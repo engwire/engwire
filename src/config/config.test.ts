@@ -102,6 +102,75 @@ run_timeout = "5m"
   test("an empty config is valid and reviews nothing", () => {
     expect(parseConfig("").reviews).toEqual([]);
   });
+
+  test("rejects a rule an earlier one has already swallowed", () => {
+    // Valid TOML, valid patterns, valid skills — and `review-payments` can
+    // never run on the one repository the user singled out.
+    expect(() =>
+      parseConfig(`
+        [[review]]
+        repos = ["acme/*"]
+        skill = "review-pr"
+
+        [[review]]
+        repos = ["acme/payments"]
+        skill = "review-payments"
+      `),
+    ).toThrow(/"acme\/payments" can never match.*"acme\/\*" in review\[0\]/s);
+  });
+
+  test("rejects redundant patterns within a rule and shadowed later rules", () => {
+    expect(() =>
+      parseConfig(`
+        [[review]]
+        repos = ["acme/api", "acme/api"]
+        skill = "review-pr"
+      `),
+    ).toThrow(/Remove the redundant pattern/);
+    expect(() =>
+      parseConfig(`
+        [[review]]
+        repos = ["acme/api"]
+        skill = "review-pr"
+
+        [[review]]
+        repos = ["ACME/API"]
+        skill = "review-other"
+      `),
+    ).toThrow(/Remove the duplicate pattern or combine the rules/);
+    expect(() =>
+      parseConfig(`
+        [[review]]
+        repos = ["*"]
+        skill = "review-pr"
+
+        [[review]]
+        repos = ["other/thing"]
+        skill = "review-other"
+      `),
+    ).toThrow(/"\*" in review\[0\].*list the more specific rule first/s);
+  });
+
+  test("accepts the documented ordering, specific rule first", () => {
+    const config = parseConfig(`
+      [[review]]
+      repos = ["acme/payments"]
+      skill = "review-payments"
+
+      [[review]]
+      repos = ["acme/*"]
+      skill = "review-pr"
+
+      [[review]]
+      repos = ["other/*"]
+      skill = "review-pr"
+    `);
+    expect(config.reviews.map((r) => r.skill)).toEqual([
+      "review-payments",
+      "review-pr",
+      "review-pr",
+    ]);
+  });
 });
 
 describe("matchesRepo", () => {
