@@ -1,0 +1,11 @@
+#!/bin/sh
+# Stands in for Claude Code. Records where it ran and what it was asked, so a
+# test can assert the boundary: the runner supplies a revision and a skill.
+echo "argv: $*"
+echo "cwd: $(pwd)"
+echo "PATH: $PATH"
+echo "GH_REPO: $GH_REPO"
+if [ -n "$FAKE_CLAUDE_RECORD" ]; then
+  printf '%s\t%s\n' "$*" "$(pwd)" >> "$FAKE_CLAUDE_RECORD"
+fi
+exit "${FAKE_CLAUDE_EXIT:-0}"
