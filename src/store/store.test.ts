@@ -82,7 +82,7 @@ describe("Store", () => {
     seed(store);
     // The returned run must agree with the row just committed; asserting only
     // the reloaded row would miss a stale value handed back to the caller.
-    expect(store.claimNext(new Date("2026-08-01T12:00:00Z"))).toMatchObject({
+    expect(store.claimNext({ now: new Date("2026-08-01T12:00:00Z") })).toMatchObject({
       status: "running",
       startedAt: "2026-08-01T12:00:00.000Z",
     });
@@ -139,6 +139,35 @@ describe("Store", () => {
 
     expect(store.get("waiting")?.finishedAt).toBeNull();
     expect(store.get("passed-over")?.finishedAt).toBe(seedRun().createdAt);
+  });
+
+  test("a queued run can be retargeted; a claimed one cannot", () => {
+    seed(store);
+    store.retarget("run-1", { headSha: "b".repeat(40), skill: "review-payments" });
+    expect(store.get("run-1")).toMatchObject({
+      headSha: "b".repeat(40),
+      skill: "review-payments",
+      status: "queued",
+    });
+
+    // Once claimed the target is frozen: "once a review starts, it finishes"
+    // would mean nothing if what it reviews could move underneath it.
+    store.claimNext();
+    expect(() =>
+      store.retarget("run-1", { headSha: "c".repeat(40), skill: "review-pr" }),
+    ).toThrow(/expected 1/);
+  });
+
+  test("an excluded run stays queued and is passed over", () => {
+    // Reconciliation can judge a queued run ineligible for this cycle — its
+    // pull request went back to draft — without consuming it.
+    seed(store, { id: "held", eventId: "1", requestedAt: "2026-08-01T10:00:00Z" });
+    seed(store, { id: "next", eventId: "2", requestedAt: "2026-08-01T11:00:00Z" });
+
+    expect(store.claimNext({ exclude: ["held"] })?.id).toBe("next");
+    expect(store.get("held")?.status).toBe("queued");
+    expect(store.claimNext({ exclude: ["held"] })).toBeNull();
+    expect(store.claimNext()?.id).toBe("held");
   });
 
   test("a run that never started cannot be recorded as completed", () => {
