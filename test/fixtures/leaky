@@ -1,0 +1,6 @@
+#!/bin/sh
+# Stands in for a review that leaves a tool running behind it. The tool is a
+# grandchild of the runner's child, so a test can prove the run's boundary is
+# the process group rather than the `claude` process alone.
+"$LEAKY_BUN" "$(dirname "$0")/leaked-tool.ts" &
+sleep "${LEAKY_SLEEP:-30}"
