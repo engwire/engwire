@@ -10,10 +10,10 @@
  * because discovery keeps `review_requested` entries and nothing else.
  *
  * Rows are never deleted. A run row is a few hundred bytes and a busy reviewer
- * produces a handful a day, so keeping them forever costs nothing and buys the
- * strongest dedup invariant available — `UNIQUE(event_id)` means a GitHub
- * review request cannot be acted on twice even if the runner crashes between
- * deciding and executing. Only worktrees are reclaimed.
+ * produces a handful a day, so storage stays negligible at the expected scale
+ * and buys the strongest dedup invariant available — `UNIQUE(event_id)` means
+ * a GitHub review request cannot be acted on twice even if the runner crashes
+ * between deciding and executing. Only worktrees are reclaimed.
  *
  * The schema lives here rather than in a `.sql` file so the compiled binary has
  * nothing to find at runtime.
@@ -342,14 +342,21 @@ export class Store {
    * second, so the tie-break is the event id — cast, because the column is TEXT
    * and `"10"` sorts before `"9"`. Reconciliation orders the same way.
    */
-  claimNext(now = new Date()): ReviewRun | null {
+  claimNext(options: { exclude?: readonly string[]; now?: Date } = {}): ReviewRun | null {
+    const now = options.now ?? new Date();
+    // Rows reconciliation judged ineligible this cycle — a pull request back in
+    // draft, say. They stay queued and are reconsidered next poll, so this is a
+    // filter on the claim rather than anything written down.
+    const exclude = options.exclude ?? [];
+    const placeholders = exclude.map(() => "?").join(",");
     const claim = this.db.transaction((): ReviewRun | null => {
       const row = this.db
-        .query<Row, []>(
+        .query<Row, string[]>(
           `SELECT * FROM review_runs WHERE status = 'queued'
+            ${exclude.length > 0 ? `AND id NOT IN (${placeholders})` : ""}
             ORDER BY requested_at, CAST(event_id AS INTEGER) LIMIT 1`,
         )
-        .get();
+        .get(...(exclude as string[]));
       if (!row) return null;
       // One timestamp for the row and the value returned, so the caller cannot
       // be handed a run that disagrees with what was just committed.
@@ -361,6 +368,21 @@ export class Store {
       return toRun({ ...row, status: "running", started_at: startedAt });
     });
     return claim();
+  }
+
+  /**
+   * Move a queued run's execution target: the revision and the skill.
+   *
+   * Constrained to `queued` because a claimed run is frozen — "once a review
+   * starts, it finishes" would mean nothing if what it was reviewing could
+   * change underneath it.
+   */
+  retarget(id: string, to: { headSha: string; skill: string }): void {
+    const result = this.db.run(
+      "UPDATE review_runs SET head_sha = ?, skill = ? WHERE id = ? AND status = 'queued'",
+      [to.headSha, to.skill, id],
+    );
+    requireOne(result.changes, `retarget(${id})`);
   }
 
   setWorktree(id: string, path: string | null): void {

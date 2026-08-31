@@ -1,0 +1,14 @@
+#!/bin/sh
+# Stands in for the GitHub CLI. Responses come from $FAKE_GH_DIR, which the test
+# writes, so a case can describe the GitHub it needs rather than share fixtures.
+set -e
+case "$*" in
+  "api user --jq .login")
+    # A GitHub outage looks like a non-zero `gh`, not a missing account.
+    [ -n "$FAKE_GH_FAIL_LOGIN" ] && { echo "could not resolve host" >&2; exit 1; }
+    echo "${FAKE_GH_LOGIN:-me}" ;;
+  search*)                cat "$FAKE_GH_DIR/search.json" ;;
+  "pr view"*)             cat "$FAKE_GH_DIR/pr.json" ;;
+  *timeline*)             cat "$FAKE_GH_DIR/timeline.json" ;;
+  *) echo "fake gh: unexpected invocation: $*" >&2; exit 64 ;;
+esac

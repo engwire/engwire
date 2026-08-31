@@ -80,7 +80,7 @@ It polls, so it sees what is still asking for your review when it looks. A reque
 
 ## How it works
 
-Engwire polls GitHub for `review_requested` timeline events naming you. Each event has its own identity, so re-requesting a review of an unchanged commit gets you a second review, because you meant it — though several unseen asks for the same pull request found in one poll are collapsed to the newest, and the rest recorded as superseded. For each one it clones the repository into its own data directory, adds a detached worktree at the latest head seen on the successful poll immediately before the review starts, and runs Claude Code there. Your skill reads the code and posts the review through `gh`. The checkout is kept for a day so you can see what Claude saw, then removed.
+Engwire polls GitHub for `review_requested` timeline events naming you. Each event has its own identity, so re-requesting a review of an unchanged commit gets you a second review, because you meant it — though several unseen asks for the same pull request found in one poll are collapsed to the newest, and the rest recorded as superseded. For each accepted request it prepares a detached worktree from its own clone at the latest head seen on the successful poll immediately before the review starts, and runs Claude Code there. Your skill reads the code and posts the review through `gh`. The checkout is kept for a day by default so you can see what Claude saw, then removed.
 
 Claude runs with `--setting-sources user`, so the review is governed by *your* configuration and *your* skill — never by a `.claude/` directory, `CLAUDE.md` or `.mcp.json` the pull request brought with it. `engwire doctor` checks that your Claude Code still supports the flag.
 
