@@ -202,6 +202,32 @@ export function parseConfig(source: string): Config {
     };
   });
 
+  // First matching rule wins, so a later rule hidden by an earlier pattern
+  // would silently use the earlier rule's skill. Covered patterns within one
+  // rule are harmless but redundant; reject both cases instead of preserving
+  // two spellings of the same configuration.
+  const seen: { pattern: string; rule: number }[] = [];
+  reviews.forEach((rule, index) => {
+    for (const pattern of rule.repos) {
+      const shadow = seen.find((earlier) => covers(earlier.pattern, pattern));
+      if (shadow) {
+        const duplicate = shadow.pattern.toLowerCase() === pattern.toLowerCase();
+        const guidance =
+          shadow.rule === index
+            ? "Remove the redundant pattern."
+            : duplicate
+              ? "Remove the duplicate pattern or combine the rules."
+              : "The first matching rule wins, so list the more specific rule first.";
+        throw new ConfigError(
+          `review[${index}].repos: ${JSON.stringify(pattern)} can never match, because ` +
+            `${JSON.stringify(shadow.pattern)} in review[${shadow.rule}] already covers it. ` +
+            guidance,
+        );
+      }
+      seen.push({ pattern, rule: index });
+    }
+  });
+
   const advanced = raw.advanced === undefined ? {} : table(raw.advanced, "advanced");
   onlyKeys(
     advanced,
@@ -255,6 +281,21 @@ const SKILL_NAME = /^[A-Za-z0-9][A-Za-z0-9:_-]*$/;
  * rather than a rule that silently matches nothing.
  */
 const REPO_PATTERN = /^(\*|[A-Za-z0-9._-]+\/(\*|[A-Za-z0-9._-]+))$/;
+
+/**
+ * Whether every repository `later` could match is already matched by `earlier`.
+ *
+ * The grammar keeps this out of general containment territory: `*` covers
+ * everything, `owner/*` covers concrete repositories under that owner, and
+ * different owner wildcards never overlap. So `owner/*` is covered only by `*`
+ * or the same wildcard, while a concrete `owner/name` is covered by anything
+ * that matches it.
+ */
+function covers(earlier: string, later: string): boolean {
+  const a = earlier.toLowerCase();
+  const b = later.toLowerCase();
+  return a === "*" || a === b || (!b.endsWith("/*") && matchesRepo(a, b));
+}
 
 /** `acme/*` matches any repository in `acme`; `*` matches every repository. */
 export function matchesRepo(pattern: string, repo: string): boolean {
