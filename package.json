@@ -1,0 +1,30 @@
+{
+  "name": "engwire",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Runs your Claude Code review skill on the pull requests that ask for your review — on your laptop, with your credentials.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Konstantin Tarkus <hello@engwire.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/engwire/engwire.git"
+  },
+  "bugs": {
+    "url": "https://github.com/engwire/engwire/issues",
+    "email": "support@engwire.com"
+  },
+  "engines": {
+    "bun": ">=1.4.0"
+  },
+  "scripts": {
+    "engwire": "bun run src/main.ts",
+    "build": "bun run scripts/build.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.0",
+    "typescript": "~6.0.3"
+  }
+}
