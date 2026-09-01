@@ -16,6 +16,8 @@ import { runLoop } from "./loop.ts";
 function runtime(over: {
   onPoll: () => void | Promise<void>;
   claimNext?: () => null;
+  /** Called with the number of this identity check, before it answers. */
+  onLogin?: (nth: number) => void;
 }): { runtime: Runtime; claims: number } {
   const state = { claims: 0 };
   const store = {
@@ -30,13 +32,17 @@ function runtime(over: {
     transaction: <T,>(work: () => T) => work(),
   } as unknown as Store;
 
+  let logins = 0;
   const gh = {
     json: async () => {
       await over.onPoll();
       return [];
     },
     text: async () => "",
-    login: async () => "me",
+    login: async () => {
+      over.onLogin?.(++logins);
+      return "me";
+    },
   } as unknown as Gh;
 
   return {
@@ -111,6 +117,26 @@ describe("runLoop", () => {
       },
     });
     expect(runLoop(fatal.runtime, new AbortController().signal)).rejects.toThrow(TypeError);
+  });
+
+  test("does not claim a review when shutdown lands during the last identity check", async () => {
+    // The window the post-poll check cannot cover: the reaper and the final
+    // `gh` call both await, so a SIGTERM arriving inside either would otherwise
+    // be noticed only after a twenty-minute review had already started — the
+    // exact outcome `service install`, which stops the old service first, would
+    // hit.
+    const controller = new AbortController();
+    const harness = runtime({
+      onPoll: () => {},
+      // The second is the check immediately before the claim.
+      onLogin: (nth) => {
+        if (nth === 2) controller.abort();
+      },
+    });
+
+    await runLoop(harness.runtime, controller.signal);
+
+    expect(harness.claims).toBe(0);
   });
 
   test("a failed poll claims nothing, even after a successful one", async () => {

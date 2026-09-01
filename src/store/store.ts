@@ -371,11 +371,36 @@ export class Store {
   }
 
   /**
+   * Give back a claim whose review never started, and hand its checkout to the
+   * reaper.
+   *
+   * The pre-spawn checks are the only caller: nothing has run and nothing has
+   * posted, so the request is still outstanding and belongs in the queue. A
+   * terminal status would spend an event GitHub will not send again, and
+   * `running` would describe a process that does not exist.
+   *
+   * `retainUntil` is required because a checkout with no deadline is invisible
+   * to the reaper, and this one holds private source: kept, it would outlive a
+   * rule nobody ever fixes. Nothing is lost by reclaiming it — the bare clone
+   * is what makes the next attempt cheap, and `prepareRevision` replaces the
+   * worktree either way.
+   */
+  releaseClaim(id: string, retainUntil: string): void {
+    const result = this.db.run(
+      `UPDATE review_runs
+          SET status = 'queued', started_at = NULL, retain_until = ?
+        WHERE id = ? AND status = 'running'`,
+      [retainUntil, id],
+    );
+    requireOne(result.changes, `releaseClaim(${id})`);
+  }
+
+  /**
    * Move a queued run's execution target: the revision and the skill.
    *
-   * Constrained to `queued` because a claimed run is frozen — "once a review
-   * starts, it finishes" would mean nothing if what it was reviewing could
-   * change underneath it.
+   * Constrained to `queued` so reconciliation cannot change a running target.
+   * A pre-agent failure releases the claim back to `queued`, where the next
+   * successful poll may retarget it before another attempt.
    */
   retarget(id: string, to: { headSha: string; skill: string }): void {
     const result = this.db.run(
@@ -394,12 +419,15 @@ export class Store {
     id: string,
     status: TerminalRunStatus,
     detail: string | null,
-    options: { retainUntil?: string | null; now?: Date } = {},
+    options: { retainUntil?: string; now?: Date } = {},
   ): void {
     const now = options.now ?? new Date();
+    // A deadline already on the row survives a caller that names none: a
+    // released claim carries one, and dismissing or superseding that row later
+    // would otherwise erase the only thing making its checkout reapable.
     const result = this.db.run(
       `UPDATE review_runs
-          SET status = ?, detail = ?, retain_until = ?, finished_at = ?
+          SET status = ?, detail = ?, retain_until = COALESCE(?, retain_until), finished_at = ?
         WHERE id = ? AND status = ?`,
       [status, detail, options.retainUntil ?? null, now.toISOString(), id, REQUIRED_BEFORE[status]],
     );
@@ -432,14 +460,22 @@ export class Store {
     return result.changes;
   }
 
-  /** Finished runs whose worktree has outlived its retention. */
+  /**
+   * Runs whose checkout has outlived its retention and nothing is reviewing in.
+   *
+   * `running` is excluded here rather than left to the caller's ordering: this
+   * is the input to deleting a directory, and a released claim leaves a
+   * deadline behind that its next claim would otherwise carry into a live
+   * review.
+   */
   expiredWorktrees(now = new Date()): { id: string; worktreePath: string }[] {
     return this.db
       .query<{ id: string; worktree_path: string }, [string]>(
         `SELECT id, worktree_path FROM review_runs
           WHERE worktree_path IS NOT NULL
             AND retain_until IS NOT NULL
-            AND retain_until <= ?`,
+            AND retain_until <= ?
+            AND status <> 'running'`,
       )
       .all(now.toISOString())
       .map((row) => ({ id: row.id, worktreePath: row.worktree_path }));

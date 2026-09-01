@@ -146,9 +146,8 @@ describe("reconcileReviews", () => {
   });
 
   test("a running review is frozen, however the pull request has moved", () => {
-    // The same guard from the other side. Head, skill and draft state are live
-    // only until a run is claimed; after that the checkout exists and Claude is
-    // reading it, so a changed pull request changes nothing about this run.
+    // Reconciliation never changes a running target. If a pre-agent check gives
+    // the claim back, it becomes queued and a later poll can retarget it.
     const running = run({ status: "running", startedAt: "2026-08-01T09:00:01Z" });
     const decisions = reconcileReviews({
       ...base,

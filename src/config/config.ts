@@ -49,6 +49,10 @@ export const DEFAULT_CONFIG_TOML = `# Engwire — automatic local review of pull
 # Every rule below answers one question: when a repository asks for my review,
 # which Claude Code skill should look at it?
 #
+# The skill is yours. Engwire ships none and writes none: \`skill\` names one
+# already installed in your Claude user skills, and what a review *is* — what
+# it reads, what it says, whether it posts — is entirely that skill's business.
+#
 # Nothing is reviewed until you uncomment a rule and name the repositories you
 # want reviewed. Engwire starts an agent on a contributor's code, so which
 # repositories that happens for is a decision worth making yourself.

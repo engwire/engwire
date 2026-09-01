@@ -25,7 +25,9 @@ curl -fsSL https://engwire.com/install.sh | sh
 engwire setup
 ```
 
-You need [`gh`](https://cli.github.com) (authenticated) and [Claude Code](https://claude.com/claude-code), plus a review skill — Engwire runs `/review-pr <repo>#<number> at <sha>`, and what a review *is* is entirely that skill's business.
+You need [`gh`](https://cli.github.com) (authenticated), [Claude Code](https://claude.com/claude-code), and a user-level review skill. Engwire invokes the configured skill as `/<skill> <repo>#<number> at <sha>` but ships none of its own: what a review reads, says and posts remains the skill's responsibility.
+
+`engwire doctor` reports skills that fail Engwire's preflight. The runner leaves their reviews queued instead of claiming work that Claude can already be shown not to run.
 
 ## Agents
 
@@ -40,7 +42,7 @@ Planned agents are product direction, not compatibility promises. An agent becom
 ## Use
 
 ```sh
-engwire run --once          # check for review requests, then exit
+engwire run --once          # one poll, at most one review, then exit
 engwire service install     # keep it running in the background (macOS)
 engwire status              # what it is doing and what it last did
 engwire doctor              # diagnose gh, claude and config
