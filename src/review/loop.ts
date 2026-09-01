@@ -206,31 +206,53 @@ function heldRuns(decisions: readonly ReviewDecision[]): string[] {
  * review.
  */
 export async function tickOnce(runtime: Runtime): Promise<void> {
-  if (await accountMatches(runtime)) {
+  const { signal } = runtime;
+  // One check per awaited step, as `runLoop` does. Ctrl-C should not have to
+  // wait out a `gh` call, a poll and a worktree prune before the command ends.
+  if (signal.aborted) return;
+  const matches = await accountMatches(runtime);
+  if (signal.aborted) return;
+
+  if (matches) {
     const held = heldRuns(await pollAndSchedule(runtime));
-    // Again after the poll, as `runLoop` does: `gh auth switch` during those
-    // seconds would have the review post as somebody else, and the claim it
-    // consumes is not the switched account's to spend.
-    if (await accountMatches(runtime)) {
-      // The preflight is last, with nothing awaited between it and the claim.
-      // Taken before the account check, it would be answering about a
-      // filesystem that had a `gh` subprocess worth of time to change.
-      const run = runtime.store.claimNext({ exclude: [...held, ...skillHolds(runtime, held)] });
+    if (signal.aborted) return;
+    // Again after the poll: `gh auth switch` during those seconds would have
+    // the review post as somebody else, and the claim it consumes is not the
+    // switched account's to spend.
+    const still = await accountMatches(runtime);
+    if (signal.aborted) return;
+    if (still) {
+      const run = runtime.store.claimNext({
+        exclude: [...held, ...skillHolds(runtime, held)],
+      });
       if (run) await startRun(runtime, run);
     }
   }
+
+  if (signal.aborted) return;
   await reapWorktrees(runtime);
 }
 
-export async function runLoop(runtime: Runtime, signal: AbortSignal): Promise<void> {
+export async function runLoop(runtime: Runtime): Promise<void> {
+  const { signal } = runtime;
   let inFlight: Promise<void> | null = null;
-  let broken: unknown;
+  // A box with its own flag, because a review rejecting with `undefined` is
+  // still a broken runner and a falsy sentinel would read as fine.
+  const broken: { failed: boolean; error?: unknown } = { failed: false };
 
   while (!signal.aborted) {
     // A review that failed in a way `executeRun` does not model is the runner
     // being broken, and it is noticed here because the loop deliberately does
     // not await the review it started.
-    if (broken) throw broken;
+    if (broken.failed) throw broken.error;
+
+    // Whether this cycle may claim is decided before it polls, not after.
+    // Polling continues while a review runs, but everything such a poll
+    // observes was observed while that review could still change GitHub: it
+    // posts, and the request it answers stops being outstanding. A cycle that
+    // began busy may still reconcile; claiming waits for a poll taken with
+    // nothing running.
+    const mayClaim = inFlight === null;
 
     // Evidence for *this* cycle, and nothing is claimed without it. Carrying a
     // previous cycle's answer forward would prevent an outage promoting work
@@ -246,9 +268,12 @@ export async function runLoop(runtime: Runtime, signal: AbortSignal): Promise<vo
     // `gh` subprocess run between here and there.
     let held: string[] | null = null;
     try {
-      if (await accountMatches(runtime)) {
-        held = heldRuns(await pollAndSchedule(runtime));
-      }
+      const matches = await accountMatches(runtime);
+      // Every awaited step is followed by its own check rather than folded into
+      // a condition further down. Shutdown arriving inside one of them should
+      // not buy the next one: a poll can spend seconds talking to GitHub.
+      if (signal.aborted) break;
+      if (matches) held = heldRuns(await pollAndSchedule(runtime));
     } catch (error) {
       // GitHub being briefly unavailable is the one failure worth surviving,
       // and `GhError` is exactly that. A SQLite write that fails, or a bug in
@@ -258,43 +283,48 @@ export async function runLoop(runtime: Runtime, signal: AbortSignal): Promise<vo
       runtime.log(`poll failed: ${error.message}`);
     }
 
-    // Checked again after the poll, not only before it. A poll takes seconds
-    // and starting a review can commit to twenty minutes, so beginning one
-    // after launchd asked the runner to stop is the difference between shutting
-    // down and being SIGKILLed partway through a review.
     if (signal.aborted) break;
+    // Again, because the poll above awaits: the review that was in flight when
+    // this cycle began can reject during it, and the claim below would then
+    // start one more review that the throw at the top of the next iteration
+    // would abandon — running, unawaited, and free to post.
+    if (broken.failed) throw broken.error;
 
-    if (!inFlight) {
+    if (mayClaim) {
       // Reclaiming runs `git worktree prune` against a bare clone, and a review
       // starting up is about to fetch into and add worktrees to that same
       // clone. One at a time means one git mutator at a time, so the reaper
       // only runs while nothing is being reviewed — retaining a checkout for
       // one more poll interval is safer than racing those mutations.
       await reapWorktrees(runtime);
+      if (signal.aborted) break;
 
-      // Fresh evidence, then identity, then shutdown, then the preflight and
-      // the claim with nothing awaited between them. The abort check belongs
-      // after the account check and not only before the reaper: both of those
-      // await, and a SIGTERM arriving inside either would otherwise start a
-      // twenty-minute review that launchd is already counting down to kill.
-      const run =
-        held !== null && (await accountMatches(runtime)) && !signal.aborted
-          ? runtime.store.claimNext({ exclude: [...held, ...skillHolds(runtime, held)] })
-          : null;
-      if (run) {
-        const started = startRun(runtime, run);
-        inFlight = started;
-        // Attached once, to the promise just created. Re-attaching on every
-        // poll while a review runs would accumulate a handler per minute.
-        void started.then(
-          () => {
-            inFlight = null;
-          },
-          (error) => {
-            inFlight = null;
-            broken = error;
-          },
-        );
+      if (held !== null) {
+        const matches = await accountMatches(runtime);
+        if (signal.aborted) break;
+        if (matches) {
+          // Nothing awaits between here and the claim: the skill preflight is
+          // a filesystem read, and the claim is what consumes the request.
+          const run = runtime.store.claimNext({
+            exclude: [...held, ...skillHolds(runtime, held)],
+          });
+          if (run) {
+            const started = startRun(runtime, run);
+            inFlight = started;
+            // Attached once, to the promise just created. Re-attaching on every
+            // poll while a review runs would accumulate a handler per minute.
+            void started.then(
+              () => {
+                inFlight = null;
+              },
+              (error) => {
+                inFlight = null;
+                broken.failed = true;
+                broken.error = error;
+              },
+            );
+          }
+        }
       }
     }
 
@@ -302,11 +332,12 @@ export async function runLoop(runtime: Runtime, signal: AbortSignal): Promise<vo
     await sleep(runtime.config.advanced.pollIntervalMs, signal);
   }
 
-  // A review already under way is awaited; that is the promise the run states
-  // make, and the plist's ExitTimeOut is sized for it. Its rejection is already
-  // observed above, so this only waits.
+  // If shutdown signalled a review already under way, its process-group handler
+  // still needs time to finish teardown before the runner exits. The plist's
+  // ExitTimeOut is sized for that boundary. Its rejection is already observed
+  // above, so this only waits.
   await inFlight?.catch(() => {});
-  if (broken) throw broken;
+  if (broken.failed) throw broken.error;
 }
 
 /**

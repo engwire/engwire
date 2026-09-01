@@ -123,7 +123,7 @@ function installSkill(name: string): string {
   return skills;
 }
 
-function runtime(config: Config): Runtime {
+function runtime(config: Config, signal = new AbortController().signal): Runtime {
   return {
     store,
     config,
@@ -132,6 +132,7 @@ function runtime(config: Config): Runtime {
     login: "me",
     log: () => {},
     cloneUrlFor: () => origin.url,
+    signal,
   };
 }
 
@@ -270,15 +271,15 @@ describe("a review request, end to end", () => {
     // without the hold it is the review this cycle would claim.
     await writeTwoRepos("acme/legacy");
 
-    const rt = runtime(config(TWO_RULES));
     const controller = new AbortController();
+    const rt = runtime(config(TWO_RULES), controller.signal);
     // One cycle: the loop does not await the review it starts, so the review
     // finishing is what says the cycle is done.
     rt.log = (message) => {
       if (message.startsWith("completed ")) controller.abort();
     };
 
-    await runLoop(rt, controller.signal);
+    await runLoop(rt);
 
     const byRepo = new Map(store.recentRuns().map((run) => [run.repo, run]));
     expect(byRepo.get("acme/api")).toMatchObject({ status: "completed", skill: "review-pr" });
@@ -314,7 +315,8 @@ describe("a review request, end to end", () => {
     await writeTwoRepos("acme/legacy");
     installSkill("review-legacy");
 
-    const rt = runtime(config(TWO_RULES));
+    const controller = new AbortController();
+    const rt = runtime(config(TWO_RULES), controller.signal);
     const gh = rt.gh;
     let logins = 0;
     rt.gh = {
@@ -330,12 +332,11 @@ describe("a review request, end to end", () => {
         return account;
       },
     };
-    const controller = new AbortController();
     rt.log = (message) => {
       if (message.startsWith("completed ")) controller.abort();
     };
 
-    await runLoop(rt, controller.signal);
+    await runLoop(rt);
 
     const byRepo = new Map(store.recentRuns().map((run) => [run.repo, run]));
     expect(byRepo.get("acme/legacy")).toMatchObject({ status: "queued" });
@@ -401,6 +402,142 @@ describe("a review request, end to end", () => {
       startedAt: null,
       worktreePath: null,
     });
+    expect(await claudeInvocations()).toHaveLength(0);
+  });
+
+  test("a poll taken while a review was running cannot be claimed from", async () => {
+    // Polling continues during a review, deliberately. But what such a poll
+    // sees was seen while that review could still change GitHub: it posts, and
+    // the request it answers stops being outstanding. So a cycle that began
+    // busy reconciles and waits — the claim belongs to a poll taken with
+    // nothing running.
+    await writeTwoRepos("acme/api", { api: 9, legacy: 10 });
+
+    const controller = new AbortController();
+    const rt = runtime(config(), controller.signal);
+    rt.config.advanced.pollIntervalMs = 1;
+
+    let releasePoll = () => {};
+    const suspended = new Promise<void>((resolve) => {
+      releasePoll = resolve;
+    });
+    let searches = 0;
+    const gh = rt.gh;
+    rt.gh = {
+      ...gh,
+      json: async <T,>(args: string[]) => {
+        if (args[0] === "search") {
+          searches += 1;
+          // The second cycle's poll overlaps the first review and is released
+          // by its completion; the third is where the loop stops, before it
+          // can legitimately claim what the second could not.
+          if (searches === 2) await suspended;
+          if (searches === 3) controller.abort();
+        }
+        return gh.json<T>(args);
+      },
+    };
+    rt.log = (message) => {
+      if (message.startsWith("completed ")) releasePoll();
+    };
+
+    await runLoop(rt);
+
+    const byRepo = new Map(store.recentRuns().map((run) => [run.repo, run]));
+    expect(byRepo.get("acme/api")).toMatchObject({ status: "completed" });
+    // Never claimed at all, rather than claimed and given back: a run released
+    // before its agent keeps the checkout and the cleanup deadline that
+    // claiming it created, so those are what tell the two apart.
+    expect(byRepo.get("acme/legacy")).toMatchObject({
+      status: "queued",
+      worktreePath: null,
+      retainUntil: null,
+    });
+    expect(await claudeInvocations()).toHaveLength(1);
+  });
+
+  test("a review that breaks while the next poll is suspended stops the runner", async () => {
+    // The loop does not await the review it starts, so a rejection can land
+    // anywhere in the next cycle — including while its poll is waiting on
+    // GitHub. Noticed only at the top of the iteration after that, the runner
+    // would claim one more review first, then throw and leave it running,
+    // unawaited, and free to post.
+    await writeTwoRepos("acme/api", { api: 9, legacy: 10 });
+
+    const controller = new AbortController();
+    const rt = runtime(config(), controller.signal);
+    rt.config.advanced.pollIntervalMs = 1;
+
+    // A store that fails while writing the outcome is the one failure
+    // `executeRun` does not model, so it is what a rejection escaping it looks
+    // like. It lands after a real checkout and a real agent, which is what puts
+    // it inside the next poll rather than before it.
+    const failure = new Error("the database stopped answering");
+    let releasePoll = () => {};
+    const suspended = new Promise<void>((resolve) => {
+      releasePoll = resolve;
+    });
+    const shim: Store = Object.create(store);
+    shim.finish = () => {
+      releasePoll();
+      throw failure;
+    };
+    rt.store = shim;
+
+    let polls = 0;
+    const gh = rt.gh;
+    rt.gh = {
+      ...gh,
+      json: async <T,>(args: string[]) => {
+        // A search is what starts a cycle; the timeline reads that follow are
+        // the same one still going. The second cycle waits for the review the
+        // first started to break.
+        if (args[0] === "search" && ++polls === 2) await suspended;
+        return gh.json<T>(args);
+      },
+    };
+
+    await expect(runLoop(rt)).rejects.toThrow(failure);
+
+    const byRepo = new Map(store.recentRuns().map((run) => [run.repo, run]));
+    expect(byRepo.get("acme/legacy")).toMatchObject({ status: "queued" });
+    expect(await claudeInvocations()).toHaveLength(1);
+  });
+
+  test("a shutdown asked for while the checkout is prepared does not start the agent", async () => {
+    // `runClaude` can forward a signal to a review that is already running;
+    // this is the window before there is one to forward to. Starting here
+    // commits the next twenty minutes to work launchd is already counting down
+    // to kill, and `ExitTimeOut` then has to wait all of it out.
+    await queueRun("racing-shutdown", 57);
+
+    const controller = new AbortController();
+    const rt = runtime(config(), controller.signal);
+    rt.cloneUrlFor = () => {
+      controller.abort();
+      return origin.url;
+    };
+
+    await tickOnce(rt);
+
+    // The claim is back and the checkout carries its cleanup deadline. It is
+    // not reclaimed here: a cycle that has been asked to stop does not stay to
+    // run `git worktree prune`, and the next start's first idle tick will.
+    expect(store.get("racing-shutdown")).toMatchObject({ status: "queued", startedAt: null });
+    expect(store.get("racing-shutdown")?.retainUntil).not.toBeNull();
+    expect(await claudeInvocations()).toHaveLength(0);
+  });
+
+  test("a cycle asked to stop before it claims claims nothing", async () => {
+    // `run --once` is one cycle, and Ctrl-C during its poll has to mean the
+    // same thing there as it does in the daemon.
+    await queueRun("stopped-early", 58);
+    const controller = new AbortController();
+    controller.abort();
+
+    await tickOnce(runtime(config(), controller.signal));
+
+    expect(store.get("stopped-early")).toMatchObject({ status: "queued" });
     expect(await claudeInvocations()).toHaveLength(0);
   });
 

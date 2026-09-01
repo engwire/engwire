@@ -1,11 +1,11 @@
-# Engwire
+# Engwire Runner
 
 Reviews the pull requests that ask for your review — on your laptop, with your GitHub account, your Claude subscription, and your own review skill.
 
 ```text
 Review requested from you
           ↓
-   Engwire (your machine)
+Engwire Runner (your machine)
           ↓
   worktree at that revision
           ↓
@@ -18,37 +18,24 @@ GitHub.com only — `GH_HOST` is pinned, so `gh` and the checkout can never disa
 
 One installation belongs to one GitHub account — the one authenticated when it first ran. Point `ENGWIRE_HOME` somewhere else for a second.
 
-## Install
-
-```sh
-curl -fsSL https://engwire.com/install.sh | sh
-engwire setup
-```
+## Requirements
 
 You need [`gh`](https://cli.github.com) (authenticated), [Claude Code](https://claude.com/claude-code), and a user-level review skill. Engwire invokes the configured skill as `/<skill> <repo>#<number> at <sha>` but ships none of its own: what a review reads, says and posts remains the skill's responsibility.
 
 `engwire doctor` reports skills that fail Engwire's preflight. The runner leaves their reviews queued instead of claiming work that Claude can already be shown not to run.
 
-## Agents
-
-| Agent | Status |
-| --- | --- |
-| Claude Code | Supported |
-| Codex | Planned |
-| Grok Build | Planned |
-
-Planned agents are product direction, not compatibility promises. An agent becomes supported only after its unattended execution, configuration isolation, GitHub identity, process cleanup and transcript handling have been verified; `doctor` and automated tests guard the parts Engwire can check without a live account.
-
 ## Use
+
+For a source checkout, build Engwire Runner before using these commands — see [Develop](#develop).
 
 ```sh
 engwire run --once          # one poll, at most one review, then exit
 engwire service install     # keep it running in the background (macOS)
 engwire status              # what it is doing and what it last did
-engwire doctor              # diagnose gh, claude and config
+engwire doctor              # diagnose the local setup
 ```
 
-Background supervision is macOS-only for now. Linux binaries are published and `engwire run` works there; nothing supervises it yet.
+Run `engwire setup` first to check prerequisites and write a starter config. Background supervision is macOS-only; on Linux, run `engwire run` directly under your preferred supervisor.
 
 ## Configure
 

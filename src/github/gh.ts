@@ -8,6 +8,8 @@
  * `gh auth git-credential` separately when a clone needs credentials.
  */
 
+import { absolutePath } from "../config/paths.ts";
+
 export class GhError extends Error {
   constructor(
     readonly args: readonly string[],
@@ -52,7 +54,10 @@ export function createGh(bin = "gh", env: Record<string, string | undefined> = p
       stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",
-      env: { ...env, ...GITHUB_ENV },
+      // `gh_bin` may legitimately be a bare `gh`, and `Bun.spawn` resolves one
+      // through the PATH it is handed — so this is what decides which `gh`
+      // discovery runs, not the shell the reviewer started the runner from.
+      env: { ...env, PATH: absolutePath(env.PATH), ...GITHUB_ENV },
     });
     const [stdout, stderr, exitCode] = await Promise.all([
       new Response(proc.stdout).text(),

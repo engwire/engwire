@@ -39,4 +39,32 @@ describe("createGh", () => {
     expect(error).toMatchObject({ args: ["fail"], exitCode: 4 });
     expect((error as GhError).message).toContain("could not resolve host");
   });
+
+  test("a bare gh is never resolved from the working directory", async () => {
+    // The runner is a command someone types, so its working directory can be a
+    // contributor's checkout — and `gh_bin` is legitimately a bare `gh`. With
+    // `.` on their PATH, a `gh` committed to that branch would run the moment
+    // discovery polls, before any review has been decided on. `Bun.spawn`
+    // resolves a bare command through the PATH it is handed, so handing it a
+    // filtered one is what closes this.
+    const cwd = process.cwd();
+    process.chdir(dir);
+    try {
+      const poisoned = createGh("gh", { PATH: `.:${join(dir, "nowhere")}` });
+      const error = await poisoned.text(["api", "user"]).then(
+        () => null,
+        (thrown: unknown) => thrown,
+      );
+
+      // Not found, rather than found and executed: the fixture `gh` sitting in
+      // this very directory prints on success, so a pass here is the absence of
+      // that.
+      expect(error).toBeInstanceOf(Error);
+      expect(String(error)).toContain("gh");
+      // The same call with the relative entry honoured is what this prevents.
+      expect((await createGh("gh", { PATH: dir }).text(["api", "user"])).trim()).toBe("github.com");
+    } finally {
+      process.chdir(cwd);
+    }
+  });
 });

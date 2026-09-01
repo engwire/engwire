@@ -18,6 +18,8 @@ function runtime(over: {
   claimNext?: () => null;
   /** Called with the number of this identity check, before it answers. */
   onLogin?: (nth: number) => void;
+  /** Shutdown, which the loop now reads from the runtime it was given. */
+  signal?: AbortSignal;
 }): { runtime: Runtime; claims: number } {
   const state = { claims: 0 };
   const store = {
@@ -54,6 +56,7 @@ function runtime(over: {
       login: "me",
       log: () => {},
       cloneUrlFor: (repo) => repo,
+      signal: over.signal ?? new AbortController().signal,
     },
     get claims() {
       return state.claims;
@@ -70,9 +73,10 @@ describe("runLoop", () => {
     const harness = runtime({
       onPoll: () => controller.abort(),
       claimNext: () => null,
+      signal: controller.signal,
     });
 
-    await runLoop(harness.runtime, controller.signal);
+    await runLoop(harness.runtime);
 
     expect(harness.claims).toBe(0);
   });
@@ -87,10 +91,11 @@ describe("runLoop", () => {
         controller.abort();
         throw new GhError(["search", "prs"], 1, "could not resolve host");
       },
+      signal: controller.signal,
     });
 
     const started = Date.now();
-    await runLoop(harness.runtime, controller.signal);
+    await runLoop(harness.runtime);
 
     expect(Date.now() - started).toBeLessThan(1_000);
     expect(harness.claims).toBe(0);
@@ -106,9 +111,10 @@ describe("runLoop", () => {
         if (++polls >= 2) transient.abort();
         throw new GhError(["search", "prs"], 1, "could not resolve host");
       },
+      signal: transient.signal,
     });
     github.runtime.config.advanced.pollIntervalMs = 1;
-    await runLoop(github.runtime, transient.signal);
+    await runLoop(github.runtime);
     expect(polls).toBeGreaterThan(1);
 
     const fatal = runtime({
@@ -116,7 +122,7 @@ describe("runLoop", () => {
         throw new TypeError("store is not a function");
       },
     });
-    expect(runLoop(fatal.runtime, new AbortController().signal)).rejects.toThrow(TypeError);
+    expect(runLoop(fatal.runtime)).rejects.toThrow(TypeError);
   });
 
   test("does not claim a review when shutdown lands during the last identity check", async () => {
@@ -132,11 +138,32 @@ describe("runLoop", () => {
       onLogin: (nth) => {
         if (nth === 2) controller.abort();
       },
+      signal: controller.signal,
     });
 
-    await runLoop(harness.runtime, controller.signal);
+    await runLoop(harness.runtime);
 
     expect(harness.claims).toBe(0);
+  });
+
+  test("shutdown during the first identity check stops before the poll", async () => {
+    // Every awaited step is followed by its own check. Noticing a stop only
+    // after the poll would buy GitHub a whole search the runner no longer
+    // wants, which is what "shutdown does not start work" has to mean for the
+    // work that is merely expensive rather than dangerous.
+    const controller = new AbortController();
+    let polls = 0;
+    const harness = runtime({
+      onPoll: () => {
+        polls += 1;
+      },
+      onLogin: () => controller.abort(),
+      signal: controller.signal,
+    });
+
+    await runLoop(harness.runtime);
+
+    expect(polls).toBe(0);
   });
 
   test("a failed poll claims nothing, even after a successful one", async () => {
@@ -154,10 +181,11 @@ describe("runLoop", () => {
         throw new GhError(["search", "prs"], 1, "could not resolve host");
       },
       claimNext: () => null,
+      signal: controller.signal,
     });
     harness.runtime.config.advanced.pollIntervalMs = 1;
 
-    await runLoop(harness.runtime, controller.signal);
+    await runLoop(harness.runtime);
 
     // One claim attempt, from the one cycle that had evidence.
     expect(polls).toBeGreaterThan(2);
