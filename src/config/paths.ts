@@ -11,10 +11,32 @@
  * test can point one case somewhere else without the import order deciding —
  * and so `service install` can ask where the *service* will look, which is not
  * necessarily where the installing shell looks.
+ *
+ * It also owns the executable search path used for review tooling.
  */
 
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
+
+/**
+ * A `PATH` with nothing relative left in it, used whenever review tooling is
+ * resolved or spawned.
+ *
+ * A relative entry — `.`, a bare `tools`, or the empty string a leading or
+ * trailing `:` produces — names a directory relative to the *working* directory,
+ * and a working directory here may be contributor-controlled: the agent's is a
+ * checkout of the branch under review, and the runner's is wherever the reviewer
+ * happened to be standing when they typed the command, which can be that same
+ * checkout. Measured against a real shell, all four forms execute from it.
+ *
+ * One definition is shared by `git`, `gh`, the agent, and the binaries `setup`
+ * writes into the config. `Bun.spawn` resolves a bare command through the
+ * `PATH` it is *given*, so handing this to a subprocess is what closes the
+ * boundary, not merely what tidies it.
+ */
+export function absolutePath(path = process.env.PATH ?? ""): string {
+  return path.split(":").filter(isAbsolute).join(":");
+}
 
 export type Paths = {
   configFile: string;

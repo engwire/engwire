@@ -31,6 +31,14 @@ export type Runtime = {
    * ordinary dependency rather than hidden as an optional test hook.
    */
   cloneUrlFor: (repo: string) => string;
+  /**
+   * Shutdown, for everything that must not start after one is requested.
+   *
+   * On the runtime rather than a parameter of `runLoop`, because the loop is
+   * not the last place that decides: `executeRun` spawns the agent minutes of
+   * checkout later, and that is the commitment worth refusing.
+   */
+  signal: AbortSignal;
 };
 
 /** Whether `gh` still uses this installation's account; a `gh` failure holds work. */
@@ -123,8 +131,20 @@ export async function executeRun(runtime: Runtime, run: ReviewRun): Promise<void
     store.releaseClaim(run.id, new Date().toISOString());
     log(`holding ${run.repo}#${run.pullNumber}: ${why}`);
   };
+  // A stop asked for during the checkout is a stop asked for before the review:
+  // starting one here commits the next twenty minutes to work launchd is
+  // already counting down to kill. Asked before the account check as well as
+  // after it, so a shutdown does not wait out one more `gh` subprocess.
+  if (runtime.signal.aborted) {
+    release("shutdown was requested before the agent started");
+    return;
+  }
   if (!(await accountMatches(runtime))) {
     release("gh is no longer the account this review was accepted for");
+    return;
+  }
+  if (runtime.signal.aborted) {
+    release("shutdown was requested before the agent started");
     return;
   }
   const problem = skillPreflightProblem(run.skill);

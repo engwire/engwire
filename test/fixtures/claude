@@ -8,4 +8,9 @@ echo "GH_REPO: $GH_REPO"
 if [ -n "$FAKE_CLAUDE_RECORD" ]; then
   printf '%s\t%s\n' "$*" "$(pwd)" >> "$FAKE_CLAUDE_RECORD"
 fi
+# A review that is still going when a signal arrives, so a test can watch the
+# runner take its process group down.
+if [ -n "$FAKE_CLAUDE_SLEEP" ]; then
+  sleep "$FAKE_CLAUDE_SLEEP"
+fi
 exit "${FAKE_CLAUDE_EXIT:-0}"

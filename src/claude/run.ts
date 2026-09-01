@@ -14,6 +14,7 @@
 
 import { chmodSync, closeSync, fchmodSync, mkdirSync, openSync } from "node:fs";
 import { dirname, isAbsolute } from "node:path";
+import { absolutePath } from "../config/paths.ts";
 import { GITHUB_ENV } from "../github/gh.ts";
 
 export type ClaudeResult = {
@@ -156,6 +157,12 @@ export async function runClaude(options: {
       process.off("SIGINT", forward);
       process.off("SIGTERM", forward);
     };
+    // Registered after the spawn, and safe there only because nothing between
+    // the two awaits: a signal raised in that span is delivered on the next
+    // event-loop turn, so `forward` is always in place before any handler runs.
+    // Measured, because the alternative is a detached review nobody signals —
+    // the runner would wait out the whole timeout while launchd counted down to
+    // SIGKILL. An `await` introduced above this line would open that window.
     process.on("SIGINT", forward);
     process.on("SIGTERM", forward);
 
@@ -189,7 +196,8 @@ export async function runClaude(options: {
  *
  * The reviewer's own shell PATH may well contain one of those, so filtering is
  * the fix rather than declining to add one. This is the executable half of the
- * boundary `--setting-sources user` draws for configuration.
+ * boundary `--setting-sources user` draws for configuration, and the filtering
+ * itself is `absolutePath` — the same rule the runner's own subprocesses get.
  *
  * An absolute `gh_bin` is then prepended: it names a binary that may not be on
  * `PATH` at all — the point of configuring it — while the skill posts by
@@ -197,7 +205,7 @@ export async function runClaude(options: {
  * PATH and contributes nothing.
  */
 export function agentPath(ghBin: string, path = process.env.PATH ?? ""): string {
-  const dirs = path.split(":").filter((dir) => isAbsolute(dir));
+  const dirs = absolutePath(path).split(":").filter(Boolean);
   if (isAbsolute(ghBin)) dirs.unshift(dirname(ghBin));
   return [...new Set(dirs)].join(":");
 }

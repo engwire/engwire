@@ -4,7 +4,7 @@
  * The reviewer's checkout is off limits — it has uncommitted work, hooks, and a
  * branch they care about, and a review must never be the reason any of that
  * moves. Engwire keeps its own bare clone per repository and builds worktrees
- * from it, so a review is invisible to the machine's owner.
+ * from it, so reviews do not disturb the owner's working copies.
  *
  * How that clone is kept cheap — bare, blobless, single-revision fetches — is
  * this module's business alone. Nothing above it names a git flag.
@@ -13,6 +13,7 @@
 import { existsSync } from "node:fs";
 import { mkdir, rename, rm } from "node:fs/promises";
 import { dirname } from "node:path";
+import { absolutePath } from "../config/paths.ts";
 
 export class GitError extends Error {
   constructor(args: readonly string[], exitCode: number, stderr: string) {
@@ -28,7 +29,10 @@ export async function git(args: string[], cwd?: string): Promise<string> {
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
-    env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+    // `git` is resolved through this PATH, not the ambient one — a review run
+    // from inside a contributor's checkout must not find their `git` — and the
+    // helpers git reaches for itself, `ssh` among them, inherit the same rule.
+    env: { ...process.env, PATH: absolutePath(), GIT_TERMINAL_PROMPT: "0" },
   });
   const [stdout, stderr, exitCode] = await Promise.all([
     new Response(proc.stdout).text(),
@@ -121,7 +125,14 @@ function cloneAuth(ghBin: string, github: boolean): string[] {
     : [];
 }
 
-/** Idempotent: replaces whatever the clone's config held with today's answer. */
+/**
+ * Idempotent: replaces whatever the clone's config held with the current answer.
+ *
+ * Rewritten on every use rather than once at clone time, because the helper
+ * embeds an absolute `gh` path and `gh` moves with a Homebrew upgrade. A clone
+ * made months ago would otherwise keep invoking a binary that is gone, while
+ * `doctor` reported the new one as healthy.
+ */
 async function configureCredentials(dir: string, ghBin: string): Promise<void> {
   await git(["config", "--unset-all", HELPER_KEY], dir).catch(() => {});
   await git(["config", "--add", HELPER_KEY, ""], dir);
