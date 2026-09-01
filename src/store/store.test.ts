@@ -109,6 +109,54 @@ describe("Store", () => {
     ]);
   });
 
+  test("a claim released before the review starts is queued again, and its checkout reclaimed", () => {
+    // The skill a run names, or the account it was accepted for, can change
+    // while its checkout is being prepared. Nothing has run and nothing has
+    // posted, so the request is still outstanding: a terminal status would
+    // spend an event GitHub will not send again.
+    seed(store);
+    store.claimNext({ now: new Date("2026-08-01T12:00:00Z") });
+    store.setWorktree("run-1", "/tmp/run-1");
+
+    store.releaseClaim("run-1", "2026-08-01T13:00:00Z");
+
+    expect(store.get("run-1")).toMatchObject({ status: "queued", startedAt: null });
+
+    // The checkout goes back to the reaper. Without a deadline it would be
+    // invisible to it, and the private source it holds would outlive a rule
+    // nobody fixes.
+    expect(store.expiredWorktrees(new Date("2026-08-01T14:00:00Z"))).toEqual([
+      { id: "run-1", worktreePath: "/tmp/run-1" },
+    ]);
+
+    // But not while the next attempt is using it. The deadline outlives the
+    // release, so the row it belongs to is claimable again long before the
+    // deadline passes — and the reaper deletes directories.
+    expect(store.claimNext({ now: new Date("2026-08-01T12:30:00Z") })?.id).toBe("run-1");
+    expect(store.expiredWorktrees(new Date("2026-08-01T14:00:00Z"))).toEqual([]);
+
+    // Only a claim can be given back. A finished run is not one.
+    store.finish("run-1", "completed", null);
+    expect(() => store.releaseClaim("run-1", "2026-08-01T13:00:00Z")).toThrow();
+  });
+
+  test("finishing a run does not erase a cleanup deadline it already had", () => {
+    // A released claim keeps its checkout scheduled for reclamation. The next
+    // poll can then dismiss or supersede that queued row — neither of which
+    // names a deadline, and both of which would otherwise make the directory
+    // invisible to the reaper for good.
+    seed(store);
+    store.claimNext();
+    store.setWorktree("run-1", "/tmp/run-1");
+    store.releaseClaim("run-1", "2026-08-01T13:00:00Z");
+
+    store.finish("run-1", "superseded", "replaced by event 2");
+
+    expect(store.expiredWorktrees(new Date("2026-08-01T14:00:00Z"))).toEqual([
+      { id: "run-1", worktreePath: "/tmp/run-1" },
+    ]);
+  });
+
   test("a decision that half-applied is no decision at all", () => {
     // Enqueueing a newer request and superseding the one it replaces is a
     // single answer. Half of it would leave both queued, and the newer event is

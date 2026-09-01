@@ -5,11 +5,12 @@
  * durable state, review execution, shutdown and worktree cleanup.
  */
 
+import { skillPreflightProblem } from "../claude/skills.ts";
 import { GhError } from "../github/gh.ts";
 import { discoverReviewRequests } from "../github/reviews.ts";
 import { removeWorktree } from "../git/worktree.ts";
 import type { NewRunDecision } from "../store/store.ts";
-import { executeRun, runId, type Runtime } from "./execute.ts";
+import { accountMatches, executeRun, runId, type Runtime } from "./execute.ts";
 import type { ReviewRequest, ReviewRun } from "./model.ts";
 import { reconcileReviews, type DismissReason, type ReviewDecision } from "./reconcile.ts";
 
@@ -129,42 +130,6 @@ async function startRun(runtime: Runtime, run: ReviewRun): Promise<void> {
 }
 
 /**
- * Whether `gh` is still the account this installation belongs to.
- *
- * Asked before discovery *and* before each claim, and never after either.
- *
- * Before discovery, because `gh search prs --review-requested=@me` means
- * whichever account `gh` is using now, while the timeline filter uses the one
- * the runner started with. Under a switched account the search returns someone
- * else's pull requests, and an old unrecorded request of the reviewer's sitting
- * in one of those timelines would be discovered and persisted — a request that
- * was not outstanding for them at all.
- *
- * Before each claim, because claiming moves a row to `running` and `failed` is
- * terminal: a check *after* the claim would let a GitHub outage permanently
- * consume a review that never started. Checked first, an outage simply leaves
- * the work queued for the next tick, which is what "a GitHub failure is
- * survivable" has to mean for work already discovered too.
- */
-async function accountMatches(runtime: Runtime): Promise<boolean> {
-  let account: string;
-  try {
-    account = await runtime.gh.login();
-  } catch (error) {
-    // Only a failed `gh` waits. A local failure obeys the same fail-loudly rule
-    // as everything else.
-    if (!(error instanceof GhError)) throw error;
-    runtime.log(`holding: could not verify the gh account: ${error.message}`);
-    return false;
-  }
-  if (account !== runtime.login) {
-    runtime.log(`holding: gh is authenticated as ${account}, not ${runtime.login}`);
-    return false;
-  }
-  return true;
-}
-
-/**
  * Remove worktrees whose retention has elapsed.
  *
  * By default, a finished review keeps its checkout for a day so the reviewer
@@ -193,21 +158,65 @@ export async function reapWorktrees(runtime: Runtime, now = new Date()): Promise
   return removed;
 }
 
+/**
+ * Queued runs ahead of the next claimable one whose skill did not pass the
+ * preflight — missing, unreadable, reserved, or not left invocable by its own
+ * front matter. They stay queued: this is a broken local setup, not a failed
+ * review, and the measured failure modes exit successfully without reviewing
+ * anything. `executeRun` takes this check and the identity check again once the
+ * checkout is ready, since preparing one can clone.
+ *
+ * It stops at the first run that passes, which is the run `claimNext` is about
+ * to take: `activeRuns` and `claimNext` order the queue the same way. Scanning
+ * further would age the answer for the row actually claimed, and read files for
+ * runs this cycle cannot reach.
+ *
+ * Per run, not per config: one misspelled rule holds the repositories it names
+ * and nothing else.
+ */
+function skillHolds(runtime: Runtime, exclude: readonly string[]): string[] {
+  const held: string[] = [];
+  for (const run of runtime.store.activeRuns()) {
+    if (run.status !== "queued" || exclude.includes(run.id)) continue;
+    // A queued run with no skill is the store disagreeing with itself, and
+    // `executeRun` is where that is refused and recorded. It is still the run
+    // `claimNext` will take, so the scan ends here either way.
+    if (!run.skill) break;
+    const problem = skillPreflightProblem(run.skill);
+    if (!problem) break;
+    held.push(run.id);
+    runtime.log(
+      `holding ${run.repo}#${run.pullNumber}: review skill ${run.skill} — ${problem}`,
+    );
+  }
+  return held;
+}
+
 /** Runs reconciliation judged ineligible this cycle; they stay queued. */
 function heldRuns(decisions: readonly ReviewDecision[]): string[] {
   return decisions.filter((d) => d.kind === "hold").map((d) => d.runId);
 }
 
-/** One full cycle, executions awaited. Used by `engwire run --once` and by tests. */
+/**
+ * One cycle, with the review awaited: one poll, at most one review.
+ *
+ * Used by `engwire run --once` and by tests, with the same shape as one
+ * `runLoop` iteration. Limiting a cycle prevents later backlog entries from
+ * using eligibility evidence gathered before an earlier, potentially long
+ * review.
+ */
 export async function tickOnce(runtime: Runtime): Promise<void> {
   if (await accountMatches(runtime)) {
-    const exclude = heldRuns(await pollAndSchedule(runtime));
-    // Re-checked between reviews, not once for the whole backlog: draining it
-    // can take hours, and the account can change during any of them.
-    while (await accountMatches(runtime)) {
-      const run = runtime.store.claimNext({ exclude });
-      if (!run) break;
-      await startRun(runtime, run);
+    const held = heldRuns(await pollAndSchedule(runtime));
+    // Again after the poll, as `runLoop` does: `gh auth switch` during those
+    // seconds would have the review post as somebody else, and the claim it
+    // consumes is not the switched account's to spend.
+    if (await accountMatches(runtime)) {
+      // The preflight is last, with nothing awaited between it and the claim.
+      // Taken before the account check, it would be answering about a
+      // filesystem that had a `gh` subprocess worth of time to change.
+      const run = runtime.store.claimNext({ exclude: [...held, ...skillHolds(runtime, held)] });
+      if (run) await startRun(runtime, run);
     }
   }
   await reapWorktrees(runtime);
@@ -230,10 +239,15 @@ export async function runLoop(runtime: Runtime, signal: AbortSignal): Promise<vo
     // current. Both are the same mistake. A poll that fails simply means no
     // review starts. Waiting for the next poll is safer than using stale
     // evidence.
-    let eligible: string[] | null = null;
+    //
+    // The list is the run ids reconciliation held; `null` is the separate fact
+    // that this cycle produced no evidence at all. The skill preflight is not
+    // in it — that is taken immediately before the claim, since a reaper and a
+    // `gh` subprocess run between here and there.
+    let held: string[] | null = null;
     try {
       if (await accountMatches(runtime)) {
-        eligible = heldRuns(await pollAndSchedule(runtime));
+        held = heldRuns(await pollAndSchedule(runtime));
       }
     } catch (error) {
       // GitHub being briefly unavailable is the one failure worth surviving,
@@ -258,9 +272,14 @@ export async function runLoop(runtime: Runtime, signal: AbortSignal): Promise<vo
       // one more poll interval is safer than racing those mutations.
       await reapWorktrees(runtime);
 
+      // Fresh evidence, then identity, then shutdown, then the preflight and
+      // the claim with nothing awaited between them. The abort check belongs
+      // after the account check and not only before the reaper: both of those
+      // await, and a SIGTERM arriving inside either would otherwise start a
+      // twenty-minute review that launchd is already counting down to kill.
       const run =
-        eligible !== null && (await accountMatches(runtime))
-          ? runtime.store.claimNext({ exclude: eligible })
+        held !== null && (await accountMatches(runtime)) && !signal.aborted
+          ? runtime.store.claimNext({ exclude: [...held, ...skillHolds(runtime, held)] })
           : null;
       if (run) {
         const started = startRun(runtime, run);

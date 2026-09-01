@@ -10,10 +10,11 @@
  */
 
 import { reviewPrompt, runClaude, type ClaudeResult } from "../claude/run.ts";
+import { skillPreflightProblem } from "../claude/skills.ts";
 import type { Config } from "../config/config.ts";
 import type { Paths } from "../config/paths.ts";
 import { prepareRevision } from "../git/worktree.ts";
-import type { Gh } from "../github/gh.ts";
+import { GhError, type Gh } from "../github/gh.ts";
 import type { Store } from "../store/store.ts";
 import type { ReviewRequest, ReviewRun } from "./model.ts";
 
@@ -32,6 +33,25 @@ export type Runtime = {
   cloneUrlFor: (repo: string) => string;
 };
 
+/** Whether `gh` still uses this installation's account; a `gh` failure holds work. */
+export async function accountMatches(runtime: Runtime): Promise<boolean> {
+  let account: string;
+  try {
+    account = await runtime.gh.login();
+  } catch (error) {
+    // Only a failed `gh` waits. A local failure obeys the same fail-loudly rule
+    // as everything else.
+    if (!(error instanceof GhError)) throw error;
+    runtime.log(`holding: could not verify the gh account: ${error.message}`);
+    return false;
+  }
+  if (account !== runtime.login) {
+    runtime.log(`holding: gh is authenticated as ${account}, not ${runtime.login}`);
+    return false;
+  }
+  return true;
+}
+
 /**
  * A readable, stable run id — it names the worktree directory and the log file,
  * so `acme-api-42-e5591` answers "what is this?" without a database.
@@ -42,8 +62,8 @@ export type Runtime = {
  *
  * No revision in it. A queued run follows the pull request's head until it is
  * claimed, so a SHA here would name whichever revision happened to be current
- * when the row was written — and the checkout it labels answers that question
- * exactly, with `git rev-parse HEAD`.
+ * when the row was written — and the checkout it labels answers that
+ * question exactly, with `git rev-parse HEAD`.
  */
 export function runId(request: ReviewRequest): string {
   const slug = request.repo.replace(/[^a-zA-Z0-9]+/g, "-").toLowerCase();
@@ -91,6 +111,25 @@ export async function executeRun(runtime: Runtime, run: ReviewRun): Promise<void
       retainUntil: retainUntil(),
     });
     log(`failed to check out ${run.repo}#${run.pullNumber}: ${message(error)}`);
+    return;
+  }
+
+  // Checkout preparation may clone, so recheck both dependencies immediately
+  // before the agent starts. Identity goes first because it awaits; the skill
+  // check is synchronous and stays adjacent to the spawn. Either failure can
+  // release the claim because no agent has run, and the retention deadline lets
+  // the reaper remove the now-unneeded checkout.
+  const release = (why: string) => {
+    store.releaseClaim(run.id, new Date().toISOString());
+    log(`holding ${run.repo}#${run.pullNumber}: ${why}`);
+  };
+  if (!(await accountMatches(runtime))) {
+    release("gh is no longer the account this review was accepted for");
+    return;
+  }
+  const problem = skillPreflightProblem(run.skill);
+  if (problem) {
+    release(`review skill ${run.skill} — ${problem}`);
     return;
   }
 

@@ -7,7 +7,14 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -16,7 +23,7 @@ import { paths, type Paths } from "../../src/config/paths.ts";
 import { git } from "../../src/git/repository.ts";
 import { createGh } from "../../src/github/gh.ts";
 import { executeRun, type Runtime } from "../../src/review/execute.ts";
-import { tickOnce } from "../../src/review/loop.ts";
+import { runLoop, tickOnce } from "../../src/review/loop.ts";
 import { Store } from "../../src/store/store.ts";
 import { createOrigin, type Origin } from "../fixtures/repo.ts";
 
@@ -66,6 +73,56 @@ function reviewRequest(id: number, at: Date) {
   };
 }
 
+/**
+ * Two repositories, each with an outstanding request of its own; `first` is the
+ * one asked for earlier, so the queue order is the test's rather than the
+ * clock's. `"same instant"` leaves the event ids as the only thing separating
+ * them. One `pr view` answers for both, which is all these cases need.
+ */
+async function writeTwoRepos(
+  first: "acme/api" | "acme/legacy" | "same instant",
+  events = { api: 1, legacy: 2 },
+): Promise<void> {
+  const earlier = new Date(Date.now() - 60_000);
+  const later = new Date();
+  const at = (repo: "acme/api" | "acme/legacy") =>
+    first === "same instant" ? later : first === repo ? earlier : later;
+  await writeGitHub({ sha: origin.sha, events: [] });
+  await Bun.write(
+    join(ghDir, "search.json"),
+    JSON.stringify([
+      { number: 42, repository: { nameWithOwner: "acme/api" } },
+      { number: 7, repository: { nameWithOwner: "acme/legacy" } },
+    ]),
+  );
+  await Bun.write(
+    join(ghDir, "timeline-acme-api.json"),
+    JSON.stringify([reviewRequest(events.api, at("acme/api"))]),
+  );
+  await Bun.write(
+    join(ghDir, "timeline-acme-legacy.json"),
+    JSON.stringify([reviewRequest(events.legacy, at("acme/legacy"))]),
+  );
+}
+
+/** `acme/api` names a skill that is not installed; `acme/legacy` names one that is. */
+const ONE_BROKEN_RULE =
+  `[[review]]\nrepos = ["acme/api"]\nskill = "not-installed"\n\n` +
+  `[[review]]\nrepos = ["acme/legacy"]\nskill = "review-pr"\n`;
+
+/** Both repositories, each with its own skill. `acme/legacy` is matched first. */
+const TWO_RULES =
+  `[[review]]\nrepos = ["acme/legacy"]\nskill = "review-legacy"\n\n` +
+  `[[review]]\nrepos = ["acme/*"]\nskill = "review-pr"\n`;
+
+/** A skill of the reviewer's own, in the configuration directory of this test. */
+function installSkill(name: string): string {
+  const skills = join(dir, "claude", "skills", name);
+  mkdirSync(skills, { recursive: true });
+  writeFileSync(join(skills, "SKILL.md"), `---\nname: ${name}\n---\n\nReview it.\n`);
+  return skills;
+}
+
 function runtime(config: Config): Runtime {
   return {
     store,
@@ -103,6 +160,12 @@ beforeEach(async () => {
   mkdirSync(ghDir, { recursive: true });
 
   process.env.ENGWIRE_HOME = join(dir, "home");
+  // The reviewer's own skills, in a directory of this test's own: a rule names
+  // a skill, and the runner refuses to claim work against one that is not
+  // installed. Left to the machine's real `~/.claude`, every test here would
+  // pass or hold depending on who ran it.
+  process.env.CLAUDE_CONFIG_DIR = join(dir, "claude");
+  installSkill("review-pr");
   process.env.FAKE_GH_DIR = ghDir;
   process.env.FAKE_GH_LOGIN = "me";
   process.env.FAKE_CLAUDE_RECORD = claudeLog;
@@ -117,6 +180,7 @@ beforeEach(async () => {
 afterEach(async () => {
   store.close();
   delete process.env.ENGWIRE_HOME;
+  delete process.env.CLAUDE_CONFIG_DIR;
   delete process.env.FAKE_GH_DIR;
   delete process.env.FAKE_GH_LOGIN;
   delete process.env.FAKE_CLAUDE_RECORD;
@@ -196,6 +260,222 @@ describe("a review request, end to end", () => {
       detail: "no_automation",
     });
     expect(await claudeInvocations()).toHaveLength(0);
+  });
+
+  test("the daemon holds the repository whose skill is missing, and reviews the other", async () => {
+    // Fault isolation, through the loop the service actually runs: one rule
+    // whose skill is not there holds the repositories that rule names, and
+    // leaves every other review alone. A global fail-stop would turn a typo in
+    // an unrelated rule into an outage. The held request is the older one, so
+    // without the hold it is the review this cycle would claim.
+    await writeTwoRepos("acme/legacy");
+
+    const rt = runtime(config(TWO_RULES));
+    const controller = new AbortController();
+    // One cycle: the loop does not await the review it starts, so the review
+    // finishing is what says the cycle is done.
+    rt.log = (message) => {
+      if (message.startsWith("completed ")) controller.abort();
+    };
+
+    await runLoop(rt, controller.signal);
+
+    const byRepo = new Map(store.recentRuns().map((run) => [run.repo, run]));
+    expect(byRepo.get("acme/api")).toMatchObject({ status: "completed", skill: "review-pr" });
+    expect(byRepo.get("acme/legacy")).toMatchObject({
+      status: "queued",
+      skill: "review-legacy",
+    });
+
+    const invocations = await claudeInvocations();
+    expect(invocations).toHaveLength(1);
+    expect(invocations[0]?.argv).toContain("/review-pr acme/api#42");
+  });
+
+  test("one cycle is one review, however much is queued", async () => {
+    // `run --once` is documented as one poll and at most one review. Draining
+    // the queue instead would claim the second run on the first poll's
+    // evidence, which is hours old by the time a backlog reaches it.
+    await writeTwoRepos("acme/api");
+    installSkill("review-legacy");
+
+    await tickOnce(runtime(config(TWO_RULES)));
+
+    const byRepo = new Map(store.recentRuns().map((run) => [run.repo, run]));
+    expect(byRepo.get("acme/api")).toMatchObject({ status: "completed" });
+    expect(byRepo.get("acme/legacy")).toMatchObject({ status: "queued" });
+    expect(await claudeInvocations()).toHaveLength(1);
+  });
+
+  test("the daemon takes the preflight after its last identity check, not before", async () => {
+    // Same window as the `tickOnce` case below, in the loop the service runs.
+    // `acme/legacy` is the older request, so it is what this cycle would claim
+    // — and its skill disappears while the final `gh` call is in flight.
+    await writeTwoRepos("acme/legacy");
+    installSkill("review-legacy");
+
+    const rt = runtime(config(TWO_RULES));
+    const gh = rt.gh;
+    let logins = 0;
+    rt.gh = {
+      ...gh,
+      login: async () => {
+        const account = await gh.login();
+        if (++logins === 2) {
+          rmSync(join(dir, "claude", "skills", "review-legacy"), {
+            recursive: true,
+            force: true,
+          });
+        }
+        return account;
+      },
+    };
+    const controller = new AbortController();
+    rt.log = (message) => {
+      if (message.startsWith("completed ")) controller.abort();
+    };
+
+    await runLoop(rt, controller.signal);
+
+    const byRepo = new Map(store.recentRuns().map((run) => [run.repo, run]));
+    expect(byRepo.get("acme/legacy")).toMatchObject({ status: "queued" });
+    expect(byRepo.get("acme/api")).toMatchObject({ status: "completed" });
+    const invocations = await claudeInvocations();
+    expect(invocations).toHaveLength(1);
+    expect(invocations[0]?.argv).toContain("/review-pr acme/api#42");
+  });
+
+  test("a skill deleted while the identity check is in flight is not claimed", async () => {
+    // The preflight is the last thing before the claim precisely because of
+    // this window: taken before the `gh` subprocess that verifies the account,
+    // it would answer about a filesystem that then had that subprocess's worth
+    // of time to change — and the run would be claimed against a skill Claude
+    // no longer has, exit 0, and be recorded `completed`.
+    await queueRun("racing", 53);
+
+    const rt = runtime(config());
+    const gh = rt.gh;
+    let logins = 0;
+    rt.gh = {
+      ...gh,
+      login: async () => {
+        const account = await gh.login();
+        // The second call is the one immediately before the claim.
+        if (++logins === 2) rmSync(join(dir, "claude", "skills", "review-pr"), {
+          recursive: true,
+          force: true,
+        });
+        return account;
+      },
+    };
+
+    await tickOnce(rt);
+
+    expect(store.get("racing")).toMatchObject({ status: "queued" });
+    expect(await claudeInvocations()).toHaveLength(0);
+  });
+
+  test("a skill that disappears while the checkout is prepared is not reviewed", async () => {
+    // The window the pre-claim check cannot cover, and the reason the check is
+    // taken twice: `prepareRevision` clones on first use of a repository, so
+    // minutes of network can separate the claim from the agent that needs the
+    // skill. `cloneUrlFor` is called as the checkout begins, which makes the
+    // disappearance deterministic without a test-only seam.
+    await queueRun("racing-checkout", 55);
+
+    const rt = runtime(config());
+    rt.cloneUrlFor = () => {
+      rmSync(join(dir, "claude", "skills", "review-pr"), { recursive: true, force: true });
+      return origin.url;
+    };
+
+    await tickOnce(rt);
+
+    // Given back, not failed: nothing ran and nothing posted, so the request is
+    // still outstanding and the next poll holds it.
+    // The claim is back and the checkout is gone: this tick's reaper found the
+    // deadline the release left on it. Private source does not wait on a rule
+    // nobody is going to fix.
+    expect(store.get("racing-checkout")).toMatchObject({
+      status: "queued",
+      startedAt: null,
+      worktreePath: null,
+    });
+    expect(await claudeInvocations()).toHaveLength(0);
+  });
+
+  test("an account switched while the checkout is prepared does not review", async () => {
+    // The same window as the skill above, for the other piece of evidence the
+    // claim rests on. `gh auth switch` here would have the skill post the
+    // review as whoever `gh` is now — a request accepted on someone else's
+    // behalf, answered in their name.
+    await queueRun("racing-account", 56);
+
+    const rt = runtime(config());
+    rt.cloneUrlFor = () => {
+      process.env.FAKE_GH_LOGIN = "someone-else";
+      return origin.url;
+    };
+
+    try {
+      await tickOnce(rt);
+    } finally {
+      process.env.FAKE_GH_LOGIN = "me";
+    }
+
+    expect(store.get("racing-account")).toMatchObject({
+      status: "queued",
+      startedAt: null,
+      worktreePath: null,
+    });
+    expect(await claudeInvocations()).toHaveLength(0);
+  });
+
+  test("the run preflighted is the run claimed when only the event id orders them", async () => {
+    // The scan stops at the first queued run whose skill passes, because that
+    // is the row `claimNext` takes — an invariant two Store queries hold by
+    // sorting alike. Both requests arrive in the same instant, so only the
+    // event id separates them, and "9" sorts after "10" unless it is compared
+    // as a number. Were the two queries to disagree, this preflights 10 and
+    // claims 9.
+    await writeTwoRepos("same instant", { api: 9, legacy: 10 });
+
+    await tickOnce(runtime(config(ONE_BROKEN_RULE)));
+
+    const byRepo = new Map(store.recentRuns().map((run) => [run.repo, run]));
+    expect(byRepo.get("acme/api")).toMatchObject({ status: "queued", skill: "not-installed" });
+    expect(byRepo.get("acme/legacy")).toMatchObject({ status: "completed" });
+    const invocations = await claudeInvocations();
+    expect(invocations).toHaveLength(1);
+    expect(invocations[0]?.argv).toContain("/review-pr acme/legacy#7");
+  });
+
+  test("a rule naming an uninstalled skill reviews nothing and consumes nothing", async () => {
+    // The one failure a review cannot report: `claude -p` prints
+    // `Unknown command:` for a skill it does not have and exits 0, which would
+    // be recorded as a completed review of a request GitHub will not send
+    // again. So the skill is checked before the claim, and the run waits.
+    await writeGitHub({ sha: origin.sha, events: [reviewRequest(1, new Date())] });
+
+    await tickOnce(
+      runtime(config(`[[review]]\nrepos = ["acme/*"]\nskill = "not-installed"\n`)),
+    );
+
+    expect(store.recentRuns()[0]).toMatchObject({ status: "queued", skill: "not-installed" });
+    expect(await claudeInvocations()).toHaveLength(0);
+
+    // Installed, and the same queued run is claimed on the next tick.
+    mkdirSync(join(dir, "claude", "skills", "not-installed"), { recursive: true });
+    writeFileSync(
+      join(dir, "claude", "skills", "not-installed", "SKILL.md"),
+      "---\nname: not-installed\n---\n",
+    );
+    await tickOnce(
+      runtime(config(`[[review]]\nrepos = ["acme/*"]\nskill = "not-installed"\n`)),
+    );
+
+    expect(store.recentRuns()[0]).toMatchObject({ status: "completed", eventId: "1" });
+    expect(await claudeInvocations()).toHaveLength(1);
   });
 
   test("a draft is held, then reviewed once it is ready", async () => {
@@ -281,18 +561,22 @@ describe("a review request, end to end", () => {
   });
 
   /** A queued review whose request is still visible, and therefore eligible. */
-  async function queueRun(id: string, eventId: number) {
+  async function queueRun(
+    id: string,
+    eventId: number,
+    over: { skill?: string; pullNumber?: number; requestedAt?: string } = {},
+  ) {
     store.insert({
       id,
       eventId: String(eventId),
       repo: "acme/api",
-      pullNumber: 42,
+      pullNumber: over.pullNumber ?? 42,
       headSha: origin.sha,
       title: "Add widgets",
-      skill: "review-pr",
+      skill: over.skill ?? "review-pr",
       status: "queued",
       detail: null,
-      requestedAt: new Date().toISOString(),
+      requestedAt: over.requestedAt ?? new Date().toISOString(),
       createdAt: new Date().toISOString(),
     });
     await writeGitHub({ sha: origin.sha, events: [reviewRequest(eventId, new Date())] });
@@ -318,6 +602,33 @@ describe("a review request, end to end", () => {
 
     expect(store.get("held")).toMatchObject({ status: "completed" });
     expect(await claudeInvocations()).toHaveLength(1);
+  });
+
+  test("an account switched during the poll is noticed before the claim", async () => {
+    // The interval the first check cannot cover. A poll takes seconds, and
+    // `gh auth switch` inside them would have the review post as whoever gh is
+    // now — spending a request that was accepted on someone else's behalf.
+    await queueRun("switched", 52);
+
+    const rt = runtime(config());
+    const polling = rt.gh;
+    rt.gh = {
+      ...polling,
+      json: async <T,>(args: string[]) => {
+        const result = await polling.json<T>(args);
+        process.env.FAKE_GH_LOGIN = "someone-else";
+        return result;
+      },
+    };
+
+    try {
+      await tickOnce(rt);
+    } finally {
+      process.env.FAKE_GH_LOGIN = "me";
+    }
+
+    expect(store.get("switched")).toMatchObject({ status: "queued" });
+    expect(await claudeInvocations()).toHaveLength(0);
   });
 
   test("a GitHub outage does not consume work already queued", async () => {
