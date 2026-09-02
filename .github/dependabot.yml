@@ -1,0 +1,9 @@
+# Actions are pinned to commit SHAs so a moved tag cannot change what builds the
+# binary people pipe into a shell. A pin cannot rot into a vulnerability on its
+# own, but it also cannot fix itself, so something has to bring them forward.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

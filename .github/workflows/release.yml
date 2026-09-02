@@ -1,0 +1,250 @@
+# A tag is the only thing this workflow publishes from. What a release is, what
+# each stage below proves, and what it deliberately does not, is the contract in
+# docs/specs/releases.md.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  # Everything the tag has to prove, on both hosts whose compiled behaviour can
+  # differ: `publish` runs once on one machine, so a Darwin-only regression
+  # would otherwise reach a release on the strength of a Linux run. A release
+  # establishes its own evidence rather than borrowing the branch CI run for the
+  # same commit, which may be older than the tag, still going, or long expired.
+  preflight:
+    name: preflight (${{ matrix.artifact }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, artifact: linux-x64 }
+          - { os: macos-latest, artifact: darwin-arm64 }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: package.json
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun test
+      - run: bun run build
+      - name: Integration tests against this host's binary
+        run: |
+          ENGWIRE_TEST_BIN="$PWD/dist/engwire-${{ matrix.artifact }}" \
+            bun test test/integration/cli.test.ts test/integration/binary.test.ts
+
+  publish:
+    needs: preflight
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release and upload its assets
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # This job can write to the repository, and checkout would otherwise
+          # leave that token in `.git/config` for the length of everything that
+          # follows. Publishing uses `GH_TOKEN` on the one step that needs it.
+          persist-credentials: false
+          # Full history, because the next step asks a question about ancestry.
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: package.json
+
+      # No `bun install` here. There are no runtime dependencies, and the
+      # devDependencies exist for the typechecker and the tests, which are
+      # preflight's job — so nothing in the write-capable job needs a
+      # `node_modules` at all. Measured: `bun run build` produces all four
+      # artifacts in a tree that has never been installed into.
+
+      # The tag names the version `install.sh` fetches; the binary reports the
+      # one compiled into it from package.json. A release where those disagree
+      # is a support thread nobody can resolve from the outside.
+      - name: Tag matches package.json
+        run: |
+          version="$(bun -e 'console.log((await Bun.file("package.json").json()).version)')"
+          [ "v$version" = "$GITHUB_REF_NAME" ] ||
+            { echo "tag $GITHUB_REF_NAME does not match package.json $version" >&2; exit 1; }
+
+          # One channel. `promote` clears the prerelease flag unconditionally,
+          # so a `v1.0.0-rc.1` would be turned into an ordinary release and made
+          # eligible for Latest. Refusing here is the honest version of that
+          # until there is a reason to have channels, and a reason is when
+          # somebody actually wants to cut a release candidate.
+          case "$version" in
+            *-*) echo "prerelease versions are not supported by this pipeline: $version" >&2; exit 1 ;;
+          esac
+
+      # A tag names a commit, not a branch — `git push origin v0.1.0` from an
+      # unmerged branch would release work nothing has reviewed. `main` is what
+      # pull requests gate, so a release has to be reachable from it. An ancestor
+      # rather than equal to it: `main` may move while preflight runs, and that
+      # is somebody else merging, not a reason to refuse this release. It fetches
+      # `main` rather than trusting what checkout left behind, because a publish
+      # that fails here has already spent the tag.
+      - name: Tag is on main
+        run: |
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor HEAD FETCH_HEAD ||
+            { echo "$GITHUB_REF_NAME is not on main" >&2; exit 1; }
+
+      - run: bun run build
+
+      # The binary carries its runtime, and every install and upgrade pays that
+      # download. gzip materially reduces it and is available on every supported
+      # machine.
+      - run: gzip -9 dist/*
+
+      # install.sh ships as an asset so `releases/latest/download/install.sh` is
+      # a stable URL. It bootstraps any version rather than only this one, which
+      # is why it has to stay backward compatible — see docs/specs/releases.md.
+      # `--verify-tag` because a tag deleted between trigger and publish would
+      # otherwise have `gh` create one from the default branch, and the release
+      # would no longer describe the commit that asked for it. It proves the tag
+      # exists, not that it still points here — and no check inside a workflow
+      # can, since the tag can move after the workflow ends. That is a repository
+      # ruleset barring updates and deletions on `v*`, not a step here; release
+      # immutability only holds the tag for as long as the release does.
+      #
+      # A prerelease until something has run these binaries: it stays off
+      # `releases/latest/download/`, and says the same thing to a person
+      # browsing Releases as it does to the installer.
+      - name: Publish a candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.gz install/install.sh \
+            --generate-notes --verify-tag --prerelease
+
+          # Immutability is repository configuration rather than anything the
+          # tag carries, and it only ever applies to releases published after it
+          # was switched on — so a release published while it was off is mutable
+          # forever, and switching it back on does not repair that one. Asking
+          # the release itself is the version of the question worth asking:
+          # everything downstream rests on these being the bytes that stay.
+          immutable=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" --jq .immutable)
+          [ "$immutable" = true ] ||
+            { echo "$GITHUB_REF_NAME was published without release immutability" >&2; exit 1; }
+
+  # The loop nothing else closes: the installer derives asset names, the release
+  # publishes them, and until here the two have only ever agreed by inspection.
+  # Why this verifies a public candidate rather than a draft, and what that
+  # costs, is docs/adr/0001-verify-published-assets-before-promoting.md.
+  #
+  # A separate job for two reasons. It needs no token at all, and a transient
+  # failure here can be rerun on its own — folded into `publish`, a rerun would
+  # hit `gh release create` against a release that already exists, and there is
+  # no way back from that: deleting it burns the tag name for releases. It runs
+  # after publishing because an unauthenticated `curl` cannot read a draft.
+  verify:
+    needs: publish
+    # One runner per published artifact. `build` cross-compiles all four from
+    # one machine, so without this the two nobody here runs — an Intel Mac and
+    # an ARM Linux box — would first execute on a user's. `fail-fast` is off so
+    # a single bad architecture reports as itself rather than cancelling the
+    # evidence about the others.
+    name: verify (${{ matrix.artifact }})
+    runs-on: ${{ matrix.os }}
+    # The retry below bounds attempts, not time: a wedged download would
+    # otherwise sit until GitHub's own limit. One bound, in one place, beats
+    # curl flags spread through a CI wrapper and a public installer.
+    timeout-minutes: 10
+    # No checkout and no token: everything below comes from the published release
+    # and the environment, so it receives exactly the installer and the artifact
+    # a user receives — by tag rather than by the `latest` alias, which is a
+    # question about promotion and not about these bytes.
+    permissions: {}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Keep labels aligned with actions/runner-images. An unavailable label
+        # never starts, so the artifact it covered would otherwise go quietly
+        # unverified.
+        include:
+          - { os: macos-latest, artifact: darwin-arm64 }
+          - { os: macos-15-intel, artifact: darwin-x64 }
+          - { os: ubuntu-latest, artifact: linux-x64 }
+          - { os: ubuntu-24.04-arm, artifact: linux-arm64 }
+    steps:
+      - name: Install what was published
+        run: |
+          # The published installer, not the one in this checkout. README tells
+          # people to curl `install.sh` off a release, so that asset existing
+          # under that exact name is part of what a release has to get right —
+          # and running the repository's copy would pass while the documented
+          # command returned a 404 for everyone.
+          #
+          # By tag rather than `latest`: the alias is GitHub's own function of
+          # the release and updates on its own schedule, so waiting on it here
+          # would test their timing rather than this workflow's output.
+          # The release asset, which is what this workflow can prove. README's
+          # `engwire.com/install.sh` redirects here; that hop is a property of
+          # the website, and coupling a release to the availability of a
+          # redirect would buy less than it costs.
+          installer="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/install.sh"
+
+          # A release asset can take a moment to be servable. A packaging
+          # mistake still fails; a few seconds of propagation no longer does.
+          attempt=1
+          until curl -fsSL "$installer" -o "$RUNNER_TEMP/install.sh" &&
+                ENGWIRE_VERSION="$GITHUB_REF_NAME" ENGWIRE_PREFIX="$RUNNER_TEMP/bin" \
+                  sh "$RUNNER_TEMP/install.sh"; do
+            [ "$attempt" -lt 5 ] ||
+              { echo "could not install $GITHUB_REF_NAME from $installer" >&2; exit 1; }
+            attempt=$((attempt + 1))
+            sleep 5
+          done
+          installed="$("$RUNNER_TEMP/bin/engwire" --version)"
+          [ "v$installed" = "$GITHUB_REF_NAME" ] ||
+            { echo "installed engwire reports $installed, not $GITHUB_REF_NAME" >&2; exit 1; }
+
+          # The runner label is the intent; this is the evidence. A matrix entry
+          # pointed at the wrong machine would otherwise verify one artifact
+          # twice and leave another untested while reporting green.
+          case "$(uname -s)-$(uname -m)" in
+            Darwin-arm64)  ran=darwin-arm64 ;;
+            Darwin-x86_64) ran=darwin-x64 ;;
+            Linux-aarch64) ran=linux-arm64 ;;
+            Linux-x86_64)  ran=linux-x64 ;;
+            *)             ran=unknown ;;
+          esac
+          [ "$ran" = "${{ matrix.artifact }}" ] ||
+            { echo "expected to verify ${{ matrix.artifact }}, but this runner is $ran" >&2; exit 1; }
+          echo "verified ${{ matrix.artifact }}"
+
+  # Only now does it become an ordinary release, eligible for the normal
+  # installation path — which one GitHub actually serves as `latest` is its
+  # decision, made by version and date across everything published. Separate
+  # from `publish` so the thing holding `contents: write` runs after the
+  # evidence, and separate from `verify` so that stays tokenless.
+  #
+  # Editing a published release survives release immutability: what that freezes
+  # is the tag and the assets, not the prerelease flag. Measured, because the
+  # obvious reading says otherwise — docs/experiments.md, and ADR-0001 for why
+  # the pipeline is shaped around verifying a public candidate.
+  promote:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Promote the verified candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # `make_latest=legacy` asks GitHub to pick by version and date across
+          # the published releases rather than forcing this one. Two tags whose
+          # verification finishes out of order would otherwise leave the older
+          # as `latest`, and the documented installer would quietly serve it.
+          # Monotonic by construction, with no comparison logic living here.
+          id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" --jq .id)
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$id" \
+            -F prerelease=false -f make_latest=legacy
