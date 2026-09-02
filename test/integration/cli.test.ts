@@ -16,7 +16,19 @@ import { Store } from "../../src/store/store.ts";
 import { createOrigin, type Origin } from "../fixtures/repo.ts";
 
 const FIXTURES = resolve(import.meta.dir, "../fixtures");
-const MAIN = resolve(import.meta.dir, "../../src/main.ts");
+/**
+ * The CLI under test: the source tree, or the compiled binary when one is
+ * named.
+ *
+ * What ships is a single file produced by `bun build --compile`, and every
+ * other test in this repository runs the source. Signals, process groups and
+ * SQLite are exactly the things that could behave differently once the runtime
+ * is embedded, and they are exactly what this file exercises — so CI points
+ * this at `dist/` and runs it a second time.
+ */
+const CLI = process.env.ENGWIRE_TEST_BIN
+  ? [process.env.ENGWIRE_TEST_BIN]
+  : ["bun", resolve(import.meta.dir, "../../src/main.ts")];
 
 let dir: string;
 let ghDir: string;
@@ -112,7 +124,7 @@ function start(
   captureStderr = false,
 ) {
   return Bun.spawn({
-    cmd: ["bun", MAIN, ...args],
+    cmd: [...CLI, ...args],
     stdin: "ignore",
     stdout: "pipe",
     stderr: captureStderr ? "pipe" : "inherit",

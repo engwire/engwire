@@ -24,11 +24,28 @@ You need [`gh`](https://cli.github.com) (authenticated), [Claude Code](https://c
 
 `engwire doctor` reports skills that fail Engwire's preflight. The runner leaves their reviews queued instead of claiming work that Claude can already be shown not to run.
 
-## Use
+## Install
 
-For a source checkout, build Engwire Runner before using these commands — see [Develop](#develop).
+Published releases install with:
 
 ```sh
+curl -fsSL https://engwire.com/install.sh | sh
+```
+
+That redirects to the latest release's installer, which is also reachable directly at `github.com/engwire/engwire/releases/latest/download/install.sh`. One binary into `~/.local/bin`.
+
+`ENGWIRE_PREFIX` puts it elsewhere and `ENGWIRE_VERSION` pins a release — on the right of the pipe, where the installer runs, not the left, where only `curl` would see them:
+
+```sh
+curl -fsSL https://engwire.com/install.sh | ENGWIRE_VERSION=0.1.0 sh
+```
+
+macOS 13+ and Linux with glibc 2.17+, Intel and ARM. The x64 builds require AVX2 — Haswell-era Intel or newer, Excavator or newer on AMD. Those are Bun's own floors, since the binary carries its runtime; Alpine and other musl distributions are not supported yet. The installer runs what it downloaded before replacing anything, so a machine outside that range fails with nothing lost. Upgrading is the same command; it replaces the binary without disturbing a review in flight, and a background service picks the new one up on the next `engwire service install`.
+
+## Use
+
+```sh
+engwire setup               # check prerequisites and write a starter config
 engwire run --once          # one poll, at most one review, then exit
 engwire service install     # keep it running in the background (macOS)
 engwire status              # what it is doing and what it last did
@@ -69,7 +86,7 @@ It polls, so it sees what is still asking for your review when it looks. A reque
 
 ## How it works
 
-Engwire polls GitHub for `review_requested` timeline events naming you. Each event has its own identity, so re-requesting a review of an unchanged commit gets you a second review, because you meant it — though several unseen asks for the same pull request found in one poll are collapsed to the newest, and the rest recorded as superseded. For each accepted request it prepares a detached worktree from its own clone at the latest head seen on the successful poll immediately before the review starts, and runs Claude Code there. Your skill reads the code and posts the review through `gh`. The checkout is kept for a day by default so you can see what Claude saw, then removed.
+Engwire polls GitHub for `review_requested` issue events naming you. Each event has its own identity, so re-requesting a review of an unchanged commit gets you a second review, because you meant it — though several unseen asks for the same pull request found in one poll are collapsed to the newest, and the rest recorded as superseded. For each accepted request it prepares a detached worktree from its own clone at the latest head seen on the successful poll immediately before the review starts, and runs Claude Code there. Your skill reads the code and posts the review through `gh`. The checkout is kept for a day by default so you can see what Claude saw, then removed.
 
 Claude runs with `--setting-sources user`, so the review is governed by *your* configuration and *your* skill — never by a `.claude/` directory, `CLAUDE.md` or `.mcp.json` the pull request brought with it. `engwire doctor` checks that your Claude Code still supports the flag.
 
@@ -88,7 +105,28 @@ bun typecheck
 bun run build     # cross-compiled binaries in dist/
 ```
 
+`bun run engwire <command>` runs any of the commands above straight from the source tree, so trying a change out does not need a build.
+
 The scheduling logic in `src/review/reconcile.ts` is pure, and every way this tool could embarrass you — a duplicate review, a review of a replaced revision, a review nobody asked for — is a test over plain objects in `reconcile.test.ts`.
+
+### Releases
+
+A release is a `v*` tag on `main` whose version matches `package.json`; the workflow refuses anything else. The version is ordinary code — it moves on a branch and goes through review like everything else, and the tag comes after it has landed:
+
+```sh
+bun pm version patch --no-git-tag-version   # when the version needs to move
+# commit, review, merge as usual
+
+VERSION=X.Y.Z   # what package.json says on origin/main
+
+git fetch --no-tags origin main &&
+git tag -a "v$VERSION" -m "v$VERSION" FETCH_HEAD &&
+git push origin "v$VERSION"
+```
+
+`--no-git-tag-version`, always, and the tag goes on `FETCH_HEAD` rather than on your local `main`: left to itself `bun pm version` tags whichever branch you happen to be on, and a local `main` that has drifted ahead survives `git pull --ff-only` without a word. The `&&` is load-bearing too — `git tag` refuses a name that already exists, and a pasted block that carried on regardless would push the old tag instead of the new one. Once pushed, a `v*` tag can be neither moved nor deleted — including one the workflow then refuses for not being on `main` — so a wrong tag is answered by the next version, never by repointing.
+
+The tag is what publishes: it rebuilds the binaries and attaches them with `install.sh`, then installs that candidate the way you would — the published installer, one runner per binary — and promotes it only once every artifact has started on its own platform. Nothing else cuts a release. [docs/specs/releases.md](docs/specs/releases.md) is the contract in full.
 
 ## Support
 

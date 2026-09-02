@@ -1,0 +1,70 @@
+# Every check a pull request has to pass, and the cross-compile the release
+# depends on — so a broken build is found on the pull request that broke it
+# rather than on the tag that needed it.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A newer push makes the older run's answer irrelevant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # macOS is where the background service runs; Linux is where `engwire run`
+    # lives under someone else's supervisor. Both are shipped, so both are run.
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: package.json
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun test
+
+  build:
+    # The binary users install is compiled here too, and then made to work.
+    # `bun run build` smoke-tests the host artifact; the integration tests then
+    # drive that same file as a process, which is the only place signals,
+    # process groups and SQLite are exercised with the runtime embedded rather
+    # than through `bun run`.
+    #
+    # On both platforms, because signals and process groups are exactly where
+    # Darwin and Linux diverge, and Darwin is where Engwire supervises anything
+    # itself.
+    name: build (${{ matrix.artifact }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, artifact: linux-x64 }
+          - { os: macos-latest, artifact: darwin-arm64 }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: package.json
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      - name: Integration tests against the binary that ships
+        run: |
+          ENGWIRE_TEST_BIN="$PWD/dist/engwire-${{ matrix.artifact }}" \
+            bun test test/integration/cli.test.ts test/integration/binary.test.ts
