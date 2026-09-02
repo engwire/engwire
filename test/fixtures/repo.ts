@@ -30,6 +30,6 @@ export async function createOrigin(dir: string): Promise<Origin> {
   await git(["commit", "-am", "second"], work);
   const secondSha = (await git(["rev-parse", "HEAD"], work)).trim();
 
-  await git(["clone", "--bare", work, bare]);
+  await git(["clone", "--bare", work, bare], dir);
   return { url: bare, sha, secondSha };
 }

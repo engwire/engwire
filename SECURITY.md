@@ -10,7 +10,9 @@ It listens on no port and accepts no inbound connection. Everything it does is o
 
 A worktree contains a contributor's code. Engwire does not build it, install its dependencies, or execute it — it checks out a revision and starts Claude Code in that directory.
 
-These guarantees are specific to each agent integration. Claude Code is the only supported agent today. Codex and Grok Build remain planned until their configuration and process boundaries have equivalent verification; their presence on the machine does not make Engwire use them.
+Git itself can run reviewer-configured programs while Engwire downloads or checks out untrusted content. Engwire clears repository-selecting `GIT_*` variables, disables the execution paths available to each clone, fetch and checkout command — configured filters, hook scripts, configured hooks and the filesystem monitor — and disables submodule recursion. Because a branch can name a filter from your global configuration through `.gitattributes`, Engwire suppresses that filter; Git LFS is the common example, so its pointer files remain pointers rather than being fetched from a server selected by the branch. One residual cannot be enumerated before a clone exists: configuration you scoped with `includeIf` specifically to Engwire's future clone path. The branch cannot request that configuration. [docs/experiments.md](docs/experiments.md) records the measurements and exact boundary.
+
+These guarantees are specific to each agent integration. Claude Code is the supported adapter; another CLI remains unsupported until its configuration and process boundaries receive equivalent verification.
 
 Engwire starts Claude with `--setting-sources user`, so the session loads your settings, your hooks and your skills — not the ones checked into the branch. There is no way to turn this off.
 
