@@ -90,6 +90,88 @@ describe("diagnose", () => {
     expect(checks.find((check) => check.label === "git")).toMatchObject({ ok: false });
   });
 
+  /** A `claude` that behaves however the case needs, plus a `gh` beside it. */
+  function tools(claudeScript: string): { home: string } {
+    const bin = join(dir, "tools");
+    mkdirSync(bin, { recursive: true });
+    const gh = join(bin, "gh");
+    writeFileSync(gh, "#!/bin/sh\necho alice\n");
+    chmodSync(gh, 0o755);
+    const claude = join(bin, "claude");
+    writeFileSync(claude, claudeScript);
+    chmodSync(claude, 0o755);
+
+    const home = join(dir, "home");
+    mkdirSync(join(home, "config"), { recursive: true });
+    writeFileSync(
+      join(home, "config", "config.toml"),
+      `[[review]]\nrepos = ["acme/*"]\nskill = "review-pr"\n\n` +
+        `[advanced]\ngh_bin = ${JSON.stringify(gh)}\nclaude_bin = ${JSON.stringify(claude)}\n`,
+    );
+    return { home };
+  }
+
+  /** A `claude` that answers the way 2.1.259 was measured to. */
+  const MEASURED_CLAUDE = `#!/bin/sh
+case "$*" in
+  "--setting-sources user --version") echo "9.9.9 (Claude Code)" ;;
+  "--setting-sources "*" --version")  echo "Invalid setting source" >&2; exit 1 ;;
+  *--version)                         echo "9.9.9 (Claude Code)" ;;
+  "--setting-sources user auth status") echo signed in ;;
+  *)                                  exit 1 ;;
+esac
+`;
+
+  test("a claude that still validates --setting-sources is green", async () => {
+    const { home } = tools(MEASURED_CLAUDE);
+
+    const checks = await diagnose({ ENGWIRE_HOME: home, PATH: "" });
+
+    expect(checks.find((check) => check.label === "claude")).toMatchObject({
+      ok: true,
+      note: expect.stringContaining("9.9.9"),
+    });
+    // The fake makes the unguarded auth invocation fail.
+    expect(checks.find((check) => check.label === "claude auth")).toMatchObject({ ok: true });
+  });
+
+  test("a claude that refuses the flag outright is not green either", async () => {
+    // Refusing an invalid value proves nothing unless Engwire's valid invocation
+    // also succeeds.
+    const { home } = tools(
+      `#!/bin/sh
+case "$*" in
+  "--setting-sources "*" --version") exit 1 ;;
+  *--version)                        echo "9.9.9 (Claude Code)" ;;
+  "--setting-sources user auth status") echo signed in ;;
+  *)                                 exit 1 ;;
+esac
+`,
+    );
+
+    const checks = await diagnose({ ENGWIRE_HOME: home, PATH: "" });
+
+    expect(checks.find((check) => check.label === "claude")).toMatchObject({ ok: false });
+  });
+
+  test("a claude that takes any setting source at all is not green", async () => {
+    // `--version` tolerates unknown flags, so accepting the nonsense setting
+    // source models a CLI that no longer recognises the flag.
+    const { home } = tools(
+      `#!/bin/sh
+case "$*" in
+  *--version)    echo "9.9.9 (Claude Code)" ;;
+  "--setting-sources user auth status") echo signed in ;;
+  *)             exit 1 ;;
+esac
+`,
+    );
+
+    const checks = await diagnose({ ENGWIRE_HOME: home, PATH: "" });
+
+    expect(checks.find((check) => check.label === "claude")).toMatchObject({ ok: false });
+  });
+
   test("probing a setup is not a way to execute the checkout it runs in", async () => {
     // Resolving the binary safely is only half of it. An absolute `claude` can
     // be a script, and `#!/usr/bin/env node` hands the interpreter straight
