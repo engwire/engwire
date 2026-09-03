@@ -32,15 +32,11 @@ export type ClaudeResult = {
  * `user` is therefore the only setting source: the reviewer's own configuration
  * and their own review skill, never the branch under review.
  *
- * Verified against Claude Code 2.1.251 rather than assumed, because the flag
- * governs a security boundary and the CLI moves quickly. In a checkout carrying
- * a project `CLAUDE.md`, a project skill, a project `.mcp.json` and a
- * `SessionStart` hook, `claude -p` loaded the memory and skill, ran the hook and
- * discovered the MCP server (held for approval). The same invocation with
- * `--setting-sources user` loaded none of them and ran no hook. `doctor` checks
- * that the installed `claude` still knows the flag.
+ * This is a measured security boundary: it keeps project memory, skills, hooks
+ * and MCP configuration out of the session. See `docs/experiments.md` for the
+ * evidence and its limits.
  */
-const SETTING_SOURCES = ["--setting-sources", "user"];
+export const SETTING_SOURCES = ["--setting-sources", "user"];
 
 /** How long a review gets to stop politely before it is killed. */
 const KILL_GRACE_MS = 10_000;

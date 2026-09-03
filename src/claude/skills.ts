@@ -43,8 +43,14 @@ export function skillFile(
  * The block a `SKILL.md` declares things about itself in. The closing `---` has
  * to be a line of its own: `---oops` ending the block early would put the rest
  * of the declarations outside it, where they read as no declaration at all.
+ *
+ * The `\n` before it is bare on purpose. A `\r?` there would take the carriage
+ * return off the last declaration in a CRLF file, so one `\r` would be removed
+ * here and a second by the value normalisation — two of them read as one line
+ * ending, and only for the last line in the block. Left in, the rule holds
+ * everywhere: one `\r` is the line ending, and any others stay in the value.
  */
-const FRONT_MATTER = /^---\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/;
+const FRONT_MATTER = /^---\r?\n([\s\S]*?)\n---[ \t]*(?:\r?\n|$)/;
 
 /** A file that opens a block `FRONT_MATTER` cannot close is one this cannot read. */
 const OPENS_FRONT_MATTER = /^---\r?\n/;
@@ -62,12 +68,18 @@ const OPENS_FRONT_MATTER = /^---\r?\n/;
  * `'user-invocable': true` as no declaration at all — and no declaration means
  * invocable. Whether the value or the key is the unmeasured part, it is
  * `frontMatterProblem` that refuses it.
+ *
+ * `[^\n]*` rather than `.`, which stops at a `\r` or a U+2028 while `$` matches
+ * before one — so `user-invocable: true\rgarbage` would read as a tidy `true`
+ * and the rest of the author's line would be discarded unseen. A newline is the
+ * only separator here; everything else stays in the value, where it is refused.
  */
-const DECLARATION = /^[ \t]*(["']?)user-invocable(["']?)[ \t]*:(.*)$/gm;
+const DECLARATION = /^[ \t]*(["']?)user-invocable(["']?)[ \t]*:([^\n]*)$/gm;
 
 /**
- * Values measured to keep a skill invocable by name. Claude does not treat this
- * as a YAML boolean; anything outside this set is conservatively rejected.
+ * Values Engwire accepts as keeping a skill invocable, matched exactly. Claude
+ * accepts more measured spellings, but generalising from them risks
+ * claiming and spending a review request if one stops working.
  */
 const INVOCABLE = new Set(["true", "1", "yes", "on"]);
 
@@ -76,23 +88,6 @@ const INVOCABLE = new Set(["true", "1", "yes", "on"]);
  * valid skill at this path, so the runner must reject it before claiming work.
  */
 const RESERVED = "synced";
-
-/**
- * The declared value, normalized only where Claude was measured indifferent: a
- * matching pair of double quotes, since `"true"` was measured invocable.
- * `'true'` was never measured either way, so it is left as it is and refused
- * with everything else unmeasured.
- *
- * A trailing `# comment` is deliberately left in for the same reason. YAML
- * would strip it; whether Claude does was never measured, and the readings
- * disagree exactly where being wrong is expensive — an unmeasured spelling held
- * is a line in `doctor`, one claimed is a review request spent on nothing.
- */
-function declaredValue(line: string): string {
-  const value = line.trim();
-  const quoted = /^"([\s\S]*)"$/.exec(value);
-  return quoted ? (quoted[1] ?? "") : value;
-}
 
 /**
  * What the front matter says that would stop Claude invoking this skill by
@@ -118,8 +113,12 @@ function frontMatterProblem(source: string): string | null {
   if (open !== close || open === "'") {
     return `quotes the key as ${open}user-invocable${close}, which is not a spelling Claude was measured to honour`;
   }
-  const value = declaredValue(raw);
-  return INVOCABLE.has(value.toLowerCase())
+  // Remove one CR from a CRLF line ending, then only the spaces and tabs Claude
+  // was measured to ignore. Quotes, comments and other Unicode whitespace stay
+  // in the value and therefore fail closed.
+  const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+  const value = line.replace(/^[ \t]+|[ \t]+$/g, "");
+  return INVOCABLE.has(value)
     ? null
     : `declares user-invocable: ${JSON.stringify(value)}; ${only}`;
 }

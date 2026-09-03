@@ -57,7 +57,7 @@ describe("skillPreflightProblem", () => {
     expect(skillPreflightProblem("never-written", env)).toContain("no SKILL.md at");
   });
 
-  test("only the values the CLI reads as true leave a skill invocable", () => {
+  test("only the allowlisted measured values leave a skill invocable", () => {
     // The silent failure, and the reason existence alone is not the predicate:
     // with `user-invocable: false` the production invocation printed *nothing
     // at all* and exited 0 — no `Unknown command`, no transcript, a `completed`
@@ -73,15 +73,37 @@ describe("skillPreflightProblem", () => {
       return skillPreflightProblem("review-pr", env) === null;
     };
 
-    for (const yes of ["true", "True", "TRUE", "1", "yes", "Yes", "on", "ON", '"true"']) {
+    for (const yes of ["true", "1", "yes", "on"]) {
       expect(invocable(yes)).toBe(true);
     }
     for (const no of ["false", "FALSE", "no", "off", "n", "0", "f", "banana", '"false"']) {
       expect(invocable(no)).toBe(false);
     }
-    // Only the double-quoted pair was measured. `'true'` is YAML's true and
-    // very likely Claude's, but likely is what this check exists not to accept.
+    // Each of these was measured to run, and each is still refused. The
+    // accepted set is a list of measurements, not a rule: case-folding or
+    // unquoting would cover spellings nobody measured, and it is the accepting
+    // direction that spends a review request. Refusing costs a poll and a
+    // `doctor` line naming the four that work.
+    for (const held of ["TRUE", "On", '"true"', '"yes"', '"1"']) {
+      expect(invocable(held)).toBe(false);
+    }
     expect(invocable("'true'")).toBe(false);
+    // The one normalisation left, and measured across all four values: the
+    // value is what the author meant, whatever their editor left around it.
+    for (const spaced of [" true", "true ", "\ttrue", "  yes  ", "\t1", "on\t"]) {
+      expect(invocable(spaced)).toBe(true);
+    }
+    // A non-breaking space is not whitespace to YAML, so this is a scalar
+    // Claude has never been shown to honour rather than a tidy `true`.
+    expect(invocable("\u00a0true")).toBe(false);
+    // Neither is a carriage return or a line separator, and `.` in a multiline
+    // pattern stops at both while `$` matches before them — so a value read
+    // with one would end at the `\r` and quietly discard the rest of what the
+    // author wrote. Only a newline separates a declaration from what follows.
+    expect(invocable("true\rgarbage")).toBe(false);
+    expect(invocable("true\u2028garbage")).toBe(false);
+    // And a second `\r` is a character in the value, not a line ending.
+    expect(invocable("true\r\r")).toBe(false);
     // A value with a space in it is the fail-open this shape exists to prevent:
     // matched loosely it is a false spelling, matched strictly it is no
     // declaration at all — and no declaration means invocable.
@@ -92,7 +114,6 @@ describe("skillPreflightProblem", () => {
     // `doctor`, while a wrong yes is a review request spent on nothing.
     expect(invocable("true # the reviewer keeps this on")).toBe(false);
     expect(invocable('"true # x"')).toBe(false);
-    // One matching pair of quotes comes off, and a lone quote is not a pair.
     expect(invocable('"true')).toBe(false);
     // A trailing YAML comment is part of the line, and was measured silent too.
     expect(invocable("false # model only")).toBe(false);
@@ -101,6 +122,17 @@ describe("skillPreflightProblem", () => {
     expect(skillPreflightProblem("review-pr", env)).toContain("user-invocable");
     // A skill that never mentions the field is invocable.
     write("review-pr", SKILL);
+    expect(skillPreflightProblem("review-pr", env)).toBeNull();
+  });
+
+  test("a SKILL.md written with CRLF line endings reads the same", () => {
+    // Measured on 2.1.259: Claude runs such a skill. The `\r` is the other
+    // half of the line ending, so it comes off as syntax rather than being
+    // read as part of the value — written here as a whole document, because
+    // that is what an editor produces and what the measurement used.
+    const { env, write } = claudeConfig();
+    write("review-pr", "---\r\nname: review-pr\r\nuser-invocable: true\r\n---\r\n");
+
     expect(skillPreflightProblem("review-pr", env)).toBeNull();
   });
 

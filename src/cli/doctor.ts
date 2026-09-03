@@ -10,7 +10,7 @@
 
 import { loadConfig, type Config } from "../config/config.ts";
 import { absolutePath, paths } from "../config/paths.ts";
-import { agentPath } from "../claude/run.ts";
+import { agentPath, SETTING_SOURCES } from "../claude/run.ts";
 import { skillPreflightProblem } from "../claude/skills.ts";
 import { accessSync, constants, mkdirSync } from "node:fs";
 import { createGh, GITHUB_ENV } from "../github/gh.ts";
@@ -226,33 +226,35 @@ async function ghChecks(
   }
 }
 
+const NOT_A_SOURCE = "not-a-setting-source";
+
 /**
  * Locating `claude` is not the same as being able to review with it.
  *
- * Two things beyond existence have to hold. It must still accept
- * `--setting-sources`, the flag that keeps the pull request's own Claude
- * configuration out of the review. That the flag still *behaves* that way was
- * established by experiment against a specific version (see `claude/run.ts`);
- * what this can check is that the interface it depends on has not gone away.
- * And it must be signed in, because an unauthenticated `claude` fails every
- * review identically, hours after anyone was watching.
+ * Beyond existence, Claude must validate the setting-source flag and be signed
+ * in. Validation checks the interface, not its semantics; the latter is the
+ * experiment recorded in `docs/experiments.md`. The auth probe carries the flag
+ * too because `doctor` may be run from an untrusted checkout.
  */
 async function claudeChecks(
   bin: string,
   env: Record<string, string | undefined>,
 ): Promise<Check[]> {
-  const help = await capture(bin, ["--help"], env);
-  const version = (await capture(bin, ["--version"], env)).stdout.trim();
-  const supportsSettingSources = help.stdout.includes("--setting-sources");
-  const auth = await capture(bin, ["auth", "status"], env);
+  // `--version` tolerates unknown flags and their values, so success alone does
+  // not prove this flag exists. Requiring an invalid value to fail does. Read
+  // only exit codes so a reworded diagnostic does not break the runner.
+  const version = await capture(bin, [...SETTING_SOURCES, "--version"], env);
+  const refusal = await capture(bin, ["--setting-sources", NOT_A_SOURCE, "--version"], env);
+  const validatesSettingSources = version.ok && !refusal.ok;
+  const auth = await capture(bin, [...SETTING_SOURCES, "auth", "status"], env);
 
   return [
     {
       label: "claude",
-      ok: supportsSettingSources,
-      note: supportsSettingSources
-        ? `${version || "installed"} (${bin})`
-        : `${bin} no longer accepts --setting-sources, which is how Engwire keeps a pull request's own Claude configuration out of the review — update Claude Code`,
+      ok: validatesSettingSources,
+      note: validatesSettingSources
+        ? `${version.stdout.trim() || "installed"} (${bin})`
+        : `could not confirm ${bin} still validates --setting-sources, which is how Engwire keeps a pull request's own Claude configuration out of the review — check or update Claude Code`,
     },
     {
       label: "claude auth",
