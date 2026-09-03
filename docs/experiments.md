@@ -40,6 +40,62 @@ The cost is that a file which really is an LFS pointer stays a pointer in the ch
 
 What none of this covers, and is not meant to: once Claude is running in that directory, a skill can execute whatever its `allowed-tools` permit. The claim measured here is narrower — what *Engwire's own* git does.
 
+## Is the timeline worth what it costs?
+
+Discovery wants one thing from a pull request's history: its `review_requested` entries, and their ids. Two endpoints carry them. `issues/<n>/timeline` is a superset that interleaves every commit, comment, review and cross-reference; `issues/<n>/events` carries the events and nothing else. Engwire reads one of them once per candidate on every poll, so this is a per-minute cost rather than a one-off.
+
+Measured with `gh` 2.98.0:
+
+```sh
+gh api --paginate 'repos/oven-sh/bun/issues/30412/timeline?per_page=100' | wc -c   # 6,049 KB
+gh api --paginate 'repos/oven-sh/bun/issues/30412/events?per_page=100'   | wc -c   #   375 KB
+```
+
+1,663 timeline entries against 305 events — 17 API pages against 4, at `per_page=100`. That pull request is alive and still collecting comments, so the figures move; the ratio is the durable half.
+
+`--paginate` merging REST pages into one JSON array is a property of `gh` rather than a given, and it has a floor. Measured against both sides of it, with a page size small enough to force three pages:
+
+```sh
+gh api --paginate 'repos/cli/cli/issues/14259/events?per_page=5' | jq length
+# gh 2.30.0 -> 5, 5, 2   three concatenated arrays; `JSON.parse` throws
+# gh 2.31.0 -> 12        one array
+```
+
+The change is [cli/cli#7190](https://github.com/cli/cli/pull/7190), released in 2.31.0 (June 2023). Note that `jq` accepts the concatenated form and Engwire's single `JSON.parse` does not, so on a multi-page response an old `gh` fails loudly rather than returning a quietly short list. Only on a multi-page one, though: a history that fits in a single page parses on either version, so an unsupported `gh` can look healthy until the first busy pull request. That is why the README states the floor rather than leaving it to be met.
+
+Cheaper is only free if the entries are the same entries. `UNIQUE(event_id)` is keyed on the id, so a database an earlier Engwire wrote has to go on matching, or the same GitHub request could be treated as fresh after the switch. Compared without normalising the two shapes — a team request carries no `requested_reviewer` and a user request no `requested_team`, and coalescing them would hide precisely the disagreement worth finding:
+
+```sh
+select='[.[] | select(.event == "review_requested")
+         | {id, node_id, url, created_at, commit_id,
+            reviewer: .requested_reviewer.login, team: .requested_team.slug}]
+        | sort_by(.id)'
+for pr in oven-sh/bun#30412 oven-sh/bun#20000 oven-sh/bun#25000 oven-sh/bun#12000 \
+          cli/cli#14259 cli/cli#10000 cli/cli#9000 cli/cli#8000; do
+  repo=${pr%%#*}; n=${pr##*#}
+  a=$(gh api --paginate "repos/$repo/issues/$n/timeline?per_page=100" | jq -c "$select")
+  b=$(gh api --paginate "repos/$repo/issues/$n/events?per_page=100"   | jq -c "$select")
+  [ "$a" = "$b" ] && echo "$pr agree" || echo "$pr DIFFER"
+done
+```
+
+Eight pull requests across two repositories, from 9 to 1,663 timeline entries, holding nine `review_requested` entries between them — five naming a user, four naming a team. Every field in that projection matched on every entry. `node_id` and `url` matching is the part that carries the argument: it makes these two projections of one underlying object rather than two records that happen to agree today. `commit_id` was null on all nine, which is the other thing Engwire leans on — the revision comes from the pull request, never the event.
+
+The other endpoint not taken is GraphQL, which could batch many candidates into one request rather than spending two `gh` subprocesses on each. Its event type cannot supply the REST database id Engwire uses:
+
+```sh
+gh api graphql -f query='{
+  event: __type(name: "ReviewRequestedEvent") { name fields { name } }
+  state: __type(name: "ReviewRequest")        { name fields { name } }
+}' --jq '.data[] | "\(.name): \([.fields[].name] | join(" "))"'
+# ReviewRequestedEvent: actor createdAt id pullRequest requestedReviewer
+# ReviewRequest:        asCodeOwner databaseId id pullRequest requestedReviewer
+```
+
+No `databaseId` on `ReviewRequestedEvent`: the node id is all there is, and the REST integer is what `UNIQUE(event_id)`, `BigInt` ordering and `CAST(event_id AS INTEGER)` are built on. `ReviewRequest` has a database id, but it is the current-state object discovery deliberately avoids for identity.
+
+What this does not establish: that the two endpoints agree in general, or that they are obliged to. Nine entries are worth what nine entries are worth, and the claim is about `review_requested` in the cases measured. `events` omits commits, comments and reviews outright, which is the point of it; anything that wants those has to go back to the timeline and pay.
+
 ## What GitHub's immutable releases actually freeze
 
 The release pipeline publishes a prerelease, verifies the published assets on four platforms, and then clears the prerelease flag. Whether that survives turning on release immutability was worth knowing before the first tag, because immutability applies only to releases published after it is enabled — never retroactively — so a decision to defer it is a decision to leave every release published in the meantime permanently editable.

@@ -9,13 +9,13 @@ case "$*" in
     echo "${FAKE_GH_LOGIN:-me}" ;;
   search*)                cat "$FAKE_GH_DIR/search.json" ;;
   "pr view"*)             cat "$FAKE_GH_DIR/pr.json" ;;
-  *timeline*)
-    # `repos/<owner>/<name>/issues/<n>/timeline`. A case that needs two
+  *"/events"*)
+    # `repos/<owner>/<name>/issues/<n>/events`. A case that needs two
     # repositories gives each its own file; everything else shares one.
     repo=$(printf '%s' "$*" | sed -n 's|.*repos/\([^/]*\)/\([^/]*\)/.*|\1-\2|p')
-    if [ -f "$FAKE_GH_DIR/timeline-$repo.json" ]
-    then cat "$FAKE_GH_DIR/timeline-$repo.json"
-    else cat "$FAKE_GH_DIR/timeline.json"
+    if [ -f "$FAKE_GH_DIR/events-$repo.json" ]
+    then cat "$FAKE_GH_DIR/events-$repo.json"
+    else cat "$FAKE_GH_DIR/events.json"
     fi ;;
   *) echo "fake gh: unexpected invocation: $*" >&2; exit 64 ;;
 esac

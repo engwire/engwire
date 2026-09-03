@@ -5,9 +5,10 @@
  * unique, not unique per repository. That is an assumption, and it was checked
  * rather than inherited: ids sampled from three unrelated repositories fell
  * inside one narrow band, never collided, and ordered the same way as their
- * timestamps. Note also that the timeline mixes id spaces — reviews and
- * comments carry ids from a different, shorter range — so this holds only
- * because discovery keeps `review_requested` entries and nothing else.
+ * timestamps. Discovery reads the issue events rather than the timeline, so
+ * every id it sees comes from that one space to begin with — the timeline's
+ * reviews and comments, which carry ids from a different and shorter range, are
+ * never fetched at all.
  *
  * Rows are never deleted. A run row is a few hundred bytes and a busy reviewer
  * produces a handful a day, so storage stays negligible at the expected scale
