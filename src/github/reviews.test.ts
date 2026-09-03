@@ -4,7 +4,7 @@ import { discoverReviewRequests } from "./reviews.ts";
 
 const SHA = "c".repeat(40);
 
-function gh(timeline: unknown[], detail: Record<string, unknown> = {}): Gh {
+function gh(events: unknown[], detail: Record<string, unknown> = {}): Gh {
   const responses: Record<string, unknown> = {
     search: [{ number: 42, repository: { nameWithOwner: "acme/api" } }],
     view: {
@@ -16,14 +16,14 @@ function gh(timeline: unknown[], detail: Record<string, unknown> = {}): Gh {
       reviewRequests: [{ login: "me" }],
       ...detail,
     },
-    timeline,
+    events,
   };
 
   return {
     text: async () => "",
     login: async () => "me",
     json: async <T,>(args: string[]) => {
-      const key = args[0] === "search" ? "search" : args[0] === "pr" ? "view" : "timeline";
+      const key = args[0] === "search" ? "search" : args[0] === "pr" ? "view" : "events";
       return responses[key] as T;
     },
   };
@@ -35,7 +35,7 @@ function event(over: Record<string, unknown> = {}) {
     event: "review_requested",
     created_at: "2026-08-01T10:00:00Z",
     requested_reviewer: { login: "me" },
-    // Live GitHub timelines leave this null on review_requested, which is why
+    // Live GitHub leaves this null on review_requested, which is why
     // the revision has to come from the pull request instead.
     commit_id: null,
     ...over,
@@ -85,12 +85,35 @@ describe("discoverReviewRequests", () => {
     expect(requests).toEqual([]);
   });
 
-  test("ignores other timeline events", async () => {
+  test("ignores other issue events", async () => {
     const requests = await discoverReviewRequests(
       gh([event({ id: 1, event: "review_request_removed" }), event({ id: 2, event: "labeled" })]),
       { login: "me", since },
     );
     expect(requests).toEqual([]);
+  });
+
+  test("reads all issue events, at the maximum page size", async () => {
+    // `--paginate` is the whole of the guarantee that a request on a later page
+    // is seen at all: GitHub caps a page at 100 entries, and a pull request
+    // busy enough to need a second one can still be asking for a review.
+    const calls: string[][] = [];
+    const responses = gh([event({ id: 1 })]);
+    const recording: Gh = {
+      ...responses,
+      json: async <T,>(args: string[]) => {
+        calls.push(args);
+        return responses.json<T>(args);
+      },
+    };
+
+    await discoverReviewRequests(recording, { login: "me", since });
+
+    expect(calls).toContainEqual([
+      "api",
+      "--paginate",
+      "repos/acme/api/issues/42/events?per_page=100",
+    ]);
   });
 
   test("ignores requests made before this installation existed", async () => {
@@ -142,7 +165,7 @@ describe("discoverReviewRequests", () => {
     const gated: Gh = {
       ...base,
       json: async <T,>(args: string[]) => {
-        if (args[0] === "api") throw new Error("the timeline was read too early");
+        if (args[0] === "api") throw new Error("the events were read too early");
         return base.json<T>(args);
       },
     };

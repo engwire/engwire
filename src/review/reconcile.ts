@@ -47,7 +47,7 @@ export type ReviewDecision =
   | { kind: "hold"; runId: string };
 
 /**
- * GitHub timeline ids are integers, and the store orders them as integers. A
+ * GitHub issue-event ids are integers, and the store orders them as integers. A
  * lexical fallback for values the API cannot produce would only be a second,
  * disagreeing definition of "newest"; `BigInt` throws instead, and needs no
  * opinion about how large an id may become.
@@ -135,7 +135,7 @@ export function reconcileReviews(input: {
     // unrecorded. GitHub does not reliably emit a fresh `review_requested`
     // when a draft becomes ready for reviewers it already had, so recording
     // this event would consume the only request Engwire is going to see.
-    // Discovery re-reads every candidate's timeline each poll, so the request
+    // Discovery re-reads every candidate's events each poll, so the request
     // simply waits until the pull request is ready, is withdrawn, or closes.
     //
     // It still makes an older queued run stale: that run is answering a

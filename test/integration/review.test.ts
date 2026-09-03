@@ -60,7 +60,7 @@ async function writeGitHub(options: {
       reviewRequests: options.reviewRequests ?? [{ login: "me" }],
     }),
   );
-  await Bun.write(join(ghDir, "timeline.json"), JSON.stringify(options.events));
+  await Bun.write(join(ghDir, "events.json"), JSON.stringify(options.events));
 }
 
 function reviewRequest(id: number, at: Date) {
@@ -96,11 +96,11 @@ async function writeTwoRepos(
     ]),
   );
   await Bun.write(
-    join(ghDir, "timeline-acme-api.json"),
+    join(ghDir, "events-acme-api.json"),
     JSON.stringify([reviewRequest(events.api, at("acme/api"))]),
   );
   await Bun.write(
-    join(ghDir, "timeline-acme-legacy.json"),
+    join(ghDir, "events-acme-legacy.json"),
     JSON.stringify([reviewRequest(events.legacy, at("acme/legacy"))]),
   );
 }
@@ -489,7 +489,7 @@ describe("a review request, end to end", () => {
     rt.gh = {
       ...gh,
       json: async <T,>(args: string[]) => {
-        // A search is what starts a cycle; the timeline reads that follow are
+        // A search is what starts a cycle; the event reads that follow are
         // the same one still going. The second cycle waits for the review the
         // first started to break.
         if (args[0] === "search" && ++polls === 2) await suspended;
@@ -791,7 +791,7 @@ describe("a review request, end to end", () => {
   test("does not discover anything while gh is a different account", async () => {
     // `--review-requested=@me` means whoever gh is now, so polling under a
     // switched account would search someone else's pull requests and could
-    // persist an old request of ours found in one of their timelines.
+    // persist an old request of ours found in one of their event streams.
     await writeGitHub({ sha: origin.sha, events: [reviewRequest(1, new Date())] });
 
     process.env.FAKE_GH_LOGIN = "someone-else";

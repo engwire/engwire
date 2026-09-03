@@ -8,7 +8,7 @@
  */
 
 /**
- * One `review_requested` timeline event naming this installation's reviewer.
+ * One `review_requested` issue event naming this installation's reviewer.
  *
  * `eventId` is GitHub's own id for the event and is this request's identity.
  * `headSha` is *not* from the event: GitHub leaves `commit_id` null on

@@ -90,7 +90,7 @@ function oneRequest(): string {
     }),
   );
   writeFileSync(
-    join(ghDir, "timeline.json"),
+    join(ghDir, "events.json"),
     JSON.stringify([
       {
         id: 1,

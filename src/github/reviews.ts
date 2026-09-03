@@ -3,14 +3,14 @@
  *
  * Two GitHub concepts get conflated easily and must not be. `requested_reviewers`
  * is *state* — GitHub clears a reviewer from it the moment they submit a review,
- * so it can never tell you that a review was requested twice. The timeline's
- * `review_requested` events are the durable record, each with its own id.
+ * so it can never tell you that a review was requested twice. The
+ * `review_requested` issue events are the durable record, each with its own id.
  *
  * Search discovers candidates cheaply, a direct pull-request read verifies the
- * current state, and the timeline supplies identity. The two reads per open
+ * current state, and the issue events supply identity. The two reads per open
  * candidate are affordable at one reviewer's scale.
  *
- * Team review requests are out of scope for now: the event carries
+ * Team review requests are unsupported: the event carries
  * `requested_team` instead of `requested_reviewer`, and answering them means
  * resolving the reviewer's team memberships first.
  */
@@ -33,7 +33,7 @@ type PullDetail = {
   reviewRequests: { login?: string }[];
 };
 
-type TimelineEvent = {
+type IssueEvent = {
   id: number;
   event: string;
   created_at: string;
@@ -73,12 +73,23 @@ async function pullDetail(gh: Gh, repo: string, number: number): Promise<PullDet
   ]);
 }
 
-/** `--paginate` without `--jq` merges array pages into one array, so one parse is correct. */
-async function timeline(gh: Gh, repo: string, number: number): Promise<TimelineEvent[]> {
-  return gh.json<TimelineEvent[]>([
+/**
+ * The issue events for a pull request, which is where `review_requested` lives.
+ *
+ * The timeline carries those entries too, along with every commit, comment,
+ * review and cross-reference — none of which this reads, on a call made once
+ * per candidate on every poll. What the two cost and how far they agree is
+ * measured in `docs/experiments.md`.
+ *
+ * `--paginate` because a pull request's history runs past one page, and without
+ * `--jq` it merges those pages into a single array, so one parse is correct on
+ * the `gh` the README requires.
+ */
+async function issueEvents(gh: Gh, repo: string, number: number): Promise<IssueEvent[]> {
+  return gh.json<IssueEvent[]>([
     "api",
     "--paginate",
-    `repos/${repo}/issues/${number}/timeline?per_page=100`,
+    `repos/${repo}/issues/${number}/events?per_page=100`,
   ]);
 }
 
@@ -107,7 +118,7 @@ export async function discoverReviewRequests(
   // limits.
   //
   // Within one, state before history, never both at once. The two reads answer
-  // different questions — `pr view` whether a review is wanted, the timeline
+  // different questions — `pr view` whether a review is wanted, the events
   // which request it is — and overlapping them can pair state observed after a
   // re-request with history read before it. Engwire would then act on the
   // superseded event and not see the newer one until the next poll, which is
@@ -123,7 +134,7 @@ export async function discoverReviewRequests(
     // still asking. So the direct read decides both, rather than the hit that
     // started this iteration: a pull request closed or a request withdrawn
     // since the search simply drops out, and any queued run for it is held on
-    // the next reconciliation. A dropped candidate costs no timeline call.
+    // the next reconciliation. A dropped candidate costs no second read.
     //
     // It settles the team case a second time too — a requested team has no
     // `login`, so it can never match the reviewer.
@@ -131,7 +142,7 @@ export async function discoverReviewRequests(
       continue;
     }
 
-    const events = await timeline(gh, repo, hit.number);
+    const events = await issueEvents(gh, repo, hit.number);
     requests.push(
       ...events
         .filter(
