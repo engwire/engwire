@@ -8,6 +8,7 @@
 import { ConfigError } from "../config/config.ts";
 import { paths } from "../config/paths.ts";
 import { GhError } from "../github/gh.ts";
+import { DatabaseTooNewError } from "../store/store.ts";
 
 import { VERSION } from "../version.ts";
 import { doctor } from "./doctor.ts";
@@ -52,13 +53,13 @@ export async function main(argv: string[]): Promise<number> {
   try {
     return await dispatch(argv);
   } catch (error) {
-    // A config error is the user's typo, and a `gh` that exited non-zero is
-    // GitHub having a moment — neither is a crash. Every command that reads
-    // `config.toml` can raise the first, and `run --once` is the command
-    // someone runs to find out whether their setup works, so a stack trace
-    // would bury the one line that says what is wrong. Anything else escapes:
-    // a broken runner should look broken.
-    if (error instanceof ConfigError || error instanceof GhError) {
+    // These are expected operational failures with actionable messages, so a
+    // stack trace would be noise. Anything else escapes and looks like a bug.
+    if (
+      error instanceof ConfigError ||
+      error instanceof GhError ||
+      error instanceof DatabaseTooNewError
+    ) {
       console.error(error.message);
       return 1;
     }
