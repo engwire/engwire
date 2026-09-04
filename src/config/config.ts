@@ -44,7 +44,7 @@ export type Config = {
 
 export class ConfigError extends Error {}
 
-export const DEFAULT_CONFIG_TOML = `# Engwire — automatic local review of pull requests that request your review.
+const PREAMBLE = `# Engwire — automatic local review of pull requests that request your review.
 #
 # Every rule below answers one question: when a repository asks for my review,
 # which Claude Code skill should look at it?
@@ -60,7 +60,73 @@ export const DEFAULT_CONFIG_TOML = `# Engwire — automatic local review of pull
 # [[review]]
 # repos = ["your-org/*"]
 # skill = "review-pr"
+#
+# A review request on a draft waits until the pull request is marked ready,
+# without you having to ask again. Set this to false to review drafts too.
+# skip_drafts = true
 `;
+
+/**
+ * The tuning defaults, written as the durations a config file would spell them.
+ *
+ * The parser and starter file share these strings so the documented values
+ * cannot drift from the defaults in force.
+ */
+const DEFAULTS = {
+  poll_interval: "60s",
+  worktree_ttl: "24h",
+  run_timeout: "20m",
+} as const;
+
+/**
+ * One `key = value` line, quoted by TOML's own serializer.
+ *
+ * JSON leaves U+007F literal while TOML requires it escaped. Because paths may
+ * contain that character, JSON quoting can create a starter TOML cannot parse.
+ */
+function setting(key: string, value: string): string {
+  return Bun.TOML.stringify({ [key]: value })!.trimEnd();
+}
+
+/** The config starter lives beside the parser that defines what it may contain. */
+export function starterConfig(bins: { ghBin: string; claudeBin: string }): string {
+  return `${PREAMBLE}
+[advanced]
+# Absolute paths: a background service does not naturally inherit your shell
+# environment, and which binary reviews your code should not depend on what
+# happens to be on a PATH.
+${setting("gh_bin", bins.ghBin)}
+${setting("claude_bin", bins.claudeBin)}
+
+# The rest have defaults you should not have to think about. They are here so
+# that the machine where one of them is wrong has something to edit. Durations
+# are a number and a unit: "500ms", "45s", "20m", "24h".
+
+# How often GitHub is asked which pull requests want your review.
+# ${setting("poll_interval", DEFAULTS.poll_interval)}
+
+# How long a finished review's checkout is kept, so you can see what Claude saw.
+# ${setting("worktree_ttl", DEFAULTS.worktree_ttl)}
+
+# How long one review may run before Engwire stops it and everything it started.
+# ${setting("run_timeout", DEFAULTS.run_timeout)}
+`;
+}
+
+/**
+ * Every key a `[[review]]` rule accepts, and every key `[advanced]` accepts.
+ *
+ * The starter-file test uses these lists so accepted settings remain documented.
+ */
+export const REVIEW_KEYS = ["repos", "skill", "skip_drafts"] as const;
+
+export const ADVANCED_KEYS = [
+  "poll_interval",
+  "worktree_ttl",
+  "run_timeout",
+  "gh_bin",
+  "claude_bin",
+] as const;
 
 const UNITS: Record<string, number> = { ms: 1, s: 1000, m: 60_000, h: 3_600_000 };
 const DAY = 24 * 3_600_000;
@@ -173,7 +239,7 @@ export function parseConfig(source: string): Config {
 
   const reviews = reviewEntries.map((entry, index): ReviewAutomation => {
     const t = table(entry, `review[${index}]`);
-    onlyKeys(t, ["repos", "skill", "skip_drafts"], `review[${index}]`);
+    onlyKeys(t, REVIEW_KEYS, `review[${index}]`);
     if (typeof t.skill !== "string" || t.skill.length === 0) {
       throw new ConfigError(`review[${index}].skill: expected a skill name`);
     }
@@ -184,7 +250,7 @@ export function parseConfig(source: string): Config {
         `review[${index}].skill: write the skill name without a leading slash`,
       );
     }
-    if (!SKILL_NAME.test(t.skill)) {
+    if (!isSkillName(t.skill)) {
       // `review pr` would be sent as `/review pr acme/api#42`, which invokes
       // `/review` with an argument nobody meant.
       throw new ConfigError(
@@ -233,31 +299,26 @@ export function parseConfig(source: string): Config {
   });
 
   const advanced = raw.advanced === undefined ? {} : table(raw.advanced, "advanced");
-  onlyKeys(
-    advanced,
-    ["poll_interval", "worktree_ttl", "run_timeout", "gh_bin", "claude_bin"],
-    "advanced",
-  );
+  onlyKeys(advanced, ADVANCED_KEYS, "advanced");
 
   return {
     reviews,
     advanced: {
-      pollIntervalMs:
-        advanced.poll_interval === undefined
-          ? 60_000
-          : duration(advanced.poll_interval, "advanced.poll_interval", {
-              min: 5_000,
-              max: DAY,
-            }),
-      worktreeTtlMs:
-        advanced.worktree_ttl === undefined
-          ? 24 * 3_600_000
-          // Zero is allowed: reclaiming the checkout immediately is a choice.
-          : duration(advanced.worktree_ttl, "advanced.worktree_ttl", { min: 0, max: 365 * DAY }),
-      runTimeoutMs:
-        advanced.run_timeout === undefined
-          ? 20 * 60_000
-          : duration(advanced.run_timeout, "advanced.run_timeout", { min: 1_000, max: DAY }),
+      pollIntervalMs: duration(
+        advanced.poll_interval ?? DEFAULTS.poll_interval,
+        "advanced.poll_interval",
+        { min: 5_000, max: DAY },
+      ),
+      // Zero is allowed: reclaiming the checkout immediately is a choice.
+      worktreeTtlMs: duration(
+        advanced.worktree_ttl ?? DEFAULTS.worktree_ttl,
+        "advanced.worktree_ttl",
+        { min: 0, max: 365 * DAY },
+      ),
+      runTimeoutMs: duration(advanced.run_timeout ?? DEFAULTS.run_timeout, "advanced.run_timeout", {
+        min: 1_000,
+        max: DAY,
+      }),
       ghBin: executable(advanced.gh_bin, "advanced.gh_bin", "gh"),
       claudeBin: executable(advanced.claude_bin, "advanced.claude_bin", "claude"),
     },
@@ -272,11 +333,20 @@ export async function loadConfig(file = paths().configFile): Promise<Config> {
   return parseConfig(await handle.text());
 }
 
-/**
- * Skill names as Claude Code spells them: what can follow a slash and still be
- * one word.
- */
 const SKILL_NAME = /^[A-Za-z0-9][A-Za-z0-9:_-]*$/;
+
+/**
+ * The name grammar a `[[review]]` rule accepts for its skill.
+ *
+ * Engwire's own, and deliberately not a claim about what Claude Code can
+ * invoke: what has not been measured is refused, not described. Exported
+ * because `setup` lists the skills on the machine, and a directory whose name
+ * is not this cannot go in a rule — offering it would be offering a config
+ * error to someone about to copy it.
+ */
+export function isSkillName(name: string): boolean {
+  return SKILL_NAME.test(name);
+}
 
 /**
  * The whole `repos` grammar: `owner/name`, `owner/*`, or `*`.

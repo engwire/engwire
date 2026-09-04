@@ -15,9 +15,29 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { skillFile, userSkills } from "../claude/skills.ts";
-import { DEFAULT_CONFIG_TOML } from "../config/config.ts";
+import { isSkillName, starterConfig } from "../config/config.ts";
 import { absolutePath, paths } from "../config/paths.ts";
 import { diagnose } from "./doctor.ts";
+
+/**
+ * Wrap comma-separated names without breaking one across lines.
+ *
+ * The default leaves two columns for `setup`'s indent in an 80-column terminal.
+ * Character counts are terminal columns because callers pass ASCII skill names.
+ */
+export function columns(names: string[], width = 78): string[] {
+  const lines: string[] = [];
+  for (const [index, name] of names.entries()) {
+    const piece = index === names.length - 1 ? name : `${name},`;
+    const line = lines.at(-1);
+    if (line !== undefined && `${line} ${piece}`.length <= width) {
+      lines[lines.length - 1] = `${line} ${piece}`;
+    } else {
+      lines.push(piece);
+    }
+  }
+  return lines;
+}
 
 export async function setup(): Promise<number> {
   const p = paths();
@@ -42,18 +62,7 @@ export async function setup(): Promise<number> {
     }
 
     mkdirSync(dirname(p.configFile), { recursive: true, mode: 0o700 });
-    writeFileSync(
-      p.configFile,
-      `${DEFAULT_CONFIG_TOML}
-[advanced]
-# Absolute paths: a background service does not naturally inherit your shell
-# environment, and which binary reviews your code should not depend on what
-# happens to be on a PATH.
-gh_bin = ${JSON.stringify(ghBin)}
-claude_bin = ${JSON.stringify(claudeBin)}
-`,
-      { mode: 0o600 },
-    );
+    writeFileSync(p.configFile, starterConfig({ ghBin, claudeBin }), { mode: 0o600 });
     console.log(`Wrote ${p.configFile}`);
   }
 
@@ -73,18 +82,15 @@ claude_bin = ${JSON.stringify(claudeBin)}
     console.log("on a contributor's code, so which repositories that happens for is");
     console.log(`yours to choose. Uncomment a [[review]] rule in ${p.configFile}.`);
     console.log("");
-    // The rule names a skill, and Engwire ships none: a name that is not
-    // installed is invisible at review time, since `claude -p` answers an
-    // unknown slash command by printing `Unknown command:` and exiting 0.
-    // `doctor` and the runner both refuse it, but naming what is actually
-    // here is what stops the rule being written against nothing. Discovered,
-    // never authored — what a review is stays the reviewer's to write.
-    const skills = userSkills();
+    // Engwire ships no skill. Offer installed names the config accepts without
+    // inventing what a review should do or handing someone an invalid value.
+    const skills = userSkills().filter(isSkillName);
     if (skills.length > 0) {
-      console.log(`Its \`skill\` names one of yours: ${skills.join(", ")}.`);
+      console.log("Its `skill` names one of yours:");
+      for (const line of columns(skills)) console.log(`  ${line}`);
     } else {
-      console.log("Its `skill` names a Claude Code skill of yours, and you have none yet —");
-      console.log(`Engwire ships no reviewer. Create ${skillFile("<name>")}.`);
+      console.log("Its `skill` names a Claude Code skill of yours, and none here can go");
+      console.log(`in a rule yet — Engwire ships no reviewer. Create ${skillFile("<name>")}.`);
     }
   } else {
     console.log(`Config: ${p.configFile}`);
@@ -92,6 +98,8 @@ claude_bin = ${JSON.stringify(claudeBin)}
 
   console.log("");
   console.log("Then:");
+  // Re-read the edited config and its skill before starting a runner.
+  console.log("  engwire doctor           re-check after editing the config");
   console.log("  engwire run --once       one poll, at most one review, then exit");
   if (process.platform === "darwin") {
     console.log("  engwire service install  keep it running in the background");
