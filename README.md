@@ -1,11 +1,11 @@
-# Engwire Runner
+# Engwire
 
-Reviews the pull requests that ask for your review — on your laptop, with your GitHub account, your Claude subscription, and your own review skill.
+Reviews the pull requests that ask for your review — on your laptop, with your GitHub account, your Claude subscription, and your own review skill. No Engwire account required.
 
 ```text
 Review requested from you
           ↓
-Engwire Runner (your machine)
+Engwire (your machine)
           ↓
   worktree at that revision
           ↓
@@ -14,9 +14,9 @@ Engwire Runner (your machine)
    your skill posts as you
 ```
 
-GitHub.com only — `GH_HOST` is pinned, so `gh` and the checkout can never disagree about which repository they mean. No new service receives your source code: Engwire drives the Git, `gh` and Claude Code already on your machine. No Engwire server, no bot account, no workflow to commit, no additional credential to your source.
+GitHub.com only — `GH_HOST` is pinned, so `gh` and the checkout can never disagree about which repository they mean. No new service receives your source code: Engwire drives the Git, `gh` and Claude Code already on your machine. The local workflow needs no Engwire-hosted service, no bot account, no workflow to commit, and no additional credential to your source.
 
-One installation belongs to one GitHub account — the one authenticated when it first ran. Point `ENGWIRE_HOME` somewhere else for a second.
+One installation belongs to one GitHub account — the one authenticated when it first ran. Point `ENGWIRE_HOME` somewhere else for a second. On macOS, only one installation per user runs in the background: launchd keeps one job under a fixed label, so `engwire service install` in a second installation replaces the first one's service and says so.
 
 ## Requirements
 

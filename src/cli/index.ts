@@ -17,7 +17,7 @@ import { serviceInstall, serviceUninstall } from "./service.ts";
 import { setup } from "./setup.ts";
 import { status } from "./status.ts";
 
-const USAGE = `Engwire Runner ${VERSION} — review the pull requests that ask for your review
+const USAGE = `Engwire ${VERSION} — review the pull requests that ask for your review
 
 Usage
   engwire setup              Check prerequisites and write a starter config

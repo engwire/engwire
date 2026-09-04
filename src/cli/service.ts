@@ -24,6 +24,22 @@ function unsupported(action: string): number {
   return 1;
 }
 
+/**
+ * What `install` says when the existing plist named another installation.
+ *
+ * Describe the plist snapshot, not the job displaced: another install could
+ * replace it before this one reaches launchctl.
+ */
+export function replacementNotice(previous: launchd.InstalledPlist): string[] {
+  if (previous.whose !== "theirs") return [];
+  return [
+    previous.supervises === null
+      ? "The service here was not one this installation could identify."
+      : `The service here was configured for ${previous.supervises}.`,
+    "One Engwire job runs under one label, so this installation now owns it.",
+  ];
+}
+
 export async function serviceInstall(): Promise<number> {
   if (process.platform !== "darwin") return unsupported("install");
 
@@ -58,13 +74,16 @@ export async function serviceInstall(): Promise<number> {
 
   const p = paths(environment);
   const config = await loadConfig(p.configFile);
+  const previous = launchd.installedPlist(p.dataDir);
   await launchd.install({
     executable: process.execPath,
     logsDir: p.logsDir,
     environment,
     runTimeoutMs: config.advanced.runTimeoutMs,
   });
-  console.log(`Installed ${launchd.plistPath()}`);
+  // The plist pins this exact binary, which may go stale after an upgrade.
+  console.log(`Installed ${launchd.plistPath()} — runs ${process.execPath}`);
+  for (const line of replacementNotice(previous)) console.log(line);
   console.log("Reinstall after editing config.toml; a running service does not reload it.");
   return 0;
 }

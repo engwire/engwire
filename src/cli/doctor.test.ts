@@ -5,7 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { paths } from "../config/paths.ts";
 import { Store } from "../store/store.ts";
-import { diagnose } from "./doctor.ts";
+import { installedPlist, plist } from "../service/launchd.ts";
+import { diagnose, serviceChecks } from "./doctor.ts";
 
 let dir: string;
 
@@ -220,5 +221,90 @@ esac
     // one in this directory was not run instead.
     expect(checks.find((check) => check.label === "claude")).toMatchObject({ ok: false });
     expect(existsSync(marker)).toBe(false);
+  });
+});
+
+describe("serviceChecks", () => {
+  /** A plist as `service install` would have written it, for a named home. */
+  function installed(executable: string, home = join(dir, "home")): string {
+    const file = join(dir, "com.engwire.local.plist");
+    writeFileSync(
+      file,
+      plist({
+        executable,
+        logsDir: join(dir, "logs"),
+        environment: { PATH: "/usr/bin", ENGWIRE_HOME: home },
+        runTimeoutMs: 20 * 60_000,
+      }),
+    );
+    return file;
+  }
+
+  const here = () => paths({ ENGWIRE_HOME: join(dir, "home") }).dataDir;
+
+  test("reports the program the plist pins", () => {
+    // Round-tripped through the generator with a path that has to survive XML
+    // escaping: a plist is written escaped, and a reader that forgets that
+    // would report a path nobody has.
+    const executable = join(dir, "a&b", "engwire");
+    mkdirSync(join(dir, "a&b"));
+    writeFileSync(executable, "#!/bin/sh\n");
+    chmodSync(executable, 0o755);
+
+    expect(serviceChecks(installedPlist(here(), installed(executable)))).toEqual([
+      { label: "service", ok: true, note: `runs ${executable}` },
+    ]);
+  });
+
+  test("a service pointing at a binary that is gone is not a green check", () => {
+    const check = serviceChecks(installedPlist(here(), installed(join(dir, "removed", "engwire"))))[0];
+
+    expect(check).toMatchObject({ label: "service", ok: false });
+    expect(check?.note).toContain("missing or not executable");
+    expect(check?.note).toContain("engwire service install");
+  });
+
+  test("another installation's service is reported, not blamed on this one", () => {
+    // A foreign service is useful context, but must not fail this installation.
+    const file = installed(join(dir, "gone", "engwire"), join(dir, "other-home"));
+
+    expect(serviceChecks(installedPlist(here(), file))).toEqual([
+      {
+        label: "service",
+        ok: true,
+        note: `supervises ${paths({ ENGWIRE_HOME: join(dir, "other-home") }).dataDir}, not this installation`,
+      },
+    ]);
+  });
+
+  test("a service that does not say whose it is counts as another's", () => {
+    // An unclaimable plist must not fail this installation's report.
+    const file = join(dir, "unreadable.plist");
+    writeFileSync(
+      file,
+      `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${join(dir, "gone", "engwire")}</string>
+    <string>run</string>
+  </array>
+</dict>
+</plist>
+`,
+    );
+
+    expect(serviceChecks(installedPlist(here(), file))).toEqual([
+      {
+        label: "service",
+        ok: true,
+        note: "a service plist is here that does not say which installation it belongs to",
+      },
+    ]);
+  });
+
+  test("nothing to say when no service is installed", () => {
+    expect(serviceChecks(installedPlist(here(), join(dir, "absent.plist")))).toEqual([]);
   });
 });

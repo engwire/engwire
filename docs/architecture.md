@@ -1,6 +1,6 @@
 # Architecture
 
-Engwire Runner watches GitHub for review requests addressed to you, checks out a pinned revision, and hands it to your Claude Code review skill. It runs on your laptop, with your `gh` and your Claude subscription. No Engwire server is involved, and no additional service is granted repository access.
+Engwire watches GitHub for review requests addressed to you, checks out a pinned revision, and hands it to your Claude Code review skill. This document describes that local system: it runs on your laptop, with your `gh` and your Claude subscription. No Engwire account or hosted service is involved, and no additional service is granted repository access.
 
 ```text
                     GitHub
@@ -100,6 +100,8 @@ The first check is immediately before the claim so a known-broken skill does not
 **An interrupted run is terminal.** If the runner dies mid-review, the run is recorded as `interrupted` and never retried. Engwire does not control the idempotency of `claude → gh → GitHub`, so a retry could post a second review of the same pull request. Re-requesting the review on GitHub creates a new event, and a new run.
 
 **One review at a time, not configurable.** Two concurrent reviews of the same repository would race over one bare clone — creating it, fetching into it, adding worktrees to it. This is a background process on a laptop; throughput was never the point, and per-repository serialisation is what a higher number would need first.
+
+**At most one installation runs in the background per macOS user.** `ENGWIRE_HOME` relocates configuration and state, but Engwire uses one fixed label in the user's launchd domain — so that user-level job belongs to exactly one installation, and the plist's own environment is the only record of which. An installation *is* its data directory — the queue, the runner lock and the worktrees all key on it — so Engwire reads that record by where the plist's environment resolves data to, not by which config root it names. `service install` therefore says when it has replaced another installation's service, and `doctor` reports a foreign one without failing on it. An unidentifiable plist is treated as somebody else's: the job it describes may be a runner in the middle of a review, and `engwire service uninstall` is the command that removes the user's job without asking whose it is.
 
 **One installation, one GitHub identity.** The queue is a list of decisions made on one person's behalf, and no run row names them — so an installation records the account of its first runner and refuses to start under another. `doctor` reports the same mismatch, and `service install` therefore refuses too: approving a service the runner is certain to reject would be the opposite of a preflight. Otherwise `gh auth switch` plus a restart would execute work accepted as Alice and post it as Bob. A second account is a second `ENGWIRE_HOME`.
 

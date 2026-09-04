@@ -10,7 +10,7 @@
     "type": "git",
     "url": "git+https://github.com/engwire/engwire.git"
   },
-  "homepage": "https://engwire.com/runner",
+  "homepage": "https://engwire.com",
   "bugs": {
     "url": "https://github.com/engwire/engwire/issues",
     "email": "support@engwire.com"

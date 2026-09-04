@@ -1,8 +1,8 @@
 # Security
 
-## What Engwire can reach
+## What local Engwire can reach
 
-Engwire holds no credentials of its own. It invokes your authenticated `gh` and your Claude Code installation as subprocesses, so it can do exactly what you can do, and revoking its access means revoking theirs.
+Local Engwire holds no credentials of its own. It invokes your authenticated `gh` and your Claude Code installation as subprocesses, so it can do exactly what you can do, and revoking its access means revoking theirs.
 
 It listens on no port and accepts no inbound connection. Everything it does is outbound, initiated by its own polling.
 
@@ -28,7 +28,7 @@ The review is a process group, and Engwire ends the group rather than the `claud
 
 This covers an ordinary tool tree, not a program determined to escape one: a descendant that calls `setsid` leaves the group and is beyond anything Engwire signals. Process groups are tidy-up, not a sandbox — `allowed-tools`, above, is the boundary that matters.
 
-## What Engwire will not touch
+## What local Engwire will not touch
 
 Your own checkouts. Engwire clones every repository into its own data directory and builds worktrees there. It never runs a git command in a directory it did not create.
 
