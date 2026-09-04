@@ -74,3 +74,8 @@ export function paths(env: Record<string, string | undefined> = process.env): Pa
     worktreeDir: (runId) => join(dataDir, "worktrees", runId),
   };
 }
+
+/** Whether the environment identifies a data directory without process fallbacks. */
+export function locatesData(env: Record<string, string | undefined>): boolean {
+  return Boolean(env.ENGWIRE_HOME || env.XDG_DATA_HOME || env.HOME);
+}

@@ -14,6 +14,7 @@ import { agentPath, SETTING_SOURCES } from "../claude/run.ts";
 import { skillPreflightProblem } from "../claude/skills.ts";
 import { accessSync, constants, mkdirSync } from "node:fs";
 import { createGh, GITHUB_ENV } from "../github/gh.ts";
+import { installedPlist, type InstalledPlist } from "../service/launchd.ts";
 import { Store } from "../store/store.ts";
 
 type Check = { label: string; ok: boolean; note: string };
@@ -180,8 +181,45 @@ export async function diagnose(
   return checks;
 }
 
+/**
+ * Build the diagnostic row for an installed service plist.
+ *
+ * Kept out of `diagnose` because `service install` uses that function as its
+ * preflight and is about to replace the plist.
+ */
+export function serviceChecks(service: InstalledPlist): Check[] {
+  if (service.whose === "none") return [];
+  // Report a foreign plist without making this installation's doctor fail.
+  if (service.whose === "theirs") {
+    return [
+      {
+        label: "service",
+        ok: true,
+        note:
+          service.supervises === null
+            ? "a service plist is here that does not say which installation it belongs to"
+            : `supervises ${service.supervises}, not this installation`,
+      },
+    ];
+  }
+  // `Bun.which` also rejects an absolute path that is not executable.
+  const ok = Bun.which(service.executable) !== null;
+  return [
+    {
+      label: "service",
+      ok,
+      note: ok
+        ? `runs ${service.executable}`
+        : `runs ${service.executable}, which is missing or not executable — run \`engwire service install\` to point it at this one`,
+    },
+  ];
+}
+
 export async function doctor(): Promise<number> {
-  const checks = await diagnose();
+  const checks = [
+    ...(await diagnose()),
+    ...serviceChecks(installedPlist(paths().dataDir)),
+  ];
   for (const check of checks) {
     console.log(`${check.ok ? "✓" : "✗"} ${check.label.padEnd(11)} ${check.note}`);
   }

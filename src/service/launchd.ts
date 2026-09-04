@@ -12,7 +12,6 @@
 import {
   chmodSync,
   closeSync,
-  existsSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -21,7 +20,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { locatesData, paths } from "../config/paths.ts";
+import { isAbsolute, join } from "node:path";
 
 const LABEL = "com.engwire.local";
 
@@ -135,6 +135,147 @@ export function plist(options: {
 `;
 }
 
+/**
+ * Which installation the service plist belongs to.
+ *
+ * Engwire installs one job under one fixed label in the user's launchd domain,
+ * while `ENGWIRE_HOME` can point at several installations — so "is this job
+ * mine?" has to be asked before anything reports on it.
+ *
+ * An installation *is* its data directory: the queue, the runner lock and the
+ * worktrees all key on that, so two environments resolving to the same one are
+ * the same installation however their config roots differ.
+ *
+ * Not necessarily the job launchd currently has loaded: `install` replaces the
+ * plist before booting out the old job.
+ *
+ * A plist that does not say whose it is counts as another's. The job it
+ * describes may be a runner in the middle of a review, and `engwire service
+ * uninstall` remains the command that removes the user's job without asking
+ * whose it is.
+ */
+export type InstalledPlist =
+  | { whose: "none" }
+  | { whose: "ours"; plistPath: string; executable: string }
+  | { whose: "theirs"; plistPath: string; supervises: string | null };
+
+/**
+ * @param dataDir The installation asking.
+ * @param plistFile The plist to read. Defaults to the fixed per-user path on
+ * macOS and to no plist elsewhere. An explicit path works on any platform for
+ * tests.
+ */
+export function installedPlist(
+  dataDir: string,
+  plistFile: string | null = process.platform === "darwin" ? plistPath() : null,
+): InstalledPlist {
+  if (plistFile === null) return { whose: "none" };
+  let source: string;
+  try {
+    source = readFileSync(plistFile, "utf8");
+  } catch (error) {
+    // Absent is no plist, which is not quite no service: a job stays loaded
+    // after somebody deletes the file describing it, and only launchd can be
+    // asked about that. Present and unreadable is a plist this cannot identify,
+    // which the rule above makes somebody else's. Neither may throw: `service
+    // install` asks this, and it is the command that repairs a service.
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return { whose: "none" };
+    return { whose: "theirs", plistPath: plistFile, supervises: null };
+  }
+  // Ignore commented-out keys before matching the generated document shape.
+  const plist = source.replace(/<!--[\s\S]*?-->/g, "");
+  const generated = parseGenerated(plist);
+  // The label is the job `uninstall` boots out, so only a plist carrying it
+  // describes something this could act on — and nothing else gets an
+  // installation identity. Reporting that a foreign job "supervises" this
+  // installation is worse than reporting nothing about it.
+  if (!generated || generated.label !== LABEL) {
+    return { whose: "theirs", plistPath: plistFile, supervises: null };
+  }
+  // An environment that locates nothing would resolve through `paths()`'s own
+  // fallbacks to the *asking* installation and read as `ours` — the one answer
+  // this must not give about a job it cannot identify.
+  const supervises = locatesData(generated.environment) ? paths(generated.environment).dataDir : null;
+  if (supervises !== dataDir) return { whose: "theirs", plistPath: plistFile, supervises };
+  return {
+    whose: "ours",
+    plistPath: plistFile,
+    executable: generated.executable,
+  };
+}
+
+/**
+ * Match the head of the generated root dictionary — the three keys ownership
+ * turns on — rather than finding each independently, which could combine values
+ * from nested dictionaries. What follows is read only to check that none of
+ * those three keys comes round again.
+ */
+const GENERATED =
+  /^<\?xml[^>]*\?>\s*<!DOCTYPE[^>]*>\s*<plist[^>]*>\s*<dict>\s*<key>Label<\/key>\s*<string>([^<]*)<\/string>\s*<key>ProgramArguments<\/key>\s*<array>\s*<string>([^<]*)<\/string>\s*<string>run<\/string>\s*<\/array>\s*<key>EnvironmentVariables<\/key>\s*<dict>([\s\S]*?)<\/dict>/;
+
+/** A key name, spelled plainly — never an entity, a character reference, or anything else to decode. */
+const KEY_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/** The three the head established. Meeting one again means the document disagrees with itself. */
+const OWNERSHIP = new Set(["Label", "ProgramArguments", "EnvironmentVariables"]);
+
+/** What a plist says it is: which job, which program, and for which installation. */
+function parseGenerated(
+  plist: string,
+): { label: string; executable: string; environment: Record<string, string> } | null {
+  const match = GENERATED.exec(plist);
+  if (!match) return null;
+  // The head is matched, but the rest of the root dictionary could repeat one
+  // of the three keys ownership turns on. Whether launchd then takes the first,
+  // the last, or refuses the file has not been measured here, so a document
+  // that repeats one is not a document this will answer about.
+  const tail = plist.slice(match[0].length);
+  for (const [, name = ""] of tail.matchAll(/<key\b[^>]*>([\s\S]*?)<\/key>/g)) {
+    // Attributes and all, because the name is whatever a reader would take from
+    // between the tags: `<key x="">Label</key>` says `Label`. So do
+    // `<key><![CDATA[Label]]></key>` and `<key>La&#98;el</key>`, but this reader
+    // decodes neither, so rather than learn to, it declines to answer about a
+    // document that spells a key anything but plainly.
+    if (!KEY_NAME.test(name) || OWNERSHIP.has(name)) return null;
+  }
+  const executable = unxml(match[2] as string);
+  // `install` records an absolute path and never revisits it. A bare name would
+  // resolve against the PATH of whoever is diagnosing, which is not the one
+  // launchd hands the job.
+  if (!isAbsolute(executable)) return null;
+  // `plist()` writes a flat dictionary of pairs. The capture above stops at the
+  // first `</dict>`, so a nested one would otherwise hand its keys up as though
+  // they were the job's own: require the whole body to be pairs and whitespace.
+  const body = match[3] ?? "";
+  const environment: Record<string, string> = {};
+  let read = 0;
+  for (const pair of body.matchAll(/<key>([^<]*)<\/key>\s*<string>([^<]*)<\/string>/g)) {
+    if (body.slice(read, pair.index).trim() !== "") return null;
+    const key = pair[1] as string;
+    // Same rule, and the same reason: `ENGWIRE&#95;HOME` is a second
+    // `ENGWIRE_HOME` to launchd, and a different string to the check below.
+    if (!KEY_NAME.test(key)) return null;
+    // `Object.entries` cannot produce the same key twice, so one that repeats
+    // did not come from here.
+    if (key in environment) return null;
+    environment[key] = unxml(pair[2] as string);
+    read = pair.index + pair[0].length;
+  }
+  if (body.slice(read).trim() !== "") return null;
+  return { label: unxml(match[1] as string), executable, environment };
+}
+
+/** The inverse of `xml()`. Ampersands last, or an escaped entity unescapes twice. */
+function unxml(text: string): string {
+  return text
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#x27;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
 /** Where a user agent lives. Darwin only, and `getuid` is always there. */
 const userDomain = (): string => `gui/${process.getuid!()}`;
 
@@ -161,7 +302,20 @@ export async function install(options: {
   //
   // launchd refuses a plist that is group- or world-writable, and an existing
   // one keeps whatever mode it already had, so set it rather than assume it.
-  const previous = existsSync(file) ? readFileSync(file) : null;
+  // Bytes to put back, `null` for nothing to put back, and `undefined` for a
+  // plist that is there and unreadable. Three different rollbacks: collapsing
+  // the last two would delete this user's only plist while its job is
+  // still loaded. Not a reason to refuse the command either — this is what
+  // someone runs when the installed service is the thing that is wrong.
+  let previous: Buffer | null | undefined;
+  try {
+    previous = readFileSync(file);
+  } catch (error) {
+    previous = (error as NodeJS.ErrnoException).code === "ENOENT" ? null : undefined;
+  }
+  // Two `service install`s at once are not supported: they share this pathname
+  // and the label they bootstrap, so one can end up loading the other's plist.
+  // A laptop command someone types is not worth a cross-installation lock.
   const pending = `${file}.new`;
   try {
     writeFileSync(pending, plist(options), { mode: 0o600 });
@@ -174,10 +328,12 @@ export async function install(options: {
   // Reinstalling is how a running service picks up an edited config, so from
   // here on the file on disk no longer describes what is loaded. Either
   // launchctl call can fail, and the plist that described the old install is
-  // put back when one does.
+  // put back when its bytes could be read.
   const restore = () => {
     if (previous) writeFileSync(file, previous, { mode: 0o600 });
-    else rmSync(file, { force: true });
+    else if (previous === null) rmSync(file, { force: true });
+    // Unreadable: no bytes to put back, and removing the plist just written
+    // would leave a loaded job with nothing on disk describing it at all.
   };
 
   try {
