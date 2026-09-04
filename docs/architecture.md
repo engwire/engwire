@@ -56,7 +56,7 @@ Engwire Runner watches GitHub for review requests addressed to you, checks out a
 | `review/execute.ts` | One review, start to finish |
 | `git/` | The only place `git` is invoked; bare clones and worktrees |
 | `claude/` | The only place `claude` is invoked |
-| `store/` | SQLite: one table of runs, plus `meta` for the watermark and the current runner |
+| `store/` | SQLite state, including schema-version enforcement |
 | `service/` | The launchd agent, and the single-runner lock |
 
 Process spawning stays at the edges. There is no shared `exec` helper: `gh`, `git` and `claude` want different things from a subprocess, and a common wrapper would grow until it had reimplemented a process library. For the same reason there is no platform-neutral service interface above `launchd.ts` — one implementation does not need an abstraction over it, and `cli/service.ts` makes the macOS check itself.
@@ -104,6 +104,8 @@ The first check is immediately before the claim so a known-broken skill does not
 **One installation, one GitHub identity.** The queue is a list of decisions made on one person's behalf, and no run row names them — so an installation records the account of its first runner and refuses to start under another. `doctor` reports the same mismatch, and `service install` therefore refuses too: approving a service the runner is certain to reject would be the opposite of a preflight. Otherwise `gh auth switch` plus a restart would execute work accepted as Alice and post it as Bob. A second account is a second `ENGWIRE_HOME`.
 
 **The runner lock is a held SQLite transaction, not a lock file.** The kernel releases it when the process dies, so there is no stale-file protocol or PID-reuse race. With one runner per installation, every row still marked `running` at startup belonged to the dead lock holder and can be marked `interrupted`.
+
+**A database records the schema it was written with, and a newer one is refused.** Engwire is replaced in place over durable state: `UNIQUE(event_id)` only means "acted on once" if its rows survive upgrades. The version is SQLite's `user_version`; builds with this gate refuse a higher value rather than reading a schema they only partly understand. Version 0.1.0 predates the gate but used the same shape, so its unstamped database is adopted as version 1. There is no migration framework before a migration exists, but the first schema change must coordinate with an old runner that an upgrade deliberately leaves in flight. The stamp makes that future decision possible without guessing at machinery now.
 
 **Identity is checked before discovery, before every claim, and once more before the agent starts.** `gh auth switch` can also move the account while the runner is up. `--review-requested=@me` means whichever account `gh` is using *now*, while the event filter uses the one the runner started with — so polling under a switched account would search someone else's pull requests and could persist an old request of the reviewer's found in one of their pull requests. An outage before the claim leaves the work queued and avoids preparing a checkout for a review that cannot safely start. The third check closes the longer window opened by checkout preparation: a first clone can take minutes, during which a switched account would make the skill post in somebody else's name. Since the agent has not started, that late failure can give the claim back rather than spend it.
 

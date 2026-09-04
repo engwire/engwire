@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { Store } from "./store.ts";
+import { Database } from "bun:sqlite";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseTooNewError, Store } from "./store.ts";
 
 /** Every fixture starts queued; tests reach other states through Store transitions. */
 type QueuedSeed = Extract<Parameters<Store["insert"]>[0], { status: "queued" }>;
@@ -279,5 +283,114 @@ describe("Store", () => {
     store.finish("done", "dismissed", "no_automation");
 
     expect(store.activeRuns().map((run) => run.id).sort()).toEqual(["queued", "running"]);
+  });
+});
+
+describe("schema version", () => {
+  let dir: string;
+  let file: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "engwire-schema-"));
+    file = join(dir, "engwire.db");
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function journalModeOf(path: string): string {
+    const db = new Database(path);
+    try {
+      return db.query<{ journal_mode: string }, []>("PRAGMA journal_mode").get()!.journal_mode;
+    } finally {
+      db.close();
+    }
+  }
+
+  function versionOf(path: string): number {
+    const db = new Database(path);
+    try {
+      return db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version;
+    } finally {
+      db.close();
+    }
+  }
+
+  test("a database records the schema it was written with", () => {
+    new Store(file).close();
+    expect(versionOf(file)).toBe(1);
+  });
+
+  test("a stamped database does not recreate a missing table", () => {
+    new Store(file).close();
+
+    const db = new Database(file);
+    db.exec("DROP TABLE review_runs");
+    db.close();
+
+    // Handing it a fresh empty table would answer "not reviewed yet" for every
+    // outstanding request, and each of those answers spends a review.
+    const store = new Store(file);
+    expect(() => store.recentRuns()).toThrow();
+    store.close();
+  });
+
+  test("a database from before versioning is adopted, not rebuilt", () => {
+    // The rows are the dedup guarantee — losing them would let every
+    // outstanding review request be acted on a second time.
+    const store = new Store(file);
+    seed(store);
+    store.close();
+
+    const db = new Database(file);
+    db.exec("PRAGMA user_version = 0");
+    db.close();
+
+    const reopened = new Store(file);
+    expect(reopened.recentRuns().length).toBe(1);
+    reopened.close();
+    expect(versionOf(file)).toBe(1);
+  });
+
+  test("failed schema adoption rolls back every change", () => {
+    // The incomplete table makes index creation fail after `meta` is created,
+    // providing a natural interruption in the middle of SCHEMA.
+    const db = new Database(file);
+    db.exec("CREATE TABLE review_runs (id TEXT PRIMARY KEY)");
+    db.close();
+
+    expect(() => new Store(file)).toThrow();
+
+    const reopened = new Database(file);
+    try {
+      const meta = reopened
+        .query<{ count: number }, []>(
+          "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'meta'",
+        )
+        .get()!.count;
+      expect(meta).toBe(0);
+      expect(
+        reopened.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version,
+      ).toBe(0);
+    } finally {
+      reopened.close();
+    }
+  });
+
+  test("a database from a newer engwire is refused rather than half-read", () => {
+    const store = new Store(file);
+    seed(store);
+    store.close();
+
+    const db = new Database(file);
+    db.exec("PRAGMA user_version = 999");
+    // Journal mode is persistent, so it reveals any write before the refusal.
+    db.exec("PRAGMA journal_mode = delete");
+    db.close();
+
+    expect(() => new Store(file)).toThrow(DatabaseTooNewError);
+    expect(versionOf(file)).toBe(999);
+    expect(journalModeOf(file)).toBe("delete");
   });
 });

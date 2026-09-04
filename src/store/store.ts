@@ -56,6 +56,28 @@ CREATE INDEX IF NOT EXISTS review_runs_requested
   ON review_runs (requested_at, CAST(event_id AS INTEGER));
 `;
 
+/** The schema this Engwire understands, stored in SQLite's `user_version`. */
+const SCHEMA_VERSION = 1;
+
+/** The database was written by a newer Engwire than this one. */
+export class DatabaseTooNewError extends Error {
+  constructor(found: number) {
+    super(
+      `This database uses schema ${found}, but this Engwire version understands schema ${SCHEMA_VERSION}. ` +
+        "Upgrade Engwire, or point ENGWIRE_HOME at a separate installation.",
+    );
+    this.name = "DatabaseTooNewError";
+  }
+}
+
+/** The schema this database was written with; 0 is a fresh file, or one from before the stamp. */
+function schemaVersion(db: Database): number {
+  // Always a row: 0 is the pragma's own default, so a missing one would mean
+  // SQLite is not behaving, and reading that as "unstamped, go ahead and adopt
+  // it" is the one answer this gate must not give.
+  return db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version;
+}
+
 type Row = {
   id: string;
   event_id: string;
@@ -159,9 +181,27 @@ export class Store {
       chmodSync(dirname(file), 0o700);
     }
     this.db = new Database(file, { create: true });
+    // Check before any initialization below can persist state, so refusing a
+    // newer database leaves it untouched. Close the handle the caller never receives.
+    const version = schemaVersion(this.db);
+    if (version > SCHEMA_VERSION) {
+      this.db.close();
+      throw new DatabaseTooNewError(version);
+    }
     this.db.exec("PRAGMA journal_mode = WAL");
     this.db.exec("PRAGMA foreign_keys = ON");
-    this.db.exec(SCHEMA);
+    // SQLite uses 0 for both a fresh file and a pre-stamp database. v0.1.0 had
+    // this same schema, so the idempotent statements preserve its rows. A
+    // stamped database skips creation: missing tables then fail loudly instead
+    // of being recreated empty and losing the deduplication guarantee. Create
+    // and stamp in one transaction so they cannot disagree after a crash.
+    if (version === 0) {
+      this.db.transaction(() => {
+        this.db.exec(SCHEMA);
+        // Pragmas take no bound parameters; the value is this file's own constant.
+        this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+      })();
+    }
   }
 
   close(): void {
