@@ -1,5 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { ConfigError, matchesRepo, parseConfig } from "./config.ts";
+import {
+  ADVANCED_KEYS,
+  ConfigError,
+  matchesRepo,
+  parseConfig,
+  REVIEW_KEYS,
+  starterConfig,
+} from "./config.ts";
 
 describe("parseConfig", () => {
   test("reads review rules and applies defaults", () => {
@@ -184,5 +191,47 @@ describe("matchesRepo", () => {
     ["ACME/API", "acme/api", true],
   ])("%s vs %s", (pattern, repo, expected) => {
     expect(matchesRepo(pattern, repo)).toBe(expected);
+  });
+});
+
+describe("starterConfig", () => {
+  const starter = starterConfig({ ghBin: "/opt/homebrew/bin/gh", claudeBin: "/usr/local/bin/claude" });
+
+  test("is a file this parser accepts", () => {
+    const config = parseConfig(starter);
+
+    expect(config.reviews).toEqual([]);
+    expect(config.advanced.ghBin).toBe("/opt/homebrew/bin/gh");
+    expect(config.advanced.claudeBin).toBe("/usr/local/bin/claude");
+  });
+
+  test("quotes a path the way TOML reads it, not the way JSON writes it", () => {
+    // U+007F is legal in a path; JSON leaves it literal while TOML requires an
+    // escape, so JSON quoting can produce a starter the parser refuses.
+    const awkward = '/opt/ho\x7fme/a"b\\c/gh';
+
+    const config = parseConfig(starterConfig({ ghBin: awkward, claudeBin: "/usr/bin/claude" }));
+
+    expect(config.advanced.ghBin).toBe(awkward);
+  });
+
+  test("the settings it shows and the settings the parser takes are one set", () => {
+    // Uncomment every example assignment, including future legal bare keys,
+    // then parse it. Sections are document structure rather than settings.
+    const uncommented = starter.replace(/^# (\[\[review\]\]|[A-Za-z0-9_-]+ = )/gm, "$1");
+
+    for (const key of [...REVIEW_KEYS, ...ADVANCED_KEYS]) {
+      expect(uncommented).toMatch(new RegExp(`^${key} = `, "m"));
+    }
+
+    const config = parseConfig(uncommented);
+
+    expect(config.reviews).toEqual([
+      { repos: ["your-org/*"], skill: "review-pr", skipDrafts: true },
+    ]);
+    // Every shown value is also the default applied when its line is absent.
+    expect(config.advanced).toEqual(parseConfig(starter).advanced);
+    const silent = uncommented.replace(/^skip_drafts = .*$/m, "");
+    expect(parseConfig(silent).reviews).toEqual(config.reviews);
   });
 });
