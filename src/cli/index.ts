@@ -14,9 +14,25 @@ import { VERSION } from "../version.ts";
 import { doctor } from "./doctor.ts";
 import { run } from "./run.ts";
 import { serviceInstall, serviceUninstall } from "./service.ts";
+import { installedService } from "../service/launchd.ts";
 import { setup } from "./setup.ts";
 import { status } from "./status.ts";
+import { uninstall } from "./uninstall.ts";
 
+/**
+ * Every command, on every platform — a usage list that changed shape by machine
+ * would make two people reading the same output disagree about what exists.
+ *
+ * Every flag those commands take, too. A flag the dispatcher accepts and this
+ * list omits is one nobody finds, and each refusal below prints the command's
+ * grammar, so `index.test.ts` has two statements of it to compare.
+ *
+ * The two launchd-only ones are marked instead. "(macOS)" rather than
+ * "(launchd)": the reader deciding whether a line applies to them is answering
+ * a platform question, and only somebody who already knows launchd is macOS
+ * could read the jargon as that answer. Unmarked, the round trip is running the
+ * command to be told it exits 1 anywhere else.
+ */
 const USAGE = `Engwire ${VERSION} — review the pull requests that ask for your review
 
 Usage
@@ -24,8 +40,9 @@ Usage
   engwire run [--once]       Watch for review requests and review them
   engwire status             Runner state and recent reviews
   engwire doctor             Diagnose the local setup
-  engwire service install    Run in the background (launchd)
-  engwire service uninstall  Stop running in the background
+  engwire service install    Run in the background (macOS)
+  engwire service uninstall  Stop running in the background (macOS)
+  engwire uninstall [--yes]  Preview or remove this installation's data, config and service
 
 Config
   ${paths().configFile}
@@ -88,6 +105,14 @@ async function dispatch(argv: string[]): Promise<number> {
       if (action === "install") return serviceInstall();
       if (action === "uninstall") return serviceUninstall();
       return usageError("engwire service <install|uninstall>");
+    }
+    case "uninstall": {
+      // Confirmed by a word, not by a prompt: this is the one command that
+      // deletes a directory of private source, and it has to behave the same
+      // whether or not anyone is watching the terminal.
+      const yes = rest.length === 1 && rest[0] === "--yes";
+      if (!yes && !noArgs(rest)) return usageError("engwire uninstall [--yes]");
+      return uninstall({ confirmed: yes, ...(await installedService(paths().dataDir)) });
     }
     case "--version":
     case "version":

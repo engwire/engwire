@@ -28,6 +28,12 @@ The review is a process group, and Engwire ends the group rather than the `claud
 
 This covers an ordinary tool tree, not a program determined to escape one: a descendant that calls `setsid` leaves the group and is beyond anything Engwire signals. Process groups are tidy-up, not a sandbox — `allowed-tools`, above, is the boundary that matters.
 
+## What local Engwire keeps
+
+One data directory, created private to your user, holding Engwire's own bare clones of the repositories it has reviewed, the worktrees it checked out, the transcript of each review, and a database of which requests it has already seen. Worktrees are reclaimed after the configured retention window, one day by default; the rest stays until you remove it. The clones are blobless, and most of what one costs is its first review: a repository of 12,000 commits measured 35 MB after ten reviews spread across its history, against 83 MB to clone it normally ([docs/experiments.md](docs/experiments.md)).
+
+`engwire uninstall` previews the paths and removes nothing. `engwire uninstall --yes` removes the data, configuration and any launchd job this installation can claim. A foreign or unidentifiable job is left alone; a data or config root that is itself a symlink is unlinked rather than followed. [The service-ownership spec](docs/specs/service-ownership.md) covers the full rule and the explicit command for removing an unclaimed job.
+
 ## What local Engwire will not touch
 
 Your own checkouts. Engwire clones every repository into its own data directory and builds worktrees there. It never runs a git command in a directory it did not create.

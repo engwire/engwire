@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { paths } from "../config/paths.ts";
 import { Store } from "../store/store.ts";
@@ -72,6 +72,49 @@ async function invoke(argv: string[]): Promise<{ code: number; said: string }> {
 }
 
 describe("main", () => {
+  test("every command and flag the usage text promises is one the dispatcher accepts", async () => {
+    // The two drift apart in the direction that matters: a command removed
+    // from dispatch but left in the help is one a reader will type and be told
+    // does not exist, and a flag the dispatcher takes but the help omits is one
+    // nobody finds. Each is given an argument it cannot take, so the grammar
+    // answers without the command running — and that refusal names the flags
+    // the command accepts, which is the second statement to compare the help
+    // against.
+    // `invoke` rather than `dispatch`: the help text goes to stdout, which the
+    // dispatcher harness deliberately swallows.
+    const { said: help } = await invoke(["help"]);
+    const promised = [
+      ...help.matchAll(/^ {2}engwire ([a-z]+(?: [a-z]+)?)((?: \[--[a-z-]+\])*)/gm),
+    ].map((match) => ({ command: match[1]!, flags: match[2]!.trim() }));
+
+    expect(promised.length).toBeGreaterThan(4);
+    for (const { command, flags } of promised) {
+      const { code, said } = await dispatch([...command.split(" "), "--not-a-flag"]);
+
+      expect(code).toBe(1);
+      expect(said).toContain("Usage:");
+      expect(said).not.toContain("Unknown command");
+      expect(said.match(/\[--[a-z-]+\]/g)?.join(" ") ?? "").toBe(flags);
+    }
+  });
+
+  test("a runner with no rules refuses, rather than dismissing the whole queue", async () => {
+    // The refusal is a data-loss guard, not tidiness. A dismissal is permanent,
+    // so a first poll with nothing configured would record every outstanding
+    // request as `no_automation` and never reconsider one of them.
+    install();
+    mkdirSync(dirname(paths().configFile), { recursive: true });
+    writeFileSync(paths().configFile, "# nothing configured yet\n");
+
+    const { code, said } = await invoke(["run", "--once"]);
+
+    expect(code).toBe(1);
+    expect(said).toContain("No [[review]] rules");
+    expect(said).toContain(paths().configFile);
+    // Nothing was even opened, let alone written: the check precedes the store.
+    expect(existsSync(paths().dbFile)).toBe(false);
+  });
+
   test("a newer database is reported without a stack trace", async () => {
     install();
     new Store(paths().dbFile).close();
@@ -116,5 +159,34 @@ describe("main", () => {
       expect(code).toBe(1);
       expect(said).toMatch(/^(Usage: engwire|Unknown command)/);
     }
+  });
+
+  test("usage marks the commands that only work on one platform", async () => {
+    // The list is the same everywhere on purpose, so the platform has to be on
+    // the line. Both `service` commands exit 1 off macOS; unmarked, the only
+    // way to find that out is to run one. "(launchd)" was not the mark — it
+    // answers "how", and the reader is asking "does this apply to me".
+    // `dispatch` above captures only stderr, which is what every other case
+    // here asserts on; usage goes to stdout.
+    const log = console.log;
+    let said = "";
+    console.log = (message: unknown) => {
+      said += `${message}\n`;
+    };
+    let code: number;
+    try {
+      code = await main(["help"]);
+    } finally {
+      console.log = log;
+    }
+
+    expect(code).toBe(0);
+    for (const line of said.split("\n")) {
+      if (!line.includes("engwire service ")) continue;
+      expect(line).toContain("(macOS)");
+    }
+    // Both of them, so a passing loop cannot mean it matched nothing.
+    expect(said).toContain("engwire service install");
+    expect(said).toContain("engwire service uninstall");
   });
 });

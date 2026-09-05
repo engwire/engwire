@@ -3,7 +3,7 @@
  */
 
 import { skillPreflightProblem } from "../claude/skills.ts";
-import { loadConfig } from "../config/config.ts";
+import { loadConfig, type Config } from "../config/config.ts";
 import { paths } from "../config/paths.ts";
 import { cloneUrl } from "../git/repository.ts";
 import { createGh, GhError, type Gh } from "../github/gh.ts";
@@ -47,19 +47,27 @@ async function waitForLogin(
   return null;
 }
 
+/**
+ * The rules a runner is allowed to act on, or the refusal.
+ *
+ * Refusing rather than starting is deliberate: dismissals are permanent, so a
+ * runner with no rules would quietly record every outstanding request as
+ * `no_automation` and never reconsider it.
+ */
+function usable(config: Config, configFile: string): boolean {
+  if (config.reviews.length > 0) return true;
+  console.error(`No [[review]] rules in ${configFile}. Add one naming the repositories to review.`);
+  return false;
+}
+
 export async function run(options: { once: boolean }): Promise<number> {
   const p = paths();
-  const config = await loadConfig(p.configFile);
-
-  // Refusing here rather than starting is deliberate: dismissals are permanent,
-  // so a runner with no rules would quietly record every outstanding request as
-  // `no_automation` and never reconsider it.
-  if (config.reviews.length === 0) {
-    console.error(
-      `No [[review]] rules in ${p.configFile}. Add one naming the repositories to review.`,
-    );
-    return 1;
-  }
+  // Read twice, and the second one is the one that authorizes work.
+  //
+  // This first read is side-effect-free refusal: a missing or broken config
+  // fails here without creating a data directory or a lock, which is what keeps
+  // a kept supervisor job from rebuilding an installation somebody removed.
+  if (!usable(await loadConfig(p.configFile), p.configFile)) return 1;
 
   let release: () => void;
   try {
@@ -96,6 +104,14 @@ export async function run(options: { once: boolean }): Promise<number> {
   // caught the error would hold the runner lock for the life of the process.
   let store: Store | null = null;
   try {
+    // The authoritative read, under the lock. `engwire uninstall` holds this
+    // same lock while it removes the configuration — config first, precisely so
+    // a runner cannot get past this line — so a snapshot taken before the lock
+    // must not be what a review runs on. Without it, a runner that read a good
+    // config, lost the race for the lock, and resumed afterwards would review
+    // on behalf of an installation that is gone.
+    const config = await loadConfig(p.configFile);
+    if (!usable(config, p.configFile)) return 1;
     store = new Store(p.dbFile);
     const gh = createGh(config.advanced.ghBin);
     // Before GitHub is consulted, because none of it needs GitHub and all of it

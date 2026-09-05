@@ -230,6 +230,27 @@ The cost is that a file which really is an LFS pointer stays a pointer in the ch
 
 What none of this covers, and is not meant to: once Claude is running in that directory, a skill can execute whatever its `allowed-tools` permit. The claim measured here is narrower — what *Engwire's own* git does.
 
+## What a repository costs on disk
+
+Worktrees are reclaimed after the configured retention window, one day by default; the bare clones behind them are not reclaimed automatically. Whether that grows without bound decides whether Engwire needs a retention policy for them, and the answer was assumed for a long time before it was measured.
+
+Measured through `ensureRepository` and `prepareRevision` themselves, against `cli/cli` at `d528f20` — 11,992 commits from there, a real repository of unremarkable size. That repository moves, so the figures below belong to that commit and the ten revisions sampled every 800 from it: `d528f20`, `90ef03e`, `87468f4`, `3a6e42f`, `b7f6af0`, `99a9b35`, `617ec61`, `c347737`, `bd1bf52`, `12e5b94`. Each "review" is therefore seasons away from the last, which is the case that would grow if any did:
+
+| | size |
+| --- | --- |
+| fresh blobless bare clone | 12 MB |
+| after the first review | 28 MB |
+| after ten reviews, spread across the whole history | 35 MB |
+| a full `git clone --bare` of the same repository, for contrast | 83 MB |
+
+The first checkout is the dominant cost: +15.7 MB, because it fetches the blobs for an entire tree. Every later review added between 0.2 and 2.3 MB, averaging under one — even jumping years of history at a time — since git deltifies the new blobs against what the clone already holds. Ten consecutive commits, the easy case, added 1 MB between them in total.
+
+Every review grew the clone — nine of nine did — but the marginal cost was small against the first. That is why Engwire has no retention policy for clones: keeping one makes the next review cheap, while reclaiming it trades a small repeated cost for a much larger one. This is a judgement about magnitude, not a bound.
+
+The larger number is transient. Each worktree here is 25 MB, and those *are* bounded — one review runs at a time and `worktree_ttl` reclaims them, so the ceiling is one retention window's reviews rather than a year's.
+
+What this does not establish: one repository was measured, along one linear history, at ten points. A monorepo carrying large binaries, or a repository whose branches diverge hard, can introduce blobs indefinitely and would answer differently. If a data directory ever does grow uncomfortably, that is the case to measure before writing a policy — these numbers say only that the ordinary case does not need one.
+
 ## Is the timeline worth what it costs?
 
 Discovery wants one thing from a pull request's history: its `review_requested` entries, and their ids. Two endpoints carry them. `issues/<n>/timeline` is a superset that interleaves every commit, comment, review and cross-reference; `issues/<n>/events` carries the events and nothing else. Engwire reads one of them once per candidate on every poll, so this is a per-minute cost rather than a one-off.
@@ -251,7 +272,7 @@ gh api --paginate 'repos/cli/cli/issues/14259/events?per_page=5' | jq length
 # gh 2.31.0 -> 12        one array
 ```
 
-The change is [cli/cli#7190](https://github.com/cli/cli/pull/7190), released in 2.31.0 (June 2023). Note that `jq` accepts the concatenated form and Engwire's single `JSON.parse` does not, so on a multi-page response an old `gh` fails loudly rather than returning a quietly short list. Only on a multi-page one, though: a history that fits in a single page parses on either version, so an unsupported `gh` can look healthy until the first busy pull request. That is why the README states the floor rather than leaving it to be met.
+The change is [cli/cli#7190](https://github.com/cli/cli/pull/7190), released in 2.31.0 (June 2023). Note that `jq` accepts the concatenated form and Engwire's single `JSON.parse` does not, so on a multi-page response an old `gh` fails loudly rather than returning a quietly short list. Only on a multi-page one, though: a history that fits in a single page parses on either version, so an unsupported `gh` can look healthy until the first busy pull request. That is why the README states the floor.
 
 Cheaper is only free if the entries are the same entries. `UNIQUE(event_id)` is keyed on the id, so a database an earlier Engwire wrote has to go on matching, or the same GitHub request could be treated as fresh after the switch. Compared without normalising the two shapes — a team request carries no `requested_reviewer` and a user request no `requested_team`, and coalescing them would hide precisely the disagreement worth finding:
 
@@ -314,3 +335,34 @@ The last two rows are the interesting pair. Deleting a release is not blocked, s
 The first row is what the pipeline turns on, and it is worth measuring precisely because GitHub's own documentation disagrees with itself about it. The immutable-releases page lists the protections as the tag and the assets; the release-management page says "you can only edit the title and release notes after a release is published", which would make promotion impossible. The API sides with the first, and the Update Release endpoint still takes `prerelease` and `make_latest`. So the choice between verifying a public candidate and having immutable assets — which looked like a real trade-off — was not one. What this establishes is those two fields and the title and notes, not a general rule that release metadata stays editable, and the pipeline fails closed if it ever changes: promotion errors, and the candidate stays a prerelease that never reaches the normal installation path.
 
 Immutability freezes the tag only while the release exists, so it is not a substitute for a `v*` tag ruleset barring updates and deletions. The two cover different halves and Engwire keeps both.
+
+## Can launchd be asked whether a job is loaded?
+
+The plist is Engwire's durable record of a service, and it is not the job: `launchctl bootstrap` loads a copy, and deleting the file afterwards leaves the job running with nothing on disk pointing at it. `engwire uninstall` is where that gap is expensive — reporting no service and then "Removed." over a supervised runner is the one answer that command must not give — so it asks launchd directly when it finds no plist. That only works if a missing label is distinguishable from a failure to ask.
+
+Measured on macOS 15, as the logged-in user:
+
+```sh
+# One label the domain already has, and one deliberately nonexistent. The first
+# may well be Engwire's; only the second is ever booted out, so this stops
+# nothing.
+loaded=$(launchctl list | awk 'NR==2 {print $3}')
+missing="com.engwire.probe-missing.$$"
+
+# Discard stdout: `print` dumps the job description, while stderr is half the answer.
+launchctl print "gui/$(id -u)/$loaded" >/dev/null;  echo "print loaded:    exit=$?"
+launchctl print "gui/$(id -u)/$missing" >/dev/null; echo "print missing:   exit=$?"
+launchctl bootout "gui/$(id -u)/$missing";          echo "bootout missing: exit=$?"
+```
+
+| | |
+| --- | --- |
+| `print` on a loaded label | exit 0 |
+| `print` on a label the domain does not have | exit 113, `Could not find service "…" in domain for user gui: 501` on **stderr** |
+| `bootout` on a label the domain does not have | exit 3, `Boot-out failed: 3: No such process` |
+
+Two different codes for the same absence, which is why Engwire matches each against the command that produced it rather than sharing one predicate. Each predicate requires its row's code and message together; half a row may be the other command's answer, or none. `print` writes the whole job description to stdout, so the caller discards it and reads only stderr.
+
+`jobState` concludes absence only from both halves together — 113 *and* that message — and answers `unknown` for everything else rather than guessing at either. Three states because a question that failed is neither of the two answers launchd gives, and `uninstall` keeps away from the label on that third while saying only that launchd would not answer. Naming a job that is gone sends someone to `engwire service uninstall`, which tolerates an absent one; missing a job that is there leaves it supervising a runner after the user was told Engwire had been removed.
+
+What this does not establish: that 113 is a documented, stable contract. It is not in `launchctl`'s manual page, which is why the message is matched alongside it, and why the doubt resolves toward mentioning a service rather than toward silence.
