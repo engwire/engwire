@@ -21,7 +21,7 @@
  */
 
 import { Database } from "bun:sqlite";
-import { chmodSync, mkdirSync } from "node:fs";
+import { privateDir } from "../config/paths.ts";
 import { dirname } from "node:path";
 import type { ReviewRun, RunStatus, TerminalRunStatus } from "../review/model.ts";
 
@@ -172,13 +172,10 @@ export class Store {
 
   constructor(file: string) {
     // 0700: the data directory holds clones of private repositories and the
-    // transcripts of reviews of them. It should not depend on the machine's
-    // ambient umask to stay unreadable.
+    // transcripts of reviews of them, so its mode should not be left to the
+    // machine's ambient umask.
     if (file !== ":memory:") {
-      mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
-      // `mode` only applies to directories this call creates; an existing one
-      // keeps whatever it had, which on an upgrade could be world-readable.
-      chmodSync(dirname(file), 0o700);
+      privateDir(dirname(file));
     }
     this.db = new Database(file, { create: true });
     // Check before any initialization below can persist state, so refusing a
