@@ -16,7 +16,7 @@ Engwire (your machine)
 
 GitHub.com only — `GH_HOST` is pinned, so `gh` and the checkout can never disagree about which repository they mean. No new service receives your source code: Engwire drives the Git, `gh` and Claude Code already on your machine. The local workflow needs no Engwire-hosted service, no bot account, no workflow to commit, and no additional credential to your source.
 
-One installation belongs to one GitHub account — the one authenticated when it first ran. Point `ENGWIRE_HOME` somewhere else for a second. On macOS, only one installation per user runs in the background: launchd keeps one job under a fixed label, so `engwire service install` in a second installation replaces the first one's service and says so.
+One installation belongs to one GitHub account — the one authenticated when it first ran. Point `ENGWIRE_HOME` somewhere else for a second. On macOS, Engwire's launchd integration supervises one installation per user: it keeps one job under a fixed label, so `engwire service install` in a second installation replaces the first one's service and says so.
 
 ## Requirements
 
@@ -95,6 +95,15 @@ The skill is invoked as `/review-pr acme/api#42 at <sha>`. The checkout is pinne
 Engwire never touches your own checkouts.
 
 See [docs/architecture.md](docs/architecture.md) for the design and [SECURITY.md](SECURITY.md) for the trust model — including what it means to point an agent at a contributor's code.
+
+## Uninstall
+
+```sh
+engwire uninstall        # what is on this machine
+engwire uninstall --yes  # remove this installation's data, config and claimed service
+```
+
+The data directory holds Engwire's clones and review transcripts, so the plain command previews the exact paths and removes nothing. `--yes` removes the data, configuration and any service this installation can claim; the binary stays. The paths depend on `ENGWIRE_HOME` and the XDG variables, and a root that is itself a symlink is unlinked rather than followed. [The service-ownership spec](docs/specs/service-ownership.md) has the safety rules in full.
 
 ## Develop
 

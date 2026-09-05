@@ -7,7 +7,8 @@
  */
 
 import { loadConfig } from "../config/config.ts";
-import { paths } from "../config/paths.ts";
+import { LOCATORS, locatesData, paths } from "../config/paths.ts";
+import { isAbsolute } from "node:path";
 import * as launchd from "../service/launchd.ts";
 import { diagnose } from "./doctor.ts";
 
@@ -22,6 +23,37 @@ function unsupported(action: string): number {
     `engwire service ${action} is available only on macOS. Run \`engwire run\` under your platform's supervisor.`,
   );
   return 1;
+}
+
+/**
+ * Path settings that will not retain their meaning in a service plist.
+ *
+ * The plist preserves no working directory, so every carried root must be
+ * absolute and non-empty. It must also name a data directory explicitly;
+ * falling back to the reader's process would make Engwire adopt an
+ * unidentifiable service as its own.
+ */
+const ROOTS = [
+  "HOME",
+  "ENGWIRE_HOME",
+  "XDG_CONFIG_HOME",
+  "XDG_DATA_HOME",
+  "GH_CONFIG_DIR",
+  "CLAUDE_CONFIG_DIR",
+] as const;
+
+export function servicePathProblems(environment: Record<string, string>): string[] {
+  const problems = ROOTS.filter((name) => name in environment && !isAbsolute(environment[name] ?? ""))
+    .map((name) =>
+      environment[name] === ""
+        ? `${name} is set to nothing`
+        : `${name}=${environment[name]} is relative`,
+    );
+  // Do not report a missing locator when an invalid one already explains it.
+  if (!locatesData(environment) && !LOCATORS.some((name) => name in environment)) {
+    problems.push(`nothing here names a data directory: ${LOCATORS.join(", ")}`);
+  }
+  return problems;
 }
 
 /**
@@ -60,6 +92,21 @@ export async function serviceInstall(): Promise<number> {
   // Diagnosing the installing shell instead would approve credentials the
   // service never sees and a config file it never reads.
   const environment = launchd.serviceEnvironment();
+
+  // Before the preflight, because this is not a question about whether the setup
+  // works — it is whether the record about to be written means anything.
+  const problems = servicePathProblems(environment);
+  if (problems.length > 0) {
+    console.error("Not installing — these service path settings are not usable:\n");
+    for (const row of problems) console.error(`✗ ${row}`);
+    console.error("\nThe plist carries these values verbatim, and nothing in it preserves the");
+    console.error("directory you are standing in — so a relative one has no settled meaning");
+    console.error("once this shell is gone, and a data directory the plist never names is a");
+    console.error("job Engwire cannot recognise as its own. A relative value wants an");
+    console.error("absolute spelling of the same location; an empty one can simply be unset;");
+    console.error(`and one of ${LOCATORS.join(", ")} has to name the installation.`);
+    return 1;
+  }
 
   const failed = (await diagnose(environment)).filter((check) => !check.ok);
   if (failed.length > 0) {

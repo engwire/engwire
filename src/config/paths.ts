@@ -15,8 +15,9 @@
  * It also owns the executable search path used for review tooling.
  */
 
+import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 
 /**
  * A `PATH` with nothing relative left in it, used whenever review tooling is
@@ -37,6 +38,36 @@ import { isAbsolute, join } from "node:path";
 export function absolutePath(path = process.env.PATH ?? ""): string {
   return path.split(":").filter(isAbsolute).join(":");
 }
+
+/**
+ * A path with the deepest ancestor `realpath` can resolve resolved, and the
+ * rest re-appended.
+ *
+ * `realpathSync` needs the whole path to exist, and Engwire's directories often
+ * do not — before the first run, and after anything removes them. Resolving
+ * only whole paths would leave an installation reached through a symlinked
+ * ancestor unable to recognise its own service exactly then: it would call the
+ * job foreign, leave it loaded, and still report the uninstall as done.
+ *
+ * Every failure climbs, not only a missing path, because this is used only for
+ * comparison and must not throw while diagnosing a broken installation. A path
+ * with no resolvable ancestor comes back as written. The result must never be
+ * used as a path to act on.
+ */
+export function resolveDeepest(path: string): string {
+  const missing: string[] = [];
+  for (let head = path; ; ) {
+    try {
+      return join(realpathSync(head), ...missing);
+    } catch {
+      const parent = dirname(head);
+      if (parent === head) return path;
+      missing.unshift(basename(head));
+      head = parent;
+    }
+  }
+}
+
 
 export type Paths = {
   configFile: string;
@@ -75,7 +106,18 @@ export function paths(env: Record<string, string | undefined> = process.env): Pa
   };
 }
 
+/**
+ * What can name the data directory, in the order `paths` reads them.
+ *
+ * Exported because `service install` reports on the same three, and two
+ * spellings of one precedence is how they come to disagree.
+ */
+export const LOCATORS = ["ENGWIRE_HOME", "XDG_DATA_HOME", "HOME"] as const;
+
 /** Whether the environment identifies a data directory without process fallbacks. */
 export function locatesData(env: Record<string, string | undefined>): boolean {
-  return Boolean(env.ENGWIRE_HOME || env.XDG_DATA_HOME || env.HOME);
+  // A relative base depends on a working directory the plist does not preserve,
+  // so it cannot identify which installation a service supervises.
+  const base = LOCATORS.map((name) => env[name]).find(Boolean);
+  return base !== undefined && isAbsolute(base);
 }
