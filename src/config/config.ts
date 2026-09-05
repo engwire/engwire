@@ -2,10 +2,11 @@
  * @file Reading `config.toml`.
  *
  * The file describes outcomes — which repositories get reviewed, by which
- * skill — and nothing about how the runner achieves them. Poll rate, retention
- * and timeouts are tuning parameters with defaults good enough that nobody
- * should have to pick them; they live under `[advanced]` for the case where the
- * default is wrong on one machine, not as part of the product's surface.
+ * skill — and nothing about how the runner achieves them. The poll interval,
+ * worktree retention and review timeout are tuning parameters with defaults
+ * good enough that nobody should have to pick them; they live under `[advanced]`
+ * for the case where a default is wrong on one machine, not as part of the
+ * product's surface.
  *
  * Validation is hand-written and so is the TOML shape check. A single-binary
  * OSS tool with zero runtime dependencies is worth more than the few lines a

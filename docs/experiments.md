@@ -1,10 +1,31 @@
 # Experiments
 
-Some of what Engwire relies on is a property of another system — Claude Code, git, GitHub — rather than of Engwire, so it was established by running that system instead of by reading its documentation. Everything recorded here is load-bearing, expensive to re-derive, impossible to verify from inside a unit test, and free to change under you.
+Some of what Engwire relies on is a property of another system — Claude Code, git, GitHub, Bun — rather than of Engwire, so it was established by running that system instead of by reading its documentation. These observations record the behavior behind implementation choices and may change between versions; some are also covered by automated tests.
 
 These are recipes, so re-running one against a new version is an afternoon's work rather than a reconstruction.
 
 Close stdin on every `claude -p` below — `< /dev/null`, inside command substitution too. Left open, it waits three seconds and prints a warning of its own, which lands in the output some of these rows are reading; production closes it the same way.
+
+## Does killing a subprocess close its output?
+
+The direct `gh` boundary needs a deadline for the complete answer, including output reads. Measured on 2026-09-06 with Bun 1.4.0 on Darwin 24.6.0:
+
+```sh
+bun -e '
+const started = performance.now();
+const p = Bun.spawn(["/bin/sh", "-c", "trap \"\" TERM; sleep 1 & wait"], {stdout:"pipe", stderr:"pipe"});
+const output = new Response(p.stdout).text().then(() => Math.round(performance.now() - started));
+setTimeout(() => p.kill("SIGKILL"), 100);
+await p.exited;
+console.log(JSON.stringify({exitMs:Math.round(performance.now()-started), stdoutClosedMs:await output}));
+'
+```
+
+The shell exited after 102 ms, but stdout closed after 1,017 ms: its child retained the pipe. Killing the direct process therefore does not bound an output read. `createGh` races the complete answer against the deadline, sends `SIGKILL` to the direct process, and requests cancellation of both readers without awaiting cleanup.
+
+`bun test src/github/gh.test.ts` exercises that boundary with a shell that ignores SIGTERM and a child holding the pipes for five seconds. On this run, the timeout test returned in about one second and confirmed that the shell had stopped. It also covers signal diagnostics when stderr carries no message — the fixture writes a newline, which is what makes that edge observable — and invalid JSON becoming `GhError`.
+
+This measures the local subprocess boundary, not GitHub availability or pagination latency. It does not establish when cancellation releases OS descriptors, or verify Linux behavior; descendants are not terminated by this boundary.
 
 ## The arena
 
