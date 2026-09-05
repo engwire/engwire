@@ -30,7 +30,11 @@ This covers an ordinary tool tree, not a program determined to escape one: a des
 
 ## What local Engwire keeps
 
-One data directory, created private to your user, holding Engwire's own bare clones of the repositories it has reviewed, the worktrees it checked out, the transcript of each review, and a database of which requests it has already seen. Worktrees are reclaimed after the configured retention window, one day by default; the rest stays until you remove it. The clones are blobless, and most of what one costs is its first review: a repository of 12,000 commits measured 35 MB after ten reviews spread across its history, against 83 MB to clone it normally ([docs/experiments.md](docs/experiments.md)).
+One data directory holds Engwire's own bare clones, worktrees, review transcripts and a database of the requests it has seen.
+
+Engwire creates the data directory and the directories containing worktrees and logs with mode `0700`, then reapplies that mode when the final component is a directory. It leaves existing parents and a final symlink alone, and does not manage filesystem ACLs.
+
+Worktrees are reclaimed after the configured retention window, one day by default; the rest stays until you remove it. The clones are blobless, and most of what one costs is its first review: a repository of 12,000 commits measured 35 MB after ten reviews spread across its history, against 83 MB to clone it normally ([docs/experiments.md](docs/experiments.md)).
 
 `engwire uninstall` previews the paths and removes nothing. `engwire uninstall --yes` removes the data, configuration and any launchd job this installation can claim. A foreign or unidentifiable job is left alone; a data or config root that is itself a symlink is unlinked rather than followed. [The service-ownership spec](docs/specs/service-ownership.md) covers the full rule and the explicit command for removing an unclaimed job.
 

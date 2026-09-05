@@ -9,10 +9,10 @@
  */
 
 import { loadConfig, type Config } from "../config/config.ts";
-import { absolutePath, paths } from "../config/paths.ts";
+import { absolutePath, paths, privateDir } from "../config/paths.ts";
 import { agentPath, SETTING_SOURCES } from "../claude/run.ts";
 import { skillPreflightProblem } from "../claude/skills.ts";
-import { accessSync, constants, mkdirSync } from "node:fs";
+import { accessSync, constants } from "node:fs";
 import { createGh, GITHUB_ENV } from "../github/gh.ts";
 import { installedPlist, type InstalledPlist } from "../service/launchd.ts";
 import { Store } from "../store/store.ts";
@@ -168,7 +168,7 @@ export async function diagnose(
   // throttling. The directory is Engwire's own, so creating it here costs
   // nothing that `engwire run` would not create moments later.
   try {
-    mkdirSync(p.dataDir, { recursive: true, mode: 0o700 });
+    privateDir(p.dataDir);
     accessSync(p.dataDir, constants.R_OK | constants.W_OK | constants.X_OK);
     checks.push({ label: "data", ok: true, note: p.dataDir });
   } catch (error) {

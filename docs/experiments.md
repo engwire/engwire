@@ -230,6 +230,91 @@ The cost is that a file which really is an LFS pointer stays a pointer in the ch
 
 What none of this covers, and is not meant to: once Claude is running in that directory, a skill can execute whatever its `allowed-tools` permit. The claim measured here is narrower — what *Engwire's own* git does.
 
+## What `homedir()` does when there is no `HOME`
+
+`paths()` falls back to `homedir()` whenever neither `ENGWIRE_HOME`, the relevant XDG variable nor `HOME` supplies a root. If that fallback were empty, `join` would produce relative paths resolved against the working directory, which may be a checkout of the branch under review. Bun's `node:os` reference says POSIX `homedir()` uses `$HOME` whenever it is defined, so its documented reading of `HOME=` would produce that unsafe result.
+
+Measured on macOS 15, Bun 1.4.0, with Node 26 alongside for contrast:
+
+```sh
+for runtime in bun node; do
+  HOME=       "$runtime" -e 'console.log(JSON.stringify(require("os").homedir()))'
+  env -u HOME "$runtime" -e 'console.log(JSON.stringify(require("os").homedir()))'
+done
+```
+
+| | `HOME=""` | `HOME` unset |
+| --- | --- | --- |
+| Bun 1.4.0 | absolute home path | absolute home path |
+| Node 26.0.0 | `""` | absolute home path |
+
+Bun returns the account's absolute home path when `HOME` is empty; Node returns the empty string. Bun therefore gives Engwire an absolute fallback today, contrary to the documented rule. `paths.test.ts` covers both rows in child processes so a runtime change arrives as a failing test rather than a relative config path.
+
+`servicePathProblems` separately rejects an empty `HOME` and refuses installation when none of `ENGWIRE_HOME`, `XDG_DATA_HOME` or `HOME` identifies the data directory. The fallback still matters to foreground runs and to a service's config path when `XDG_DATA_HOME` alone identifies its data.
+
+What this does not establish: Bun's behavior on Linux. The test pins the property Engwire needs — an absolute root — rather than Bun's lookup mechanism.
+
+## What a directory mode does not cover
+
+For a path whose final component is not a symlink, `privateDir` uses recursive `mkdir` with mode `0700`, then `chmod` so an existing directory gets the same mode. On macOS, those operations do not remove an inherited ACL.
+
+Measured with the raw filesystem operations on macOS 15, Bun 1.4.0:
+
+```sh
+mkdir parent
+chmod +a "everyone allow list,search,readattr,file_inherit,directory_inherit" parent
+bun -e 'require("node:fs").mkdirSync("parent/child",{recursive:true,mode:0o700});
+        require("node:fs").chmodSync("parent/child",0o700)'
+stat -f %Lp parent/child
+ls -lde parent/child | sed -n '2,$p'
+```
+
+```
+700
+ 0: group:everyone inherited allow list,search,readattr,file_inherit,directory_inherit
+```
+
+The inherited entry survives both calls, so mode `0700` alone does not establish exclusive access.
+
+`chmod` also follows a final symlink:
+
+```sh
+mkdir theirs && chmod 0755 theirs && ln -s theirs link
+bun -e 'require("node:fs").mkdirSync("link",{recursive:true,mode:0o700});
+        require("node:fs").chmodSync("link",0o700)'
+stat -f %Lp theirs
+```
+
+```
+700
+```
+
+The umask reaches the intermediates the `chmod` does not, and only ever subtracts:
+
+```sh
+bun -e 'const fs = require("node:fs");
+        for (const mask of [0o022, 0o077, 0o007, 0o100, 0o200, 0o400, 0o777]) {
+          const d = "m" + mask.toString(8), old = process.umask(mask);
+          try { fs.mkdirSync(`${d}/inner`, { recursive: true, mode: 0o700 });
+                console.log(mask.toString(8), (fs.statSync(`${d}/inner`).mode & 0o777).toString(8)); }
+          catch (e) { console.log(mask.toString(8), e.code); }
+          finally { process.umask(old); } }'
+```
+
+```
+22 700
+77 700
+7 700
+100 EACCES
+200 EACCES
+400 300
+777 EACCES
+```
+
+A umask can only take permissions out of the requested `0700`, never put them in. `100` and `200` remove one the next component's creation needs, so `mkdir` fails; `400` removes read, which creating a known child does not need, and leaves the intermediate at `300` — stricter than asked for rather than laxer. Neither outcome widens access, which is the whole of what the intermediates have to promise.
+
+`privateDir` therefore checks the final path component with `lstat` and skips `chmod` when it is a link. That avoids changing the target of a supported relocated-data symlink and matches `uninstall`'s rule not to follow a removal root. The helper also leaves existing parents unchanged and does not manage ACLs. On macOS, a fresh `~/.local/share/engwire` can inherit one from `~/.local/share`; closing that residual would require platform-specific ACL handling.
+
 ## What a repository costs on disk
 
 Worktrees are reclaimed after the configured retention window, one day by default; the bare clones behind them are not reclaimed automatically. Whether that grows without bound decides whether Engwire needs a retention policy for them, and the answer was assumed for a long time before it was measured.

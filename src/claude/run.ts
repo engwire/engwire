@@ -12,9 +12,9 @@
  * the runner is killed.
  */
 
-import { chmodSync, closeSync, fchmodSync, mkdirSync, openSync } from "node:fs";
+import { closeSync, fchmodSync, openSync } from "node:fs";
 import { dirname, isAbsolute } from "node:path";
-import { absolutePath } from "../config/paths.ts";
+import { absolutePath, privateDir } from "../config/paths.ts";
 import { GITHUB_ENV } from "../github/gh.ts";
 
 export type ClaudeResult = {
@@ -52,10 +52,10 @@ export async function runClaude(options: {
   timeoutMs: number;
   logPath: string;
 }): Promise<ClaudeResult> {
-  // A transcript is a review of private code. 0700 on the directory and 0600 on
-  // the file, whatever the machine's umask is and whatever the path was before.
-  mkdirSync(dirname(options.logPath), { recursive: true, mode: 0o700 });
-  chmodSync(dirname(options.logPath), 0o700);
+  // A transcript is a review of private code: its directory gets the
+  // private-directory policy, and the file itself 0600 whatever the machine's
+  // umask is and whatever the path was before.
+  privateDir(dirname(options.logPath));
   const fd = openSync(options.logPath, "a", 0o600);
   let untrap = () => {};
   let shutdownSignal: NodeJS.Signals | undefined;

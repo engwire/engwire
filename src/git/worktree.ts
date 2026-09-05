@@ -8,8 +8,9 @@
  */
 
 import { existsSync } from "node:fs";
-import { mkdir, rm } from "node:fs/promises";
+import { rm } from "node:fs/promises";
 import { dirname } from "node:path";
+import { privateDir } from "../config/paths.ts";
 import { ensureRepository, fetchRevision, git, inertOverrides } from "./repository.ts";
 
 export async function prepareRevision(options: {
@@ -24,8 +25,9 @@ export async function prepareRevision(options: {
   /** The configured `gh`; git authenticates fetches through it. */
   ghBin: string;
 }): Promise<string> {
-  // Worktrees hold private source; keep their parent private too.
-  await mkdir(dirname(options.worktreeDir), { recursive: true, mode: 0o700 });
+  // Worktrees hold a contributor's source tree, so their parent gets the
+  // private-directory policy.
+  privateDir(dirname(options.worktreeDir));
   await ensureRepository({
     url: options.url,
     dir: options.repoDir,

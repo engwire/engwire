@@ -20,7 +20,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { locatesData, paths, resolveDeepest } from "../config/paths.ts";
+import { locatesData, paths, privateDir, resolveDeepest } from "../config/paths.ts";
 import { isAbsolute, join } from "node:path";
 
 const LABEL = "com.engwire.local";
@@ -485,8 +485,7 @@ export async function install(options: {
 }): Promise<void> {
   const file = plistPath();
   mkdirSync(join(homedir(), "Library", "LaunchAgents"), { recursive: true });
-  mkdirSync(options.logsDir, { recursive: true, mode: 0o700 });
-  chmodSync(options.logsDir, 0o700);
+  privateDir(options.logsDir);
   // `Umask` in the plist only governs files launchd creates. An existing
   // `runner.log` — from an older install, a stray `touch`, a restore — is
   // opened as it is, and it holds repository names and review errors.

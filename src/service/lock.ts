@@ -7,8 +7,9 @@
  */
 
 import { Database } from "bun:sqlite";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { dirname } from "node:path";
+import { privateDir } from "../config/paths.ts";
 
 export class LockedError extends Error {
   constructor() {
@@ -23,7 +24,7 @@ export class LockedError extends Error {
  * The transaction is never committed; it exists only for the lock it takes.
  */
 export function acquireLock(file: string): () => void {
-  mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+  privateDir(dirname(file));
   const db = new Database(file, { create: true });
   // Fail rather than wait: a second runner should say so immediately, not hang.
   db.exec("PRAGMA busy_timeout = 0");

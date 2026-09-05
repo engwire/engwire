@@ -15,7 +15,7 @@
  * It also owns the executable search path used for review tooling.
  */
 
-import { realpathSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
 
@@ -68,6 +68,32 @@ export function resolveDeepest(path: string): string {
   }
 }
 
+/**
+ * Create a directory recursively, and set the named directory's mode to `0700`
+ * unless that name is a link.
+ *
+ * `mkdir` leaves an existing directory's mode unchanged, so the explicit
+ * `chmod` also covers restored directories and older installations. Only the
+ * named directory is tightened; newly created parents receive the `mkdir` mode,
+ * which a umask can subtract from but never add to, while existing parents may
+ * be shared, and a named directory that is itself a link is left to whoever it
+ * belongs to.
+ *
+ * This changes POSIX mode bits, not inherited ACLs — a directory created under
+ * a parent carrying a granting one is one another local user can still list,
+ * and the first run makes `~/.local/share/engwire` under whatever
+ * `~/.local/share` already has.
+ */
+export function privateDir(path: string): void {
+  mkdirSync(path, { recursive: true, mode: 0o700 });
+  // Never through a link. `chmod` follows one — measured — so this would set
+  // the mode of a directory somebody moved elsewhere and linked back from, and
+  // that directory is theirs to decide about. `uninstall` reads a removal root
+  // the same way: a link at the entry stands in for the directory rather than
+  // being it.
+  if (lstatSync(path, { throwIfNoEntry: false })?.isSymbolicLink()) return;
+  chmodSync(path, 0o700);
+}
 
 export type Paths = {
   configFile: string;

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
-import { rm } from "node:fs/promises";
+import { existsSync, mkdirSync, mkdtempSync, statSync, writeFileSync } from "node:fs";
+import { chmod, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createOrigin, type Origin } from "../../test/fixtures/repo.ts";
@@ -79,6 +79,16 @@ function marker(name: string): string {
 }
 
 describe("prepareRevision", () => {
+  test("an existing worktree parent is set to mode 0700", async () => {
+    const parent = join(dir, "worktrees");
+    mkdirSync(parent, { recursive: true });
+    await chmod(parent, 0o755);
+
+    await prepareRevision({ ...where(), sha: origin.sha });
+
+    expect(statSync(parent).mode & 0o777).toBe(0o700);
+  });
+
   test("a branch cannot point the checkout at a filter the reviewer configured", async () => {
     // `.gitattributes` travels with the branch; the filter it names is defined
     // in the reviewer's own config, so a contributor chooses whether it runs
