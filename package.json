@@ -4,6 +4,9 @@
   "private": true,
   "description": "Runs your Claude Code review skill on the pull requests that ask for your review — on your laptop, with your credentials.",
   "type": "module",
+  "exports": {
+    ".": "./src/plugin.ts"
+  },
   "license": "MIT",
   "author": "Konstantin Tarkus <hello@engwire.com>",
   "repository": {
@@ -27,6 +30,7 @@
   },
   "devDependencies": {
     "@types/bun": "^1.4.0",
+    "ajv": "^8.20.0",
     "typescript": "~6.0.3"
   }
 }

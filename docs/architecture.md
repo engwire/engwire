@@ -58,6 +58,15 @@ Engwire watches GitHub for review requests addressed to you, checks out a pinned
 | `claude/` | The only place `claude` is invoked |
 | `store/` | SQLite state, including schema-version enforcement |
 | `service/` | The launchd agent, and the single-runner lock |
+| `plugin.ts` | The extension API the `engwire` package reserves. Not part of the runner |
+
+The private package reserves `import { definePlugin } from "engwire"` through `plugin.ts`. It supplies contextual typing and returns the supplied object unchanged; there is no plugin runtime or runtime validation. The helper is the only export, and its metadata type stays internal until authors need to name it. Keep this entry point independent of the runner and runtime-specific APIs so future authors can use it outside Bun.
+
+`src/workflows/workflow.schema.json` defines the declarative format for `.engwire/workflows/<name>.json`. The file name supplies the workflow name; the schema defines the fields and shared name grammar. Format changes must accept existing files: new keys are optional and existing constraints must not tighten. Ajv validates the schema and repository samples in tests only. [ADR-0002](adr/0002-pin-the-workflow-file-format-before-a-loader.md) records why the format precedes a loader and the compatibility tradeoffs.
+
+The runner loads no workflows or plugins. `.engwire/workflows/review-request.json` is a format sample, not runnable review configuration: it omits the skill that every `[[review]]` rule requires. `config.toml` still controls review execution; how workflows relate to review rules remains undecided. A future loader must resolve extensions from Engwire's installed state, never from the working directory, including this repository's `.engwire/`.
+
+`main.test.ts` checks that the runner's runtime import graph reaches every non-test source file except the plugin entry point and workflow schema. `plugin.test.ts` checks package resolution and the entry point's empty import graph. These checks do not establish portability of runtime globals or type-only dependencies.
 
 Process spawning stays at the edges. There is no shared `exec` helper: `gh`, `git` and `claude` want different things from a subprocess, and a common wrapper would grow until it had reimplemented a process library. For the same reason there is no platform-neutral service interface above `launchd.ts` — one implementation does not need an abstraction over it, and `cli/service.ts` makes the macOS check itself.
 

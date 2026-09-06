@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://engwire.com/schemas/workflow.json",
+  "title": "Engwire workflow",
+  "description": "One file under .engwire/workflows/<name>.json. The file name is the workflow's name, so nothing in here repeats it. A workflow declaratively composes capabilities; it carries no code. The runner does not load workflow files yet.",
+  "type": "object",
+  "required": ["title", "on", "steps"],
+  "additionalProperties": false,
+  "$defs": {
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$",
+      "description": "Lowercase kebab-case. Trigger sources, plugins, actions and workflow file names use this grammar."
+    },
+    "line": {
+      "type": "string",
+      "pattern": "^\\S(.*\\S)?$",
+      "description": "A non-empty line without leading or trailing whitespace. Omit an optional key rather than writing an empty string."
+    }
+  },
+  "properties": {
+    "$schema": {
+      "const": "https://engwire.com/schemas/workflow.json"
+    },
+    "title": {
+      "$ref": "#/$defs/line",
+      "description": "Human-readable workflow title."
+    },
+    "description": {
+      "$ref": "#/$defs/line",
+      "description": "Summary of what the workflow does."
+    },
+    "on": {
+      "type": "object",
+      "description": "What starts the workflow: exactly one source, and the event it must observe. Which sources and events exist is decided by Engwire and its plugins, not by this schema.",
+      "minProperties": 1,
+      "maxProperties": 1,
+      "propertyNames": {
+        "$ref": "#/$defs/name"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "required": ["event"],
+        "additionalProperties": false,
+        "properties": {
+          "event": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "steps": {
+      "type": "array",
+      "description": "Run in order. Each step names a capability and hands it inputs.",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["uses"],
+        "additionalProperties": false,
+        "properties": {
+          "uses": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*\\.[a-z][a-z0-9]*(-[a-z0-9]+)*$",
+            "description": "A capability as <plugin>.<action>, each half a name per $defs/name. Plugin names are one flat namespace."
+          },
+          "with": {
+            "type": "object",
+            "description": "Inputs to the capability, which is the only thing that knows their names."
+          }
+        }
+      }
+    }
+  }
+}
