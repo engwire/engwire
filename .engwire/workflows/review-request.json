@@ -1,0 +1,15 @@
+{
+  "$schema": "https://engwire.com/schemas/workflow.json",
+  "title": "Review request",
+  "description": "Review the pull requests that ask for your review, with your own skill.",
+  "on": {
+    "github": {
+      "event": "review_requested"
+    }
+  },
+  "steps": [
+    {
+      "uses": "agent.run"
+    }
+  ]
+}

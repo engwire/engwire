@@ -18,6 +18,8 @@ Engwire starts Claude with `--setting-sources user`, so the session loads your s
 
 This boundary was measured against Claude Code 2.1.251 and re-checked against 2.1.257 for project memory, skills and hooks; [docs/experiments.md](docs/experiments.md) records the setup, results and the older `.mcp.json` observation. Because this is CLI behaviour rather than Engwire's, `engwire doctor` confirms that the installed Claude still validates the flag. That checks the interface, not its semantics: only re-running the experiment can show that a recognised flag still excludes project configuration.
 
+A branch under review can also carry `.engwire/` extension files, as this repository does. The runner has no extension loader and does not read those files. A future loader must resolve extensions from Engwire's installed state, never from the working directory; [architecture.md](docs/architecture.md#modules) describes this boundary.
+
 Claude's `PATH` is filtered to absolute directories. Its working directory is the checkout, so any relative entry — `.`, a bare `tools`, or the empty field a leading or trailing `:` produces — would be a directory the contributor controls, and a skill running `gh` by name would find their file rather than yours. All four forms were confirmed to execute from the working directory before this was written. Configuration cannot reintroduce it: a relative `gh_bin` or `claude_bin` is a config error.
 
 Pull requests from forks are skipped outright. A `[[review]]` rule names a base repository, and anyone can open a pull request into one — so matching a rule is not evidence that the branch's author is trusted, and the branch's contents are what an agent is about to read.
