@@ -275,10 +275,9 @@ export async function runLoop(runtime: Runtime): Promise<void> {
       if (signal.aborted) break;
       if (matches) held = heldRuns(await pollAndSchedule(runtime));
     } catch (error) {
-      // GitHub being briefly unavailable is the one failure worth surviving,
-      // and `GhError` is exactly that. A SQLite write that fails, or a bug in
-      // reconciliation, is not a transient poll problem — logging those once a
-      // minute forever would keep a broken runner alive and quiet.
+      // Retry unusable gh answers: non-zero exits, invalid JSON and timeouts.
+      // Local failures, such as spawn errors, failed SQLite writes or bugs in
+      // reconciliation, must escape rather than keep a broken runner polling.
       if (!(error instanceof GhError)) throw error;
       runtime.log(`poll failed: ${error.message}`);
     }
