@@ -229,6 +229,19 @@ The checkout recipes below drive a single `git worktree add`, which is how the v
 
 Engwire's clones carry no hooks of their own, so disabling both hook sources loses no Engwire-owned behaviour.
 
+**The environment names programs too, not just repositories.** `git()` used to drop a list of variables — `GIT_DIR` and its relatives — and inherit the rest. The list was the wrong shape: it has to name every variable git will act on, and three of the ones it did not name run a program of the environment's choosing. Measured on git 2.54.0:
+
+```sh
+mkdir helpers
+printf '#!/bin/sh\ntouch RAN\nexit 1\n' > helpers/git-remote-https
+chmod +x helpers/git-remote-https
+GIT_EXEC_PATH="$PWD/helpers" GIT_TERMINAL_PROMPT=0 \
+  git ls-remote https://github.com/engwire/engwire
+ls RAN
+```
+
+The helper ran. `GIT_EXEC_PATH` is where git finds its own subprocesses, so it replaces the program an https fetch executes, and a cleaned `PATH` does not reach it — the two are different lookups. `GIT_SSH_COMMAND` ran the same way against an `ssh://` remote, and `GIT_ASKPASS` is a program by the same definition. So the boundary is the namespace: every inherited `GIT_*` is dropped and only what Engwire means to say is put back. The repository selectors are a subset of that, so nothing previously covered stops being covered, and `HOME` still reaches git — the reviewer's configuration is neutralised key by key rather than discarded. `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` are kept for that same reason: they choose which file the configuration comes from, and `inertOverrides` already reads the effective configuration and disables what executes. Dropping them would make both enumeration and execution fall back to different configuration from the reviewer’s selected files.
+
 **Filters were the exception.** A committed `.gitattributes` naming `filter=evil` activates a `filter.evil.smudge` defined in the *reviewer's global* config, and it ran during checkout with the file's contents on its stdin. A contributor cannot choose *what* runs — the command is configuration the reviewer wrote for their own reasons — but they choose whether it runs and on what content. This is not hypothetical: the machine these measurements were taken on has `git-lfs 3.7.1` installed, and a user-level `git lfs install` defines `filter.lfs.smudge`, `clean`, `process` and `required = true` globally.
 
 `inertOverrides` in `git/repository.ts` now supplies targeted overrides to clone, fetch and both checkout operations, finding executable configuration by name because git has no wildcard override. Re-run against the same arena, nothing executes.
@@ -244,6 +257,9 @@ What the measurements settled about the shape of the fix:
 - **`GIT_DIR` outranks the working directory.** `git -C <dir>` with `GIT_DIR` exported operates on `$GIT_DIR`, so naming a cwd guarantees nothing on its own; `git()` drops `GIT_DIR` and its relatives from the environment it hands to git, and keeps everything else.
 - **`-c` cannot express every key.** A subsection name may legally contain an `=`, and `-c <name>=<value>` splits on the first one: against a real `[filter "a=b"]` the argument `-c filter.a=b.smudge=` set `filter.a` instead and the smudge ran. `--config-env=<name>=<var>` splits on the last `=` and takes the value from the environment, which blocked it — and it exits 128 if the variable is missing, so a mistake there is loud rather than silent.
 - **Targeted beats blanket.** `GIT_CONFIG_GLOBAL=/dev/null` would also work, but the clone is blobless, so the checkout still fetches blobs and still needs whatever proxy and credential settings the reviewer's configuration carries.
+- **A relative config selector is resolved against the working directory.** Measured: with `GIT_CONFIG_GLOBAL=.gitconfig`, `git config --get` returned a value set only in a `.gitconfig` committed to the checkout, and `git -C <worktree>` from elsewhere resolved it the same way. Every git Engwire runs works in a directory Engwire chose, one of them a checkout of the branch under review — so a relative selector would let the branch supply the "global" configuration.
+- **Refusing such a selector is not the same as dropping it.** Measured with a temporary `HOME`: a relative `GIT_CONFIG_GLOBAL` reads the relative file; omitting the variable reads `$HOME/.gitconfig`; `/dev/null` reads neither. `HOME` is deliberately still passed to git, so dropping an unusable selector would hand a checkout configuration the caller's own git was never reading — sanitising is only ever allowed to narrow. `git()` therefore answers a non-absolute `GIT_CONFIG_GLOBAL` or `GIT_CONFIG_SYSTEM` with `/dev/null`, which is also what an empty one already means to git.
+- **`GIT_CONFIG_NOSYSTEM` is kept for the same reason, from the other direction.** It is the boolean that suppresses the system file. Measured: with `GIT_CONFIG_SYSTEM` naming a file and `GIT_CONFIG_NOSYSTEM=1`, git reads nothing from it; strip the boolean while restoring the selector and the file is read. Losing it would turn system configuration the caller had switched off back on.
 
 The cost is that a file which really is an LFS pointer stays a pointer in the checkout.
 

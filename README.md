@@ -78,7 +78,7 @@ Pull requests from forks are always skipped, with no way to allow them. A rule n
 
 Unknown keys are an error, not a default — `skip_draft = false` will not quietly leave drafts skipped.
 
-The poll interval, worktree retention and review timeout have defaults you should not have to think about. They live under `[advanced]` for the machine where one of them is wrong.
+The poll interval, worktree retention, review timeout and checkout timeout have defaults you should not have to think about. They live under `[advanced]` for the machine where one of them is wrong. `checkout_timeout` defaults to `"10m"`; raise it if a first clone needs longer on a slow link. It covers the checkout's cancellable Git work; local cleanup can run beyond it ([details](docs/architecture.md#decisions)).
 
 Engwire starts watching the first time a runner starts with a rule configured; nothing older is ever reviewed. Anything it has already looked at and passed over stays passed over. It does not promise the reverse, though: a request that arrived after that point while the runner was stopped was never recorded, so adding a rule later can pick it up if it is still outstanding.
 

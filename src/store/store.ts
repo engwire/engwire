@@ -474,7 +474,7 @@ export class Store {
    * Give back a claim whose review never started, and hand its checkout to the
    * reaper.
    *
-   * The pre-spawn checks are the only caller: nothing has run and nothing has
+   * Every caller is before the agent starts: nothing has run and nothing has
    * posted, so the request is still outstanding and belongs in the queue. A
    * terminal status would spend an event GitHub will not send again, and
    * `running` would describe a process that does not exist.

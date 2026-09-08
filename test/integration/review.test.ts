@@ -25,7 +25,7 @@ import { createGh } from "../../src/github/gh.ts";
 import { executeRun, type Runtime } from "../../src/review/execute.ts";
 import { runLoop, tickOnce } from "../../src/review/loop.ts";
 import { Store } from "../../src/store/store.ts";
-import { createOrigin, type Origin } from "../fixtures/repo.ts";
+import { createOrigin, NO_DEADLINE, type Origin } from "../fixtures/repo.ts";
 
 const FIXTURES = resolve(import.meta.dir, "../fixtures");
 
@@ -128,7 +128,10 @@ function runtime(config: Config, signal = new AbortController().signal): Runtime
     store,
     config,
     paths: p,
-    gh: createGh(join(FIXTURES, "gh")),
+    // Built with the shutdown signal, as `cli/run.ts` builds it: a stop reaches
+    // a `gh` already in flight, so what a stopped identity check returns is a
+    // rejection rather than an account.
+    gh: createGh(join(FIXTURES, "gh"), { signal }),
     login: "me",
     log: () => {},
     cloneUrlFor: () => origin.url,
@@ -218,7 +221,7 @@ describe("a review request, end to end", () => {
     // temporary directories behind a symlink.
     const cwd = invocations[0]?.cwd ?? "";
     expect(cwd.startsWith(realpathSync(dirname(p.worktreeDir("any"))))).toBe(true);
-    expect((await git(["rev-parse", "HEAD"], cwd)).trim()).toBe(origin.sha);
+    expect((await git(["rev-parse", "HEAD"], cwd, NO_DEADLINE)).trim()).toBe(origin.sha);
   });
 
   test("polling again does not review it a second time", async () => {
@@ -683,6 +686,52 @@ describe("a review request, end to end", () => {
     expect(await claudeInvocations()).toHaveLength(0);
   });
 
+  test("a stop during the last identity check gives the claim back", async () => {
+    // The check exists because `accountMatches` awaits: preparing a checkout
+    // can take minutes, and a stop that lands in that window must not buy the
+    // twenty that follow — launchd is already counting down to kill them. The
+    // claim has reached no agent, so nothing has posted and the request is
+    // still outstanding; it goes back to the queue rather than being spent.
+    await writeGitHub({ sha: origin.sha, events: [reviewRequest(1, new Date())] });
+
+    const controller = new AbortController();
+    const rt = runtime(config(), controller.signal);
+    const said: string[] = [];
+    rt.log = (message) => {
+      said.push(message);
+    };
+    // Three identity checks precede the agent: before the poll, after it, and
+    // once more inside `executeRun` once the checkout is ready. The last is the
+    // one this is about.
+    let logins = 0;
+    const gh = rt.gh;
+    rt.gh = {
+      ...gh,
+      login: async () => {
+        if (++logins === 3) controller.abort();
+        return gh.login();
+      },
+    };
+
+    await tickOnce(rt);
+
+    const run = store.recentRuns()[0];
+    expect(run).toMatchObject({ status: "queued", startedAt: null });
+    // Given back, not spent: the request can still be reviewed by a later run.
+    expect(run?.finishedAt).toBeNull();
+    expect(await claudeInvocations()).toHaveLength(0);
+    // And given back for the right reason. The runner's `gh` carries the
+    // shutdown, so a stop landing inside that call comes back as a plain
+    // `false` — the same answer an account that really had changed gives. Read
+    // before the signal is rechecked, both endings release the claim and only
+    // the sentence differs, which is the whole of what a held run leaves
+    // behind: `releaseClaim` stores no detail, so this line is the only account
+    // of why. Telling a reviewer their account switched mid-review, when what
+    // happened is that they pressed Ctrl-C, sends them to `gh auth status`.
+    expect(said.some((line) => line.includes("shutdown was requested"))).toBe(true);
+    expect(said.some((line) => line.includes("no longer the account"))).toBe(false);
+  });
+
   test("a failing review is recorded as failed, with its transcript kept", async () => {
     await writeGitHub({ sha: origin.sha, events: [reviewRequest(1, new Date())] });
     process.env.FAKE_CLAUDE_EXIT = "2";
@@ -695,6 +744,30 @@ describe("a review request, end to end", () => {
     const run = store.recentRuns()[0];
     expect(run).toMatchObject({ status: "failed", detail: "claude exited 2" });
     expect(existsSync(p.runLog(run!.id))).toBe(true);
+  });
+
+  test("a claude that is no longer there fails the review, not the runner", async () => {
+    // Nothing between `setup` and the spawn checks that the binary is still
+    // there: `claude_bin` is validated for being absolute and never for
+    // existing, and `usable()` asks only whether there are rules. So a version
+    // manager moving `claude` out from under a configured runner arrives as a
+    // throw from `Bun.spawn` rather than as a non-zero exit — which the test
+    // above covers and this one cannot reuse.
+    //
+    // The distinction is the runner's life. A throw here is not a `GhError`,
+    // so `runLoop` rethrows it and the daemon dies; caught, the request is
+    // spent and every later poll keeps working. Worth stating, because losing
+    // one review to an upgraded Claude Code is an inconvenience and losing the
+    // runner to it is a reviewer who finds out days later.
+    await writeGitHub({ sha: origin.sha, events: [reviewRequest(1, new Date())] });
+    const uninstalled = config();
+    uninstalled.advanced.claudeBin = join(dir, "claude-that-was-uninstalled");
+
+    await tickOnce(runtime(uninstalled));
+
+    const run = store.recentRuns()[0];
+    expect(run).toMatchObject({ status: "failed" });
+    expect(run!.detail).toContain("claude-that-was-uninstalled");
   });
 
   /** A queued review whose request is still visible, and therefore eligible. */
@@ -718,6 +791,68 @@ describe("a review request, end to end", () => {
     });
     await writeGitHub({ sha: origin.sha, events: [reviewRequest(eventId, new Date())] });
   }
+
+  test("a shutdown asked for before the checkout starts gives the claim back", async () => {
+    // Shutdown wins deliberately: nothing ran, so the request is still
+    // outstanding, and failing it would spend a review somebody asked for
+    // because the machine happened to be going down.
+    //
+    // What this pins and what it does not. `cloneUrlFor` is evaluated while
+    // `prepareRevision`'s arguments are built, which is *before* the composite
+    // signal beside it — so aborting there makes the shutdown the first cause,
+    // and `git()` refuses to spawn rather than being stopped mid-flight. That
+    // covers "shutdown already asked for". It does not reproduce the crossing,
+    // where the deadline fires first and the stop lands inside git's
+    // termination grace, and so would not catch a refactor to "first abort
+    // cause wins" — which would call shutdown the first cause here too.
+    // Reproducing that needs a git that lingers after SIGTERM so the test can
+    // observe the deadline before asking for the stop; a PATH-substituted
+    // stand-in did not resolve in this harness, so the gap is named rather than
+    // papered over.
+    await queueRun("stopped-and-late", 61);
+
+    const controller = new AbortController();
+    const rt = runtime(config(), controller.signal);
+    rt.cloneUrlFor = () => {
+      controller.abort();
+      return origin.url;
+    };
+
+    await tickOnce(rt);
+
+    // Queued with nothing recorded against it — the shape of a released claim,
+    // where the test below pins what the deadline alone does instead.
+    expect(store.get("stopped-and-late")).toMatchObject({ status: "queued", detail: null });
+    expect(await claudeInvocations()).toHaveLength(0);
+  });
+
+  test("a checkout that outlasts checkout_timeout fails rather than holding the runner", async () => {
+    // The failure this bounds is silent and total: the runner reviews one pull
+    // request at a time, so a `clone` or `fetch` on a connection that is open
+    // and quiet holds the only execution slot there is, indefinitely, while
+    // polling carries on and the queue grows behind it. `run_timeout` starts
+    // later, inside `runClaude`, and never gets the chance.
+    await queueRun("stalled", 60);
+
+    const stingy = config();
+    // Smaller than any real checkout: this one clones a repository and spawns
+    // half a dozen processes to do it.
+    stingy.advanced.checkoutTimeoutMs = 1;
+
+    await tickOnce(runtime(stingy));
+
+    const run = store.get("stalled");
+    // Failed rather than released, because unlike a shutdown or a skill that
+    // disappeared, this one *is* about this pull request: the next attempt
+    // would meet the same repository and the same deadline.
+    expect(run).toMatchObject({ status: "failed" });
+    expect(run?.detail).toContain("checkout_timeout");
+    // Named as the deadline rather than as whatever git managed to say while
+    // being killed, which describes a repository that is fine.
+    expect(run?.detail).not.toContain("exit");
+    expect(run?.retainUntil).not.toBeNull();
+    expect(await claudeInvocations()).toHaveLength(0);
+  });
 
   test("holds queued work while gh is a different account, and resumes after", async () => {
     // `gh auth switch` can move the active account underneath a queued review.
@@ -764,7 +899,14 @@ describe("a review request, end to end", () => {
       process.env.FAKE_GH_LOGIN = "me";
     }
 
-    expect(store.get("switched")).toMatchObject({ status: "queued" });
+    // Queued again is not the same as never claimed, and the difference is the
+    // point of checking here rather than leaving it to the check before the
+    // agent: `executeRun` records a checkout and prepares it — minutes of
+    // network — before it ever asks who `gh` is now. What survives a claim that
+    // was taken and handed straight back is the cleanup deadline, since
+    // `releaseClaim` stamps one so the abandoned checkout gets reaped. A run
+    // that was never claimed has none, so this is what says which happened.
+    expect(store.get("switched")).toMatchObject({ status: "queued", retainUntil: null });
     expect(await claudeInvocations()).toHaveLength(0);
   });
 
@@ -814,6 +956,11 @@ describe("a review request, end to end", () => {
     const run = store.recentRuns()[0];
     expect(run?.status).toBe("failed");
     expect(run?.detail).toContain("checkout failed");
+    // What git said, not what the clock said. The two are told apart by the
+    // error `prepareRevision` threw rather than by reading the signals
+    // afterwards, because unwinding a real failure takes time of its own and a
+    // deadline elapsing in that gap would bury the message worth reading.
+    expect(run?.detail).not.toContain("checkout_timeout");
     expect(run?.retainUntil).not.toBeNull();
   });
 
