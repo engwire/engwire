@@ -215,6 +215,8 @@ The reserved folder name `synced` was not re-run. Engwire refuses it, so a chang
 
 Probes live at user scope and so are written into the reviewer's own `~/.claude/skills`. They are named `engwire-probe-*` and removed afterwards; there is no way to run this one in a temporary configuration root, because credentials live under that root and a temporary one is an unauthenticated one.
 
+That relocation was attempted properly on 2026-09-08 and does not work, which is why `claude/skills.ts` still calls the skills path an inference. An alternate root built out of symlinks to every entry of the real one, plus a copy of `~/.claude.json` (which the CLI looks for *inside* the root once `CLAUDE_CONFIG_DIR` is set, not beside it), still answered `Not logged in · Please run /login`. Authentication did not follow the variable, so this relocation could not preserve the credentials the probe would have run under. What that rules out is the cheap version — point the variable at a copy of the real root and look. Authenticating a second root separately was not attempted and is not ruled out; it costs a login against an account, which is why the skills path stays an inference rather than a measurement.
+
 ## Does a checkout run anything?
 
 SECURITY.md says Engwire checks out a revision and does not execute it. A checkout is git operating on content someone else wrote, and git has several ways to run a command while it works — so whether that sentence holds is a property of git, not a decision Engwire makes. Measured on git 2.54.0, through `ensureRepository` and `prepareRevision` themselves, against an origin carrying the vectors below.
@@ -488,3 +490,514 @@ Two different codes for the same absence, which is why Engwire matches each agai
 `jobState` concludes absence only from both halves together — 113 *and* that message — and answers `unknown` for everything else rather than guessing at either. Three states because a question that failed is neither of the two answers launchd gives, and `uninstall` keeps away from the label on that third while saying only that launchd would not answer. Naming a job that is gone sends someone to `engwire service uninstall`, which tolerates an absent one; missing a job that is there leaves it supervising a runner after the user was told Engwire had been removed.
 
 What this does not establish: that 113 is a documented, stable contract. It is not in `launchctl`'s manual page, which is why the message is matched alongside it, and why the doubt resolves toward mentioning a service rather than toward silence.
+
+## Where gh looks for its configuration, and what moves it
+
+A review runs in a checkout of the branch, and `gh` is the tool a skill posts with. If gh's configuration root moves with the working directory, the branch supplies it — `hosts.yml` there decides which account `gh` acts as, and an alias in `config.yml` runs through a shell when it starts with `!`. Measured on 2026-09-08 with gh 2.98.0 on Darwin 24.6.0. None of this needs authentication; all of it writes files, so run it in a scratch directory.
+
+**Precedence.** The three roots pointed at three separate directories, one command each:
+
+```sh
+mkdir -p a b c cwd && cd cwd
+GH_CONFIG_DIR=../a XDG_CONFIG_HOME=../b HOME=../c        gh config set editor all-three
+env -u GH_CONFIG_DIR XDG_CONFIG_HOME=../b HOME=../c      gh config set editor xdg-home
+env -u GH_CONFIG_DIR -u XDG_CONFIG_HOME HOME=../c        gh config set editor home-only
+```
+
+| set | file written |
+| --- | --- |
+| all three | `a/config.yml` |
+| `XDG_CONFIG_HOME`, `HOME` | `b/gh/config.yml` |
+| `HOME` | `c/.config/gh/config.yml` |
+
+So `GH_CONFIG_DIR` is used as given, `XDG_CONFIG_HOME` is joined with `gh`, and `HOME` with `.config/gh`.
+
+**Relative values.** The same three, each pointing somewhere relative, written from `here` and then read back from a sibling directory:
+
+```sh
+mkdir -p here there && cd here
+GH_CONFIG_DIR=relcfg gh config set editor engwire-direct
+env -u GH_CONFIG_DIR XDG_CONFIG_HOME=relcfg gh config set editor engwire-xdg
+env -u GH_CONFIG_DIR -u XDG_CONFIG_HOME HOME=relhome gh config set editor engwire-home
+# then `gh config get editor` with each of the three, from ../there and from here
+```
+
+| root | where it landed | read from `there` | read from `here` |
+| --- | --- | --- | --- |
+| `GH_CONFIG_DIR=relcfg` | `here/relcfg/config.yml` | empty | `engwire-direct` |
+| `XDG_CONFIG_HOME=relcfg` | `here/relcfg/gh/config.yml` | empty | `engwire-xdg` |
+| `HOME=relhome` | `here/relhome/.config/gh/config.yml` | empty | `engwire-home` |
+
+Each is resolved from the current directory, and a `gh alias set boom '!echo ENGWIRE_PROBE_RAN'` in one of those directories ran on `gh boom`: the branch would supply the credentials and the program both.
+
+**Empty values**, which `ghConfigProblem` has to tell apart from relative ones. The first two rows fall through, so they write wherever `HOME` points — send it somewhere absolute and disposable, or gh will edit the real `config.yml`. The third row is the one that cannot be redirected, because `HOME` is the variable under test:
+
+```sh
+mkdir -p here fakehome && cd here
+env -u XDG_CONFIG_HOME HOME=../fakehome GH_CONFIG_DIR= gh config set editor empty-direct
+env -u GH_CONFIG_DIR   HOME=../fakehome XDG_CONFIG_HOME= gh config set editor empty-xdg
+env -u GH_CONFIG_DIR -u XDG_CONFIG_HOME HOME= gh config set editor empty-home
+```
+
+| root, set to `""` | where the configuration landed |
+| --- | --- |
+| `GH_CONFIG_DIR=` | the next root — `$HOME/.config/gh/config.yml` |
+| `XDG_CONFIG_HOME=` | the next root — `$HOME/.config/gh/config.yml` |
+| `HOME=` | **`./.config/gh/config.yml`, under the current directory** |
+
+Two of the three read an empty value as no value; the third reads it as "here". An empty `HOME` is a relative root whose disguise is that it looks like the absence of a setting.
+
+
+**No `HOME` at all**, which is what an unset variable looks like and not what it means. Two directories, each with a marker gh would only read if it were looking locally:
+
+```sh
+mkdir -p one/.config/gh two/.config/gh
+printf 'editor: marker-one\n' > one/.config/gh/config.yml
+printf 'editor: marker-two\n' > two/.config/gh/config.yml
+for d in one two; do
+  ( cd $d && env -u GH_CONFIG_DIR -u XDG_CONFIG_HOME -u HOME gh config get editor )
+done
+```
+
+`marker-one` from `one`, `marker-two` from `two`. So gh does *not* ask the operating system for the account's home when `HOME` is absent — it reads `.config/gh` from the directory it is standing in, exactly as it does for an empty one. This read nothing of the reviewer's own configuration, which is how it was confirmed the answer came from the cwd rather than from home.
+
+That was assumed rather than measured until it was measured, and the assumption was wrong in the direction that matters: gh treats unset and empty alike, and `ghConfigProblem` refuses both. A runner started without `HOME` — which is a plausible way for a supervisor to start one — would otherwise have read its account out of whatever directory it was started in. This is also where gh parts company with Engwire's own `paths()`, which falls back to `homedir()` and is therefore perfectly happy with the same environment: `locationProblem` passes every row in this section.
+
+The rule that follows is a **refusal**, and that is the part worth stating carefully, because the first version of it was a repair. Engwire can work out which directory gh would use and hand the agent an absolute `GH_CONFIG_DIR` naming the same place — which stops the root *moving* between the runner and the review, and pins the branch's copy exactly as faithfully when the runner itself was started from a checkout. Absolute is not trusted. Nothing measured here distinguishes a relative root the reviewer meant from one a contributor left lying about, so the commands that run gh refuse and `doctor` reports.
+
+**On Linux**, since that is supported and the rule above is applied there unconditionally. The whole matrix again inside `alpine:3.20` with `apk add github-cli`, gh 2.47.0 — the script is the point, so here it is rather than a path to it:
+
+```sh
+cat > /tmp/ghlinux.sh <<'EOF'
+set -e
+apk add --no-cache github-cli >/dev/null
+gh --version | head -1
+mkdir -p /probe/a /probe/b /probe/c /probe/cwd /probe/here /probe/emptyhome /probe/one/.config/gh /probe/two/.config/gh
+cd /probe/cwd
+GH_CONFIG_DIR=../a XDG_CONFIG_HOME=../b HOME=../c   gh config set editor all-three
+env -u GH_CONFIG_DIR XDG_CONFIG_HOME=../b HOME=../c gh config set editor xdg-home
+env -u GH_CONFIG_DIR -u XDG_CONFIG_HOME HOME=../c   gh config set editor home-only
+echo "precedence:"; find /probe/a /probe/b /probe/c -name config.yml
+cd /probe/here
+GH_CONFIG_DIR=relcfg gh config set editor rel-direct
+env -u GH_CONFIG_DIR XDG_CONFIG_HOME=relcfg2 gh config set editor rel-xdg
+env -u GH_CONFIG_DIR -u XDG_CONFIG_HOME HOME=relhome gh config set editor rel-home
+echo "relative:"; find /probe/here -name config.yml
+# A fake home each, and the value read back: written one after another into the
+# same home, the second row could land anywhere and the `find` would still show
+# the file the first row wrote.
+mkdir -p /probe/fakehome1 /probe/fakehome2
+env -u XDG_CONFIG_HOME HOME=/probe/fakehome1 GH_CONFIG_DIR= gh config set editor empty-direct
+env -u GH_CONFIG_DIR HOME=/probe/fakehome2 XDG_CONFIG_HOME= gh config set editor empty-xdg
+echo "empty GH_CONFIG_DIR fell through to: $(cat /probe/fakehome1/.config/gh/config.yml 2>&1 | grep ^editor:)"
+echo "empty XDG_CONFIG_HOME fell through to: $(cat /probe/fakehome2/.config/gh/config.yml 2>&1 | grep ^editor:)"
+cd /probe/emptyhome
+env -u GH_CONFIG_DIR -u XDG_CONFIG_HOME HOME= gh config set editor empty-home
+echo "empty HOME wrote:"; find /probe/emptyhome -name config.yml
+printf 'editor: marker-one\n' > /probe/one/.config/gh/config.yml
+printf 'editor: marker-two\n' > /probe/two/.config/gh/config.yml
+for d in one two; do
+  cd /probe/$d
+  echo "unset HOME from $d: [$(env -u GH_CONFIG_DIR -u XDG_CONFIG_HOME -u HOME gh config get editor)]"
+done
+EOF
+docker run --rm -v /tmp/ghlinux.sh:/probe.sh:ro alpine:3.20 sh /probe.sh
+```
+
+Every row agrees with Darwin: `GH_CONFIG_DIR`, then `XDG_CONFIG_HOME/gh`, then `HOME/.config/gh`; relative values resolved from the current directory; empty `GH_CONFIG_DIR` and `XDG_CONFIG_HOME` fell through to the next root; an empty `HOME` wrote `./.config/gh/config.yml`; and with all three unset, `gh config get editor` answered `marker-one` from `one` and `marker-two` from `two`. So the behaviour is gh's rather than the platform's, which is what lets one rule serve both.
+
+What this does not establish: glibc, or gh 2.98.0 on Linux. Alpine is musl and its packaged gh is a year older, so this pins the shape of the rule rather than one build of it.
+
+## What the reviewer's Node environment runs on the agent's behalf
+
+`--setting-sources user` keeps the branch's Claude configuration out of the review. It cannot keep out startup code that runs before Claude parses an argument at all. Measured on 2026-09-08, Node 26.0.0 on Darwin 24.6.0, with the working directory standing in for a checkout:
+
+```sh
+echo 'require("node:fs").writeFileSync("/tmp/marker", "ran")' > p.cjs
+echo 'import { writeFileSync } from "node:fs"; writeFileSync("/tmp/marker", "ran")' > p.mjs
+echo 'console.log(1)' > cli.js
+mkdir mods && echo 'require("node:fs").writeFileSync("/tmp/marker", "ran")' > mods/evil.js
+
+# The marker is the whole observation, so it is cleared before every row —
+# one left behind by the row above would make the next one look positive.
+probe() { rm -f /tmp/marker; env "$@" >/dev/null 2>&1; test -e /tmp/marker && echo loaded || echo "not loaded"; }
+
+probe NODE_OPTIONS='--require ./p.cjs' node -e '0'
+probe NODE_OPTIONS='--require ./p.cjs' node cli.js
+probe NODE_OPTIONS='--import ./p.mjs'  node -e '0'
+probe NODE_PATH=./mods node -e 'require("evil")'
+probe NODE_PATH=mods   node -e 'require("evil")'
+probe node -e 'try{require("evil")}catch(e){}'   # control
+```
+
+Every row but the control loaded the file from the working directory. The two variables do it by different mechanisms, and the difference matters when describing what was shown: `NODE_OPTIONS` with `--require` or `--import` runs the file *before* the program it is loading into runs a line of its own, while `NODE_PATH` puts the directory on the search path, so a bare `require("evil")` the program performs itself resolves into the checkout. A review skill that runs `npm`, `npx` or a linter is a program full of bare lookups.
+
+Two mechanisms in one namespace, whose documented members keep growing, is the list-shaped mistake the `GIT_*` measurements above already caught once — so `runClaude` drops the whole `NODE_*` namespace rather than these two names.
+
+The exposure also depends on how `claude` was installed, though the policy does not: the binary this was measured against reads none of it.
+
+| launched with | `NODE_OPTIONS='--require ./p.cjs'` |
+| --- | --- |
+| `node` | loaded |
+| `claude` 2.1.263, a native Mach-O binary | not loaded |
+
+`BUN_CONFIG_PRELOAD` did nothing to either `bun` or that binary. The namespace still goes, because a review is not only `claude`: a skill that runs `node`, `npm` or `npx` inside the checkout hands the branch the same preload, whichever way Claude itself was installed.
+
+What this does not establish: that an npm-installed `claude` was itself measured — it was not, only the Node mechanism such an installation is launched by.
+
+## What the environment can hand Claude's Bash tool
+
+`CLAUDE_CODE_SHELL` is described as selecting that shell, which would make it another executable selector reaching the agent, and a relative one would be selectable by the branch. Measured on 2026-09-08 against claude 2.1.263, from a directory standing in for a checkout:
+
+```sh
+cat > engwire-shell <<'EOF'
+#!/bin/sh
+echo ran >> /tmp/engwire-shell-marker
+exec /bin/bash "$@"
+EOF
+chmod +x engwire-shell
+
+# The apparatus first: a stand-in that never writes its marker would make every
+# row below read as safety.
+rm -f /tmp/engwire-shell-marker; ./engwire-shell -c 'echo apparatus-ok'; test -e /tmp/engwire-shell-marker
+
+for value in "$(pwd)/engwire-shell" ./engwire-shell; do
+  rm -f /tmp/engwire-shell-marker
+  CLAUDE_CODE_SHELL="$value" claude --setting-sources user --allowedTools Bash \
+    -p 'Run this bash command and tell me its output: echo ENGWIRE_PROBE' < /dev/null
+  test -e /tmp/engwire-shell-marker && echo "$value: used" || echo "$value: not used"
+done
+```
+
+| `CLAUDE_CODE_SHELL` | Bash tool ran | stand-in shell used |
+| --- | --- | --- |
+| an absolute path | yes, `ECHO ENGWIRE_PROBE` answered | no |
+| `./engwire-shell` | yes | no |
+
+The tool ran both times and the stand-in was never invoked, so this version does not take the shell from the environment and the relative case does not arise. Engwire therefore leaves the variable alone: there is nothing measured to defend against, and dropping a variable on suspicion is how a list starts.
+
+`BASH_ENV` is the same question about the shell rather than about which shell. GNU Bash reads and executes the file it names whenever a non-interactive shell starts, so a relative `BASH_ENV=./x` is `NODE_OPTIONS=--require ./x` wearing different clothes. Same apparatus, same session, both spellings at once:
+
+```sh
+echo 'echo ran >> /tmp/engwire-bashenv-marker' > engwire-bash-env
+
+rm -f /tmp/engwire-bashenv-marker
+BASH_ENV=./engwire-bash-env bash -c 'echo apparatus-ok'
+test -e /tmp/engwire-bashenv-marker        # the mechanism itself: fires
+
+rm -f /tmp/engwire-bashenv-marker
+ENV=./engwire-bash-env sh -c 'echo apparatus-ok'
+test -e /tmp/engwire-bashenv-marker        # the `sh` spelling: does not
+
+rm -f /tmp/engwire-bashenv-marker
+BASH_ENV=./engwire-bash-env ENV=./engwire-bash-env claude --setting-sources user \
+  --allowedTools Bash -p 'Run this bash command and tell me its output: echo ENGWIRE_BASHENV_PROBE' \
+  < /dev/null
+test -e /tmp/engwire-bashenv-marker        # through the Bash tool: does not
+```
+
+A plain `bash -c` ran the file, and Claude's own Bash tool did not. That is one process short of the answer, because a review is not only Claude — so the same probe again, one level deeper:
+
+```sh
+rm -f /tmp/engwire-bashenv-marker
+BASH_ENV=./engwire-bash-env claude --setting-sources user --allowedTools Bash \
+  -p "Run this exact bash command and show me its full output: bash -c 'echo BASH_ENV=[\$BASH_ENV]; echo child-ok'" \
+  < /dev/null
+test -e /tmp/engwire-bashenv-marker        # fires
+```
+
+The child printed `BASH_ENV=[./engwire-bash-env]` and the marker was written. So the variable is inherited all the way down, and the first shell a skill starts for itself runs whatever the checkout left at that path. Engwire drops `BASH_ENV`. Engwire does not drop `ENV`, the spelling a shell invoked as `sh` would read: a non-interactive `sh` was measured not to read it, and dropping it anyway is where a list starts.
+
+`ZDOTDIR` is the same question for the other shell on this platform, and it answers louder. zsh reads `$ZDOTDIR/.zshenv` on *every* invocation, interactive or not:
+
+```sh
+echo 'echo ran >> /tmp/engwire-zdotdir-marker' > .zshenv
+
+rm -f /tmp/engwire-zdotdir-marker
+ZDOTDIR=. zsh -c 'echo apparatus-ok'; test -e /tmp/engwire-zdotdir-marker   # fires
+
+rm -f /tmp/engwire-zdotdir-marker
+ZDOTDIR=. claude --setting-sources user --allowedTools Bash \
+  -p "Run this exact bash command and show its full output: zsh -c 'echo child-ok'" < /dev/null
+wc -l < /tmp/engwire-zdotdir-marker        # 4
+```
+
+It ran, and more than once in a single invocation — the tool's own shell reads it too on a machine where zsh is the login shell. The count is not the point; that it runs at all is.
+
+Removing the variable is *not* the fix here, which is where `ZDOTDIR` parts company with `BASH_ENV`: `BASH_ENV` names the file, so removing it removes the file, while `ZDOTDIR` names a directory and falls back to `HOME`. What each combination actually reads, with a `.zshenv` planted in every candidate directory and `zsh -c ':'` run from `cwd`:
+
+```sh
+mkdir -p cwd/relhome cwd/relz safehome
+for d in cwd cwd/relhome cwd/relz safehome; do echo "echo $d >> /tmp/engwire-z" > $d/.zshenv; done
+probe() { rm -f /tmp/engwire-z; ( cd cwd && env "$@" zsh -c ':' ); echo "$* -> $(cat /tmp/engwire-z 2>/dev/null)"; }
+
+probe -u ZDOTDIR HOME="$PWD/safehome"
+probe -u ZDOTDIR HOME=relhome
+probe -u ZDOTDIR HOME=.
+probe -u ZDOTDIR HOME=
+probe -u ZDOTDIR -u HOME
+probe ZDOTDIR=relz HOME="$PWD/safehome"
+probe ZDOTDIR= HOME=.
+probe ZDOTDIR="$PWD/safehome" HOME=
+```
+
+| environment | what ran |
+| --- | --- |
+| no `ZDOTDIR`, absolute `HOME` | `safehome/.zshenv` — the fallback |
+| no `ZDOTDIR`, `HOME=relhome` | **`cwd/relhome/.zshenv`** |
+| no `ZDOTDIR`, `HOME=.` | **`cwd/.zshenv`** |
+| no `ZDOTDIR`, `HOME=` or no `HOME` | nothing under the working directory |
+| `ZDOTDIR=relz`, absolute `HOME` | **`cwd/relz/.zshenv`** |
+| `ZDOTDIR=`, `HOME=.` | nothing — an empty selector is still a selector |
+| absolute `ZDOTDIR`, `HOME=` | the selector's own file |
+
+So `ZDOTDIR` wins whenever it is set, empty included; `HOME` answers only when it is not; an empty value of either, and an absent `HOME`, read nothing from the working directory — where they read instead was not established and does not matter here; and the unsafe case is exactly a non-empty relative value, whichever variable supplied it. `ENV` stays on the strength of the row above it: three names in one family, two of which fire.
+
+Two fixes were wrong before the third was right, and both failures are worth keeping. **Dropping `ZDOTDIR`** hands the question to `HOME` — swapping one checkout-relative selector for another in the second row, and replacing a *safe* absolute selector with an unsafe `HOME` in the last. **Naming it absolutely** stops the directory moving between the runner and the review, and keeps pointing at whatever it already pointed at. Measured on 2026-09-08, which is the whole argument in four commands:
+
+```sh
+mkdir -p zprobe/checkout/relz zprobe/worktree && cd zprobe
+echo 'echo "CONTRIBUTOR FILE RAN" >> '"$PWD"'/marker' > checkout/relz/.zshenv
+PINNED=$(cd checkout && python3 -c "import os; print(os.path.abspath('relz'))")
+rm -f marker; ( cd worktree && ZDOTDIR="$PINNED" zsh -c ':' ); cat marker
+```
+
+`CONTRIBUTOR FILE RAN`. A relative value resolves against the directory `engwire run` was typed in, which can be the checkout under review; the pinned absolute name then carries the branch's `.zshenv` into a zsh started somewhere else entirely. Stopping a path from moving does not make its origin trustworthy — the rule `ghConfigProblem` states for gh's configuration root, arrived at here a second time. `zshStartupProblem` refuses the non-empty relative case and passes every measured-safe one through untouched.
+
+**The loader variables** are the bluntest form of this, and the two platforms answer differently.
+
+On Darwin, the tested Claude installation stripped them; the ordinary probe binary did not:
+
+```sh
+printf '#include <stdio.h>\n__attribute__((constructor)) static void p(void){ FILE *f=fopen("/tmp/engwire-dyld-marker","a"); if(f){fputs("ran\\n",f);fclose(f);} }\n' > inject.c
+printf '#include <stdio.h>\nint main(void){ puts("victim-ok"); return 0; }\n' > victim.c
+cc -dynamiclib -o libinject.dylib inject.c && cc -o victim victim.c
+
+probe() { rm -f /tmp/engwire-dyld-marker; "$@" >/dev/null 2>&1; test -e /tmp/engwire-dyld-marker && echo loaded || echo "not loaded"; }
+probe env DYLD_INSERT_LIBRARIES=./libinject.dylib ./victim      # loaded
+probe env DYLD_INSERT_LIBRARIES=./libinject.dylib /bin/echo hi  # not loaded — SIP
+
+rm -f /tmp/engwire-dyld-marker
+DYLD_INSERT_LIBRARIES=./libinject.dylib claude --setting-sources user --allowedTools Bash \
+  -p 'Run this exact bash command and show its full output: ./victim; echo "DYLD=[$DYLD_INSERT_LIBRARIES]"' \
+  < /dev/null
+test -e /tmp/engwire-dyld-marker                                # not loaded
+```
+
+A relative `DYLD_INSERT_LIBRARIES` loads into an ordinary program and not into a SIP-protected one, and by the time the agent's own children look the variable is *empty* — the child printed `DYLD=[]`. dyld strips it when it spawns the signed `claude`, and every descendant inherits the cleaned environment.
+
+How wide that stripping is, measured on 2026-09-08 because a test wanted to assert on it:
+
+```sh
+printf '#!/bin/sh\necho "sentinel:[${DYLD_ENGWIRE_SENTINEL-<unset>}]"\necho "ld:[${LD_ENGWIRE_SENTINEL-<unset>}]"\n' > dyldprobe.sh
+chmod +x dyldprobe.sh
+DYLD_ENGWIRE_SENTINEL=present LD_ENGWIRE_SENTINEL=present ./dyldprobe.sh
+DYLD_ENGWIRE_SENTINEL=present /usr/bin/env | grep -c DYLD_
+```
+
+The script saw `sentinel:[<unset>]` and `ld:[present]`, and `env` counted zero. So dyld removes the whole `DYLD_*` namespace — an invented name it can have no opinion about included — before any SIP-protected binary, and `/bin/sh` is one. The practical consequence is a testing one: a `#!/bin/sh` fixture on Darwin cannot tell a policy that drops `DYLD_*` from one that keeps it, so `run.test.ts` asserts that rule on `claudeEnvironment` directly. The spawn-based version of that test passed against a filter with the rule removed.
+
+What this does *not* establish is that Claude is safe from `DYLD_*` — only that this Claude is, because of how it was installed. The Linux result below is the same product with a different installation shape and the opposite answer. `claude_bin` names any executable, so `claudeEnvironment` drops `DYLD_*` too rather than resting the boundary on the agent's signing.
+
+**Linux does not.** Measured on 2026-09-08 in `node:22-bookworm` (Debian, glibc) against an npm-installed `claude` — the loader question needs no authentication, because it is answered before the program starts. Both mechanisms are in one script so a rerun puts them both back inside the container:
+
+```sh
+mkdir -p /tmp/ld && cat > /tmp/ld/run.sh <<'EOF'
+set -e
+cd /probe
+printf '#include <stdio.h>\n__attribute__((constructor)) static void p(void){ FILE *f=fopen("/probe/marker","a"); if(f){fputs("ran\\n",f);fclose(f);} }\n' > probe.c
+printf '#include <stdio.h>\nint main(void){ puts("victim-ok"); return 0; }\n' > victim.c
+printf 'void engwire_probe_symbol(void);\nint main(void){ engwire_probe_symbol(); return 0; }\n' > needy.c
+gcc -shared -fPIC -o libprobe.so probe.c
+gcc -o victim victim.c
+probe() { rm -f /probe/marker; "$@" >/dev/null 2>&1 || true; test -e /probe/marker && echo LOADED || echo "not loaded"; }
+
+echo "== mechanism one: LD_PRELOAD =="
+printf '  ordinary binary, relative LD_PRELOAD : '; probe env LD_PRELOAD=./libprobe.so ./victim
+npm i -g @anthropic-ai/claude-code >/dev/null 2>&1
+printf '  installed: '; claude --version
+printf '  claude --version, relative LD_PRELOAD: '; probe env LD_PRELOAD=./libprobe.so claude --version
+
+echo "== mechanism two: LD_LIBRARY_PATH =="
+# The constructor library gains the symbol `needy` calls, so the dependency is
+# real rather than decorative.
+printf 'void engwire_probe_symbol(void){}\n' >> probe.c
+gcc -shared -fPIC -Wl,-soname,libengwireprobe.so -o libengwireprobe.so probe.c
+# The `ldd` line is the apparatus check, and it is load-bearing: two earlier
+# versions of this reported "safe" on every row because the binary linked no
+# real dependency at all. `needy.c` referencing the symbol is what fixed that.
+gcc -o needy needy.c -L/probe -lengwireprobe
+ldd needy | grep -q engwireprobe || { echo "APPARATUS BROKEN: needy does not depend on the library"; exit 1; }
+mkdir -p elsewhere && cp needy elsewhere/needy
+printf '  from elsewhere, LD_LIBRARY_PATH=/probe : '; ( cd elsewhere && rm -f /probe/marker; LD_LIBRARY_PATH=/probe ./needy >/dev/null 2>&1 || true; test -e /probe/marker && echo LOADED || echo "not loaded" )
+printf '  from /probe,    LD_LIBRARY_PATH unset  : '; probe env -u LD_LIBRARY_PATH ./needy
+printf '  from /probe,    LD_LIBRARY_PATH=       : '; probe env LD_LIBRARY_PATH= ./needy
+printf '  from /probe,    LD_LIBRARY_PATH=:      : '; probe env LD_LIBRARY_PATH=: ./needy
+printf '  from /probe,    LD_LIBRARY_PATH=.      : '; probe env LD_LIBRARY_PATH=. ./needy
+EOF
+docker run --rm -v /tmp/ld:/probe -w /probe node:22-bookworm bash /probe/run.sh
+```
+
+The script prints its own results. Run against `claude` 2.1.263 and again against 2.1.265:
+
+| | relative `LD_PRELOAD=./libprobe.so` |
+| --- | --- |
+| an ordinary binary | LOADED |
+| `claude --version`, npm-installed | **LOADED** |
+
+The constructor ran inside the agent's own process, before Claude had the chance to enforce anything at all — no tool call, no skill, no shell needed. That is the strongest form of this whole family, and the only one that lands in the process Engwire is trying to draw a boundary around.
+
+`LD_LIBRARY_PATH` is a second mechanism in the same namespace, and it names no file:
+
+| run from | `LD_LIBRARY_PATH` | result |
+| --- | --- | --- |
+| `elsewhere` | `/probe` | LOADED — the control |
+| the directory holding the library | unset | not loaded |
+| the directory holding the library | `` (wholly empty) | not loaded |
+| the directory holding the library | `:` — one empty entry | **LOADED** |
+| the directory holding the library | `.` | **LOADED** |
+
+An empty *entry* is the working directory, while an entirely empty value reads as unset. So a review that runs any dynamically linked program in the checkout can have a branch-supplied library answer an ordinary dependency. Two independent mechanisms, and `ld.so` documents `LD_AUDIT` besides, which is the same argument that made `NODE_*` a namespace: `withoutStartupCodeVariables` drops `LD_*`.
+
+The dependency check is essential: earlier probes reported "not loaded" on every row because `needy` linked no real dependency. Calling a symbol the library defines and checking it with `ldd` prevents that false negative.
+
+What this does not establish: musl, a natively installed Linux Claude, or that `LD_AUDIT` behaves as documented — none of which change the fix, since the namespace covers them. What this does not establish: other versions of anything above. Nor that this family has been enumerated — `BASH_ENV` was found after `NODE_*`, `ZDOTDIR` after `BASH_ENV`, and the Linux loader after that. The recipes are here because the answers are properties of released software rather than of Engwire, and the ones that go through Claude cost an agent turn each to re-run.
+
+## Which of Engwire's own subprocesses the loader gets to
+
+The section above proves the mechanism against `claude`. Every edge in this project spawns something, and two of them — `git` and `gh` — run with a working directory inside a clone of the branch or wherever the runner was started. The question is not whether the loader is dangerous, which is settled, but which of these binaries it actually reaches. Measured on 2026-09-08 rather than generalised.
+
+**On Linux**, in the same container, with an apparatus check first because a target that cannot run at all would report "not loaded" and read as safety:
+
+```sh
+# The container decides the target, not the host. The first run of this built
+# x86-64 into an aarch64 container; the binary could not execute and the probe
+# reported "not loaded", which reads exactly like resistance.
+mkdir -p /tmp/ld
+case "$(docker run --rm node:22-bookworm uname -m)" in
+  aarch64) TARGET=bun-linux-arm64 ;;
+  x86_64)  TARGET=bun-linux-x64 ;;
+  *)       echo "unknown container architecture"; exit 1 ;;
+esac
+bun build --compile --minify --target=$TARGET --outfile=/tmp/ld/engwire-linux src/main.ts
+cat > /tmp/ld/subprocesses.sh <<'EOF'
+set -e
+cd /probe
+printf '#include <stdio.h>\n__attribute__((constructor)) static void p(void){ FILE *f=fopen("/probe/marker","a"); if(f){fputs("ran\\n",f);fclose(f);} }\n' > probe.c
+gcc -shared -fPIC -o libprobe.so probe.c
+apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq git gh file >/dev/null 2>&1
+
+echo "== each target runs, and is a dynamic executable =="
+for t in "git --version" "gh --version" "/probe/engwire-linux --version"; do
+  printf '  %-32s ' "$t"
+  # Capture the target's status before truncating its output; a pipeline to
+  # head would report head's success even if the target could not execute.
+  if out=$($t 2>&1); then
+    printf 'runs: %-28s ' "$(printf '%s\n' "$out" | head -1)"
+  else
+    printf 'DOES NOT RUN: %s\n' "$out"
+    exit 1
+  fi
+  if file -b "$(command -v ${t%% *})" | grep -q "dynamically linked"; then
+    echo "dynamic"
+  else
+    echo "DYNAMIC EXECUTABLE NOT CONFIRMED — stop before interpreting loader results"
+    exit 1
+  fi
+done
+
+# Stricter than the `probe` in the section above, and deliberately so. There a
+# target that fails to start *is* the result being measured — a missing library
+# is what an unset LD_LIBRARY_PATH looks like. Here every target was just shown
+# to run, so a failure is the apparatus breaking, and "not loaded" would be the
+# same false negative in a new costume.
+probe() {
+  rm -f /probe/marker
+  "$@" >/dev/null 2>&1 || { echo "PROBE TARGET FAILED TO RUN — result would be meaningless"; exit 1; }
+  test -e /probe/marker && echo LOADED || echo "not loaded"
+}
+echo "== relative LD_PRELOAD into each subprocess Engwire starts =="
+printf '  git --version     : '; probe env LD_PRELOAD=./libprobe.so git --version
+printf '  gh --version      : '; probe env LD_PRELOAD=./libprobe.so gh --version
+printf '  engwire --version : '; probe env LD_PRELOAD=./libprobe.so /probe/engwire-linux --version
+EOF
+docker run --rm -v /tmp/ld:/probe -w /probe node:22-bookworm bash /probe/subprocesses.sh
+```
+
+Every apparatus condition exits rather than warning. A target that cannot run, one `file` will not confirm as dynamic, and a probe whose target failed to start all stop the script — because each of them produces "not loaded", and that is the one answer this experiment must never give for the wrong reason.
+
+**On macOS**, the same three. Self-contained rather than reusing the `inject.c` above, whose marker path belongs to that section — run this from the repository root:
+
+```sh
+REPO=$PWD; mkdir -p /tmp/dyld && cd /tmp/dyld
+printf '#include <stdio.h>\n__attribute__((constructor)) static void p(void){ FILE *f=fopen("/tmp/dyld/marker","a"); if(f){fputs("ran\\n",f);fclose(f);} }\n' > inject.c
+cc -dynamiclib -o libinject.dylib inject.c
+bun build --compile --minify --target=bun-darwin-arm64 --outfile=/tmp/dyld/engwire "$REPO/src/main.ts"
+probe() {
+  rm -f /tmp/dyld/marker
+  "$@" >/dev/null 2>&1 || { echo "PROBE TARGET FAILED TO RUN — result would be meaningless"; return 1; }
+  test -e /tmp/dyld/marker && echo LOADED || echo "not loaded"
+}
+for t in /tmp/dyld/engwire "$(command -v git)" "$(command -v gh)"; do
+  printf '  %-22s runs: %-32s ' "$(basename $t)" "$($t --version | head -1)"
+  probe env DYLD_INSERT_LIBRARIES=./libinject.dylib "$t" --version
+done
+```
+
+| target | relative `LD_PRELOAD` (Debian, glibc) | relative `DYLD_INSERT_LIBRARIES` (Darwin 24.6.0) |
+| --- | --- | --- |
+| `git --version` — git 2.39.5 / 2.54.0 | **LOADED** | **LOADED** |
+| `gh --version` — gh 2.23.0 / 2.98.0 | **LOADED** | **LOADED** |
+| `engwire --version` — a release build | **LOADED** | **LOADED** |
+
+Three things follow, and the third is the one worth stating plainly.
+
+The mechanism is not Claude's. `git` and `gh` load a relative library exactly as `claude` does, so `withoutStartupCodeVariables` is applied at all three edges rather than only the agent's. Each edge keeps its own Git, GitHub, PATH, deadline and process-group policy; the shared part is only this filter.
+
+The macOS column is the reason `DYLD_*` is dropped rather than trusted. dyld strips it before a *SIP-protected* binary and before the signed `claude` measured earlier — but an ordinary Homebrew `git`, an ordinary `gh`, and a binary Engwire itself ships are none of those. The protection belongs to how a program was installed, not to the platform.
+
+And **Engwire's own binary loads it too, on both platforms.** No filter in this codebase can reach that: the constructor runs before `main.ts` gets control, so by the time any TypeScript could remove a variable, the code it names has already run. That is a residual rather than a bug to fix here, and `SECURITY.md` names it as one. What it bounds is the claim the rest of this makes: Engwire can decide what its *children* inherit, and cannot decide what its own process was started with.
+
+## Is a signal delivered before its handler is registered?
+
+`runClaude` puts the review in its own process group and is then the only process that can stop it. Whether the signal handlers may be registered *after* the spawn turns on what happens to a signal arriving in between. Measured on 2026-09-08, Bun 1.4.0, Darwin 24.6.0:
+
+```sh
+cat > sig.ts <<'EOF'
+// Control only: the same line moved below the blocking span for the second row.
+process.on("SIGTERM", () => { console.log("handler ran"); process.exit(0); });
+const buf = new Int32Array(new SharedArrayBuffer(4));
+Atomics.wait(buf, 0, 0, 600);   // synchronous, so no event-loop turn happens
+console.log("still alive");
+setTimeout(() => { console.log("no signal arrived"); process.exit(2); }, 800).unref();
+EOF
+# Redirect the output: reading it from the terminal is how a run that was never
+# signalled gets mistaken for one that survived being signalled.
+bun sig.ts > out.txt 2>&1 & bp=$!
+sleep 0.3; kill -TERM "$bp"; wait $bp; echo "exit=$?"; cat out.txt
+```
+
+| handler registered | result |
+| --- | --- |
+| before the blocking span | exit 0 — "still alive", then "handler ran" on the next event-loop turn |
+| after it, 3 runs | exit 143, nothing printed — the default action, at once |
+
+There is no grace period: a signal that finds no JS handler terminates the process where it stands. Registering after `Bun.spawn` would leave a span, however short, in which the review has been detached and the process that knows how to stop it is gone — so `runClaude` registers first and signals the new group afterwards if a signal arrived while the spawn was in flight.
+
+A self-raised signal is not this measurement: `process.kill(process.pid, "SIGTERM")` immediately before the registration also exits 143, but POSIX requires a signal sent to oneself to be delivered before `kill` returns, so it would say 143 either way.
+
+## What an emptied process group reports
+
+Once the agent has exited, `runClaude` kills its group unconditionally, and has to tell "nothing left to kill" from a cleanup that genuinely failed. Measured on 2026-09-08, Bun 1.4.0, Darwin 24.6.0: spawn detached, `await proc.exited`, then `process.kill(-proc.pid, "SIGKILL")` and count the error codes.
+
+| the group, at the kill | result |
+| --- | --- |
+| `sh -c 'exit 0'` — leader only, nothing behind it | `ESRCH` × 200 |
+| `sh -c 'sleep 0.01 & exit 0'` — a descendant winding down, never signalled | delivered × 200 |
+| `sh -c 'sleep 30 & sleep 30'`, the group SIGTERMed 50 ms in | `ESRCH` × 95, `EPERM` × 5 |
+
+The third row is the production shape — a timeout or a shutdown signals the group, and the final kill lands once the leader has been reaped — and it is the only one that reports `EPERM`. Nothing from the review survived any of those hundred runs. That supports treating `EPERM` as cleanup in this Darwin case, but does not establish why the kernel returned it or that every `EPERM` means an empty group. `signalRun` ignores it only on Darwin; elsewhere it remains a cleanup failure.
+
+Worth knowing before re-running this: the first two shapes were measured first and reported `EPERM` not once in 400 attempts. A group that was never signalled is not this measurement, and neither is one killed before its leader is reaped.
+
+What this does not establish: Linux, or the mechanism. `run.test.ts` covers the property Engwire needs — the review's tools are gone afterwards — so a platform that stops behaving this way arrives as a failing test rather than as a run that fails on its own cleanup.

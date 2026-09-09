@@ -1,0 +1,10 @@
+#!/bin/sh
+# Stands in for a review that does not stop when it is asked to, so a test can
+# let the run deadline pass while the shutdown that got there first is still
+# waiting. Readiness is announced from inside the handler's own process: the
+# race only means anything once SIGTERM is genuinely being ignored.
+exec "$STUBBORN_BUN" -e '
+  process.on("SIGTERM", () => {});
+  await Bun.write(process.env.STUBBORN_READY, "ready");
+  await Bun.sleep(Number(process.env.STUBBORN_MS ?? 2500));
+'

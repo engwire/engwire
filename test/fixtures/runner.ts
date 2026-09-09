@@ -8,6 +8,8 @@ await runClaude({
   repo: "acme/api",
   cwd: process.cwd(),
   prompt: "ignored",
-  timeoutMs: 60_000,
+  // Long enough to be irrelevant, unless a test is arranging the race where a
+  // shutdown lands first and the deadline passes while it is still winding up.
+  timeoutMs: Number(process.env.RUNNER_TIMEOUT_MS ?? 60_000),
   logPath: process.argv[3]!,
 });
