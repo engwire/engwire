@@ -269,6 +269,48 @@ The cost is that a file which really is an LFS pointer stays a pointer in the ch
 
 What none of this covers, and is not meant to: once Claude is running in that directory, a skill can execute whatever its `allowed-tools` permit. The claim measured here is narrower — what *Engwire's own* git does.
 
+## Does a losing deadline keep the process alive?
+
+Two places race a deadline against work that may finish first: `capture` in `cli/doctor.ts`, and `createGh`. Whichever loses is never awaited again, and `Promise.race` does not cancel it — so whether the command can exit turns on whether a timer nobody cleans up still holds the event loop. Both places do clean theirs up, and the measurement below is why they have to. `engwire doctor`, `setup` and `service install` all run those probes, and all three are commands somebody is sitting and watching.
+
+Measured on macOS 15, Bun 1.4.0. Each script settles a race immediately and then does nothing; what is being timed is when the process exits, not when the race resolves:
+
+```sh
+# The work answers at once; the deadline is three seconds away.
+cat > sleep-race.ts <<'EOF'
+await Promise.race([Promise.resolve("done"), Bun.sleep(3000).then(() => null)]);
+console.log("raced at", Math.round(performance.now()), "ms");
+EOF
+
+# The same race, with a timer the script owns and unrefs.
+cat > settimeout-race.ts <<'EOF'
+let timer: ReturnType<typeof setTimeout> | undefined;
+const expired = new Promise<null>((resolve) => {
+  timer = setTimeout(() => resolve(null), 3000);
+  timer.unref();
+});
+await Promise.race([Promise.resolve("done"), expired]);
+console.log("raced at", Math.round(performance.now()), "ms");
+EOF
+
+# And a signal armed and abandoned, which is how `checkout_timeout` is built.
+echo 'AbortSignal.timeout(3000);' > abortsignal-timeout.ts
+
+for f in sleep-race settimeout-race abortsignal-timeout; do /usr/bin/time -p bun run $f.ts; done
+```
+
+| | race settles | process exits |
+| --- | --- | --- |
+| `Bun.sleep(3000)` as the losing side | 5 ms | **3.01 s** |
+| `setTimeout(…, 3000)` with `.unref()` | 2 ms | 0.00 s |
+| `AbortSignal.timeout(3000)`, armed and abandoned | — | 0.00 s |
+
+`Bun.sleep`'s timer is referenced, so a probe that answered promptly still held the runtime for the whole deadline. This is not theoretical: written that way, a `doctor` that had printed every row in 0.07 s took 20.4 s to return, on five sequential probes against a twenty-second deadline. `capture` therefore owns an explicit `setTimeout`, clears it when the answer arrives, and `unref`s it so a path that misses the clear cannot keep a finished command alive. `AbortSignal.timeout` needs neither, which is why `executeRun` composes one for `checkout_timeout` and does nothing further about it.
+
+`src/main.ts` sets `process.exitCode` rather than calling `process.exit`, so nothing forces the runtime down over a live handle — the difference above is the whole difference between a command that ends and one that waits.
+
+What this does not establish: that `Bun.sleep`'s referencing is documented or stable, or that the same holds on Linux. A test spawns `engwire doctor` and requires it to finish its probes and exit well inside the production deadline, guarding against regressions that leave a finished command waiting on live handles.
+
 ## What `homedir()` does when there is no `HOME`
 
 `paths()` falls back to `homedir()` whenever neither `ENGWIRE_HOME`, the relevant XDG variable nor `HOME` supplies a root. If that fallback were empty, `join` would produce relative paths resolved against the working directory, which may be a checkout of the branch under review. Bun's `node:os` reference says POSIX `homedir()` uses `$HOME` whenever it is defined, so its documented reading of `HOME=` would produce that unsafe result.

@@ -9,9 +9,15 @@ case "$*" in
   "api user --jq .login")
     # A GitHub outage looks like a non-zero `gh`, not a missing account.
     [ -n "$FAKE_GH_FAIL_LOGIN" ] && { echo "could not resolve host" >&2; exit 1; }
+    # An outage that ends: the first call fails and leaves the marker, so one
+    # runner can be watched waiting and then recovering in the same process.
+    [ -n "$FAKE_GH_FAIL_LOGIN_ONCE" ] && [ ! -f "$FAKE_GH_FAIL_LOGIN_ONCE" ] && {
+      : > "$FAKE_GH_FAIL_LOGIN_ONCE"; echo "could not resolve host" >&2; exit 1; }
     # A `gh` that has not answered yet, so a test can signal the runner while
-    # one is genuinely in flight rather than racing to guess when it is.
-    [ -n "$FAKE_GH_HANG_LOGIN" ] && { : > "$FAKE_GH_HANG_LOGIN"; sleep 120; }
+    # one is genuinely in flight rather than racing to guess when it is. `exec`
+    # because the boundary kills the process it spawned and no descendant of it
+    # — a `sleep` left as a child outlives the test, reparented to init.
+    [ -n "$FAKE_GH_HANG_LOGIN" ] && { : > "$FAKE_GH_HANG_LOGIN"; exec sleep 120; }
     echo "${FAKE_GH_LOGIN:-me}" ;;
   search*)                cat "$FAKE_GH_DIR/search.json" ;;
   "pr view"*)             cat "$FAKE_GH_DIR/pr.json" ;;
