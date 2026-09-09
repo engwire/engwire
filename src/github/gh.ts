@@ -8,6 +8,8 @@
  * `gh auth git-credential` separately when a clone needs credentials.
  */
 
+import { isAbsolute, join } from "node:path";
+import { withoutStartupCodeVariables } from "../environment.ts";
 import { absolutePath } from "../config/paths.ts";
 import { readText } from "../read-text.ts";
 
@@ -84,6 +86,56 @@ export type Gh = {
 export const GITHUB_ENV = { GH_HOST: "github.com" } as const;
 
 /**
+ * Where gh will look for its configuration.
+ *
+ * Measured precedence, with the three roots pointed at different directories:
+ * gh wrote under `GH_CONFIG_DIR`; without it, under `XDG_CONFIG_HOME/gh`;
+ * without that, under `HOME/.config/gh`. Measured too that an empty value is no
+ * value for the first two, which fall through to the next root.
+ *
+ * Empty or absent `HOME` resolves to `.config/gh` under cwd; unlike Engwire’s
+ * `paths()`, gh does not fall back to the OS account home. See docs/experiments.md.
+ * Return the deciding variable too so the diagnostic names what to fix.
+ */
+function ghConfigRoot(env: Record<string, string | undefined>): { dir: string; named: string } {
+  if (env.GH_CONFIG_DIR) return { dir: env.GH_CONFIG_DIR, named: "GH_CONFIG_DIR" };
+  if (env.XDG_CONFIG_HOME) return { dir: join(env.XDG_CONFIG_HOME, "gh"), named: "XDG_CONFIG_HOME" };
+  return { dir: join(env.HOME ?? "", ".config", "gh"), named: "HOME" };
+}
+
+/**
+ * What is wrong with where this environment points gh, or null.
+ *
+ * A refusal rather than a repair. A root that resolves from the working
+ * directory is contributor content whenever that directory is a checkout, and a
+ * reviewer can start Engwire from one — so resolving it absolutely would pin
+ * the branch's own `hosts.yml` just as faithfully as the reviewer's. Absolute
+ * is not the same as trusted. `zshStartupProblem` reaches the same conclusion
+ * about zsh's startup directory, having tried the repair first.
+ *
+ * What that directory holds is why it is worth refusing over: `hosts.yml`
+ * decides which account posts a review, and `config.yml` holds aliases that can
+ * be `!` shell commands. A branch that supplied it would supply the credentials
+ * and the program both.
+ *
+ * Check the effective root once, using the measured precedence above.
+ * `run` refuses it; `doctor` and `setup` report it without probing gh, and
+ * `service install` diagnoses the environment it will write to the plist.
+ */
+export function ghConfigProblem(
+  env: Record<string, string | undefined> = process.env,
+): string | null {
+  const { dir, named } = ghConfigRoot(env);
+  if (isAbsolute(dir)) return null;
+  return (
+    `gh would read its configuration from ${JSON.stringify(dir)}, a relative path decided by ` +
+    `${named}. That directory holds the credentials a review posts with, and gh resolves it ` +
+    "from whatever directory a command was run in — including a checkout Engwire is about to " +
+    `review, whose author could put one there. Set ${named} to an absolute path.`
+  );
+}
+
+/**
  * How long Engwire waits for a `gh` invocation to produce a complete answer.
  *
  * A paginated call can make many requests, so two minutes is deliberately
@@ -138,7 +190,13 @@ export function createGh(
       // `gh_bin` may legitimately be a bare `gh`, and `Bun.spawn` resolves one
       // through the PATH it is handed — so this is what decides which `gh`
       // discovery runs, not the shell the reviewer started the runner from.
-      env: { ...env, PATH: absolutePath(env.PATH), ...GITHUB_ENV },
+      //
+      // `gh` gets the startup-variable filter for the same reason Claude does,
+      // and it is not a precaution: a relative `LD_PRELOAD` was measured to run
+      // a constructor inside `gh --version` on Debian and inside an ordinary
+      // macOS `gh` too. This edge is given no cwd of its own, so it stands
+      // wherever the runner does — which can be a checkout.
+      env: { ...withoutStartupCodeVariables(env), PATH: absolutePath(env.PATH), ...GITHUB_ENV },
     });
     const out = readText(proc.stdout);
     const err = readText(proc.stderr);

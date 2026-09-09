@@ -12,18 +12,21 @@ import { isAbsolute } from "node:path";
 import * as launchd from "../service/launchd.ts";
 import { diagnose } from "./doctor.ts";
 
-/**
- * launchd is the only supervisor, so this is the only place that knows it.
- *
- * A platform-neutral service layer over one implementation would add an
- * abstraction without hiding any current variation.
- */
+/** Return platform guidance separately so it can be tested on either platform. */
+export function unsupportedNote(action: string): string[] {
+  return [
+    `engwire service ${action} is available only on macOS. Run \`engwire run\` under your platform's supervisor:`,
+    LINUX_DOCS,
+  ];
+}
+
 function unsupported(action: string): number {
-  console.error(
-    `engwire service ${action} is available only on macOS. Run \`engwire run\` under your platform's supervisor.`,
-  );
+  for (const line of unsupportedNote(action)) console.error(line);
   return 1;
 }
+
+/** Installed binaries need a web URL because no checkout is required. */
+export const LINUX_DOCS = "https://github.com/engwire/engwire/blob/main/docs/linux.md";
 
 /**
  * Path settings that will not retain their meaning in a service plist.

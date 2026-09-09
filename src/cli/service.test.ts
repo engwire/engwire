@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { replacementNotice, servicePathProblems } from "./service.ts";
+import { LINUX_DOCS, replacementNotice, servicePathProblems, unsupportedNote } from "./service.ts";
 
 describe("replacementNotice", () => {
   test("says nothing when the plist here already names this installation", () => {
@@ -29,6 +29,20 @@ describe("replacementNotice", () => {
     const said = replacementNotice({ whose: "theirs", plistPath: "/p", supervises: null });
 
     expect(said[0]).toContain("not one this installation could identify");
+  });
+});
+
+describe("unsupportedNote", () => {
+  test("sends the reader somewhere rather than only saying no", () => {
+    // launchd is the only supervisor Engwire implements, so this is the whole
+    // of what a Linux user gets from `engwire service`. Naming the action and
+    // then stopping would leave them to guess what "your platform's
+    // supervisor" means; the page is the part they can act on.
+    const said = unsupportedNote("install");
+
+    expect(said[0]).toContain("engwire service install");
+    expect(said[0]).toContain("only on macOS");
+    expect(said).toContain(LINUX_DOCS);
   });
 });
 

@@ -3,7 +3,7 @@ import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createGh, GH_TIMEOUT_MS, GhAnswerError, GhError } from "./gh.ts";
+import { createGh, ghConfigProblem, GH_TIMEOUT_MS, GhAnswerError, GhError } from "./gh.ts";
 
 // A local gh stub exercises environment pinning and subprocess failures.
 // These tests make no GitHub requests.
@@ -19,6 +19,10 @@ writeFileSync(
 # login. Tested for being set rather than non-empty, since empty is the case
 # that matters most and a plain -n cannot tell it from unset.
 [ -n "\${FAKE_GH_ANSWER+set}" ] && { printf '%s' "$FAKE_GH_ANSWER"; exit 0; }
+# The loader and interpreter selectors, for the test that asserts none of them
+# survive this edge. Echoed rather than recorded to a file so the assertion
+# reads the same answer the caller does.
+[ "$1" = "startup" ] && { printf 'LD_PRELOAD=[%s] NODE_OPTIONS=[%s] BASH_ENV=[%s]' "\${LD_PRELOAD-unset}" "\${NODE_OPTIONS-unset}" "\${BASH_ENV-unset}"; exit 0; }
 echo "$GH_HOST"
 `,
 );
@@ -242,5 +246,77 @@ describe("login", () => {
     });
 
     expect(await gh.login()).toBe(answer);
+  });
+});
+
+describe("what the environment can run before gh does", () => {
+  test("the startup-code selectors do not reach gh", async () => {
+    // Not a precaution carried over from Claude's edge: measured, a relative
+    // `LD_PRELOAD` ran a constructor inside `gh --version` on Debian and inside
+    // an ordinary macOS `gh` too — the `DYLD_*` stripping that protects a
+    // signed binary does not extend to one installed the usual way. This edge
+    // is given no cwd of its own, so it stands wherever the runner does, which
+    // can be a checkout of the branch.
+    // `DYLD_*` is deliberately not among them. Darwin strips that whole
+    // namespace before a SIP-protected binary starts and `#!/bin/sh` is one, so
+    // a row here would read `[unset]` with the rule removed — a test that cannot
+    // fail. Namespace membership is asserted directly in `environment.test.ts`.
+    const answer = await createGh(bin, {
+      env: {
+        ...process.env,
+        LD_PRELOAD: "./libengwire.so",
+        NODE_OPTIONS: "--require ./engwire.cjs",
+        BASH_ENV: "./engwire-bash-env",
+      },
+    }).text(["startup"]);
+
+    expect(answer).toBe(
+      "LD_PRELOAD=[unset] NODE_OPTIONS=[unset] BASH_ENV=[unset]",
+    );
+  });
+});
+
+describe("ghConfigProblem", () => {
+  // Every route to gh's configuration, each with a value that resolves from
+  // whatever directory a command was run in — which for a review is the pull
+  // request. The branch would then supply `hosts.yml`, deciding which account
+  // posts, beside a `config.yml` whose aliases can be `!` shell commands.
+  //
+  // Refused rather than resolved absolutely. Naming the same directory
+  // absolutely would stop it moving between the runner and the review and pin
+  // the branch's copy just as faithfully — absolute is not trusted, and this is
+  // the one relative-path hazard in the project where the origin, not the
+  // movement, is the fault.
+  //
+  // The `HOME` rows are the ones that hide: empty and unset both look like no
+  // setting at all, and both mean "here" — gh does not ask the operating system
+  // for the account's home the way `paths()` does (measured, experiments.md),
+  // so `locationProblem` passes exactly these two.
+  test.each([
+    ["GH_CONFIG_DIR names it", { GH_CONFIG_DIR: "gh-config" }, "GH_CONFIG_DIR"],
+    ["XDG_CONFIG_HOME reaches it", { XDG_CONFIG_HOME: "cfg" }, "XDG_CONFIG_HOME"],
+    ["HOME reaches it", { HOME: "home" }, "HOME"],
+    ["HOME is empty", { HOME: "" }, "HOME"],
+    ["HOME is not set at all", {}, "HOME"],
+    // The fall-through rows: an empty value at a higher precedence is not a
+    // root of its own, so the variable blamed has to be the one that decided.
+    ["GH_CONFIG_DIR is empty over a relative XDG_CONFIG_HOME", { GH_CONFIG_DIR: "", XDG_CONFIG_HOME: "cfg" }, "XDG_CONFIG_HOME"],
+    ["XDG_CONFIG_HOME is empty over a relative HOME", { XDG_CONFIG_HOME: "", HOME: "home" }, "HOME"],
+  ])("refuses a configuration root when %s", (_case, env, blamed) => {
+    const problem = ghConfigProblem(env);
+
+    expect(problem).toContain(blamed);
+    expect(problem).toContain("absolute path");
+  });
+
+  test.each([
+    ["GH_CONFIG_DIR", { GH_CONFIG_DIR: "/opt/gh", XDG_CONFIG_HOME: "cfg", HOME: "home" }],
+    ["XDG_CONFIG_HOME", { XDG_CONFIG_HOME: "/etc/xdg", HOME: "home" }],
+    ["HOME", { HOME: "/Users/dev" }],
+  ])("accepts a root %s names absolutely, whatever it shadows", (_case, env) => {
+    // The shadowed values are relative on purpose: gh reads one root, so a
+    // refusal that fired on a variable gh never consults would refuse a
+    // perfectly good machine.
+    expect(ghConfigProblem(env)).toBeNull();
   });
 });

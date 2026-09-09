@@ -12,9 +12,9 @@
 
 import { existsSync } from "node:fs";
 import { mkdir, rename, rm } from "node:fs/promises";
-import { dirname, isAbsolute } from "node:path";
+import { dirname } from "node:path";
 import { absolutePath } from "../config/paths.ts";
-import { withoutGitVariables } from "./environment.ts";
+import { gitEnvironment } from "./environment.ts";
 import { readText } from "../read-text.ts";
 
 /**
@@ -107,30 +107,6 @@ function subcommandOf(args: readonly string[]): string {
     if (!arg.startsWith("-")) return arg;
   }
   return "";
-}
-
-/**
- * Remove ambient Git overrides, then restore the reviewer's config-file policy.
- * `inertOverrides` enumerates and neutralises that same effective configuration.
- *
- * Relative file selectors could read a branch's committed `.gitconfig` from
- * the worktree. Replace them, and empty selectors, with `/dev/null`: dropping
- * them would fall back to config the caller had not selected. Keep
- * `GIT_CONFIG_NOSYSTEM` verbatim so a disabled system file stays disabled.
- * These behaviours are measured in docs/experiments.md.
- *
- * `GIT_CONFIG_COUNT` and its KEY/VALUE pairs stay removed: they inject config
- * values rather than select files.
- */
-function gitEnvironment(): Record<string, string | undefined> {
-  const env = withoutGitVariables(process.env);
-  for (const name of ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"] as const) {
-    const value = process.env[name];
-    if (value !== undefined) env[name] = isAbsolute(value) ? value : "/dev/null";
-  }
-  const noSystem = process.env.GIT_CONFIG_NOSYSTEM;
-  if (noSystem !== undefined) env.GIT_CONFIG_NOSYSTEM = noSystem;
-  return env;
 }
 
 /**

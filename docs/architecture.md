@@ -50,15 +50,18 @@ Engwire watches GitHub for review requests addressed to you, checks out a pinned
 | --- | --- |
 | `cli/` | Command dispatch, and one file per command that needs more than a call |
 | `config/` | `config.toml` and where files live |
-| `github/` | The only place `gh` is invoked; turns GitHub into `ReviewRequest[]` |
+| `github/` | The runtime `gh` boundary; turns GitHub into `ReviewRequest[]` |
 | `review/reconcile.ts` | Every scheduling decision. Pure |
 | `review/loop.ts` | Poll, record, execute, reap. The imperative shell |
 | `review/execute.ts` | One review, start to finish |
-| `git/` | The only place `git` is invoked; bare clones and worktrees |
-| `claude/` | The only place `claude` is invoked |
+| `git/` | The runtime `git` boundary; bare clones and worktrees |
+| `claude/` | The review agent boundary |
 | `store/` | SQLite state, including schema-version enforcement |
 | `service/` | The launchd agent, and the single-runner lock |
-| `plugin.ts` | The extension API the `engwire` package reserves. Not part of the runner |
+| `read-text.ts` | Cancellable reading of a subprocess stream; the caller owns the process |
+| `environment.ts` | What no spawned program may inherit: the loader and interpreter selectors, and whether zsh's startup root is one Engwire will run with |
+| `git/environment.ts` | What a spawned git inherits: the `GIT_*` rule, and the configuration selectors put back |
+| `plugin.ts` | A reserved plugin authoring entry point. No plugin runtime, and not part of the runner |
 
 The private package reserves `import { definePlugin } from "engwire"` through `plugin.ts`. It supplies contextual typing and returns the supplied object unchanged; there is no plugin runtime or runtime validation. The helper is the only export, and its metadata type stays internal until authors need to name it. Keep this entry point independent of the runner and runtime-specific APIs so future authors can use it outside Bun.
 
@@ -68,7 +71,15 @@ The runner loads no workflows or plugins. `.engwire/workflows/review-request.jso
 
 `main.test.ts` checks that the runner's runtime import graph reaches every non-test source file except the plugin entry point and workflow schema. `plugin.test.ts` checks package resolution and the entry point's empty import graph. These checks do not establish portability of runtime globals or type-only dependencies.
 
+`doctor` also invokes `gh`, `claude` and `git` to check versions, authentication and startup. Its probes use a short deadline and the binaries resolved for the environment being diagnosed, which may be the one launchd will supply. Changes to an invocation must account for both the review and diagnostic paths; shared environment rules live in `environment.ts` and `git/environment.ts`. Git itself invokes `gh` as a credential helper during cloning.
+
 Process spawning stays at the edges. There is no shared `exec` helper: `gh`, `git` and `claude` want different things from a subprocess, and a common wrapper would grow until it had reimplemented a process library. For the same reason there is no platform-neutral service interface above `launchd.ts` — one implementation does not need an abstraction over it, and `cli/service.ts` makes the macOS check itself.
+
+`read-text.ts` gives `gh`, `git` and `doctor` cancellable stream reads: killing a process need not close output held by a descendant ([experiments.md](experiments.md)). It owns no process lifecycle or invocation policy. Claude redirects output to a file descriptor and needs no stream reader.
+
+`environment.ts` removes loader and interpreter selectors that can execute code from the working directory. The filter applies to `git`, `gh` and Claude; it cannot protect Engwire itself before startup, a residual described in [SECURITY.md](../SECURITY.md). `zshStartupProblem` refuses a relative startup root instead of dropping its selector, because dropping `ZDOTDIR` falls back to `HOME`.
+
+`git/environment.ts` drops the ambient `GIT_*` namespace. Engwire’s own Git commands restore configuration-file selectors because `inertOverrides` reads that configuration and neutralises executable settings. The agent restores none: its `git diff` could otherwise run a configured diff driver selected by contributor content.
 
 ## Decisions
 
@@ -115,6 +126,8 @@ After Claude exits and its process group has been sent the final kill, Engwire a
 **One review at a time, not configurable.** Two concurrent reviews of the same repository would race over one bare clone — creating it, fetching into it, adding worktrees to it. This is a background process on a laptop; throughput was never the point, and per-repository serialisation is what a higher number would need first.
 
 **Engwire's launchd integration supervises at most one installation per macOS user.** `ENGWIRE_HOME` relocates configuration and state, but Engwire uses one fixed label in the user's launchd domain — so that user-level job belongs to exactly one installation, and the plist's own environment is the only record of which. An installation *is* its data directory, not the config root that names it. A job Engwire cannot claim is somebody else's rather than nobody's: it may be a runner in the middle of a review, so `service install` says when it replaced one, `doctor` reports one without failing, and `uninstall` leaves one alone and names `engwire service uninstall`. [The service-ownership spec](specs/service-ownership.md) defines the full contract.
+
+**An installation has to have one address, so a relative one is refused.** Relative config or data paths would give each working directory its own queue, lock and watermark, allowing duplicate reviews. `locationProblem` checks the computed paths. The dispatcher guards `setup`, `run` and `status` after validating arguments; `doctor` reports an invalid location as its whole diagnosis, including the Engwire version; `uninstall` prints its inventory before refusing removal. `service install` checks the environment it will write into the plist, and `service uninstall` needs no installation address because its label and plist are fixed per user. Tests derive commands from the help text and require each to reject relative locations or be explicitly exempt. `locatesData` separately checks whether a plist names the data directory needed to establish service ownership.
 
 **One installation, one GitHub identity.** The queue is a list of decisions made on one person's behalf, and no run row names them — so an installation records the account of its first runner and refuses to start under another. `doctor` reports the same mismatch, and `service install` therefore refuses too: approving a service the runner is certain to reject would be the opposite of a preflight. Otherwise `gh auth switch` plus a restart would execute work accepted as Alice and post it as Bob. A second account is a second `ENGWIRE_HOME`.
 

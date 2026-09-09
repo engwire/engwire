@@ -3,9 +3,15 @@
 # writes, so a case can describe the GitHub it needs rather than share fixtures.
 set -e
 case "$*" in
+  # The floor `doctor` holds gh to. A stand-in that cannot say which gh it is
+  # would be reported as one Engwire cannot read paginated responses from.
+  --version) echo "gh version 2.31.0 (2023-06-06)" ;;
   "api user --jq .login")
     # A GitHub outage looks like a non-zero `gh`, not a missing account.
     [ -n "$FAKE_GH_FAIL_LOGIN" ] && { echo "could not resolve host" >&2; exit 1; }
+    # A `gh` that has not answered yet, so a test can signal the runner while
+    # one is genuinely in flight rather than racing to guess when it is.
+    [ -n "$FAKE_GH_HANG_LOGIN" ] && { : > "$FAKE_GH_HANG_LOGIN"; sleep 120; }
     echo "${FAKE_GH_LOGIN:-me}" ;;
   search*)                cat "$FAKE_GH_DIR/search.json" ;;
   "pr view"*)             cat "$FAKE_GH_DIR/pr.json" ;;

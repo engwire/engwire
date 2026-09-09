@@ -113,6 +113,49 @@ describe("which git runs", () => {
   });
 });
 
+describe("what the environment can run before git does", () => {
+  test("the startup-code selectors do not reach git", async () => {
+    // Upstream of every configuration control in this file: measured on Debian
+    // and macOS, a relative `LD_PRELOAD` ran a constructor inside
+    // `git --version` itself, before git read a byte of config. `git()` runs
+    // with its cwd inside a clone of the branch, so the library that answers is
+    // one a contributor shipped. Asserted through a stand-in `git` that reports
+    // what it was handed, since the real one has nothing to say about it.
+    // `DYLD_*` is deliberately not among them. Darwin strips that whole
+    // namespace before a SIP-protected binary starts and `#!/bin/sh` is one, so
+    // a row here would read `[unset]` with the rule removed — a test that cannot
+    // fail. Namespace membership is asserted directly in `environment.test.ts`.
+    const checkout = join(dir, "startup-checkout");
+    const tools = join(dir, "startup-tools");
+    const seen = join(dir, "startup-env");
+    mkdirSync(checkout, { recursive: true });
+    mkdirSync(tools, { recursive: true });
+    writeFileSync(
+      join(tools, "git"),
+      `#!/bin/sh\nprintf '%s\\n' "LD_PRELOAD=[\${LD_PRELOAD-unset}]" "NODE_OPTIONS=[\${NODE_OPTIONS-unset}]" "BASH_ENV=[\${BASH_ENV-unset}]" > "${seen}"\necho "git version 0.0.0-stub"\n`,
+      { mode: 0o755 },
+    );
+    process.env.PATH = tools;
+    process.env.LD_PRELOAD = "./libengwire.so";
+    process.env.NODE_OPTIONS = "--require ./engwire.cjs";
+    process.env.BASH_ENV = "./engwire-bash-env";
+    try {
+      const said = await git(["--version"], checkout, NO_DEADLINE);
+
+      // The stand-in ran, or an absent recording would pass this on its own.
+      expect(said).toContain("0.0.0-stub");
+      const recorded = readFileSync(seen, "utf8");
+      expect(recorded).toContain("LD_PRELOAD=[unset]");
+      expect(recorded).toContain("NODE_OPTIONS=[unset]");
+      expect(recorded).toContain("BASH_ENV=[unset]");
+    } finally {
+      for (const name of ["LD_PRELOAD", "NODE_OPTIONS", "BASH_ENV"]) {
+        delete process.env[name];
+      }
+    }
+  });
+});
+
 describe("the configuration a git is allowed to find", () => {
   test("a relative config selector cannot be answered by the checkout", async () => {
     // `GIT_CONFIG_GLOBAL` is resolved against the process's working directory

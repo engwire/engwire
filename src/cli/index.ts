@@ -6,8 +6,9 @@
  */
 
 import { ConfigError } from "../config/config.ts";
-import { paths } from "../config/paths.ts";
-import { GhError } from "../github/gh.ts";
+import { zshStartupProblem } from "../environment.ts";
+import { locationProblem, paths } from "../config/paths.ts";
+import { ghConfigProblem, GhError } from "../github/gh.ts";
 import { DatabaseTooNewError } from "../store/store.ts";
 
 import { VERSION } from "../version.ts";
@@ -84,24 +85,85 @@ export async function main(argv: string[]): Promise<number> {
   }
 }
 
+/** Print a refusal and answer 1, or answer null when there is nothing to refuse. */
+function refuse(problem: string | null): number | null {
+  if (problem === null) return null;
+  console.error(problem);
+  return 1;
+}
+
+/**
+ * The refusal every command that opens a database or writes a config makes.
+ *
+ * A relative installation address is a second installation per working
+ * directory, so the commands that act on one cannot start. `doctor` and
+ * `uninstall` need it in hand instead: one reports it as the failed check it
+ * is, the other prints the inventory and then refuses the removal, because
+ * deleting an address that moves would delete whatever happens to sit there
+ * now. `help` and `version` do not depend on an installation existing.
+ */
+function refuseRelativeLocation(): number | null {
+  return refuse(locationProblem());
+}
+
+/**
+ * The two further refusals a *review* needs, which is why they are not on the
+ * gate above.
+ *
+ * They have different scopes and lumping them together got that wrong: gh's
+ * configuration root decides which account posts and what its aliases run, and
+ * zsh's startup directory decides what the review's first shell executes.
+ * Neither is a question `status` has to answer — it reads a database and a lock
+ * and starts nothing — and neither should stop `setup`, whose whole job is to
+ * report what is wrong rather than to fail at the door. `diagnose` reports
+ * both: an unsafe gh root blocks gh probes, and an unsafe zsh startup root
+ * blocks every tool probe.
+ *
+ * Both are refusals rather than repairs. Resolving a relative one to an
+ * absolute path stops it moving and pins whatever it was already pointing at —
+ * which, when a command is run from a checkout, is content the branch supplied.
+ */
+function refuseUnsafeReviewRoots(): number | null {
+  return refuse(ghConfigProblem() ?? zshStartupProblem());
+}
+
 async function dispatch(argv: string[]): Promise<number> {
   const [command, ...rest] = argv;
 
+  // Each guard sits inside the case that needs it, after the arguments have
+  // been checked: a gate in front of the whole switch answered `engwire status
+  // nonsense` with an environment complaint instead of the syntax error, and
+  // gave `service install` an irrelevant one on the platform where the answer
+  // is "this is macOS-only". What keeps a new command from quietly skipping the
+  // guard is not the shape of this function — it is `index.test.ts`, which
+  // derives the commands from the help text and holds each to refusing or to
+  // being deliberately exempt.
   switch (command) {
     case "setup":
-      return noArgs(rest) ? setup() : usageError("engwire setup");
+      if (!noArgs(rest)) return usageError("engwire setup");
+      return refuseRelativeLocation() ?? setup();
     case "run": {
       const once = rest.length === 1 && rest[0] === "--once";
       if (!once && !noArgs(rest)) return usageError("engwire run [--once]");
-      return run({ once });
+      // The only command that both acts on the installation and starts a review,
+      // so the only one that answers all three questions.
+      return refuseRelativeLocation() ?? refuseUnsafeReviewRoots() ?? run({ once });
     }
     case "status":
-      return noArgs(rest) ? status() : usageError("engwire status");
+      if (!noArgs(rest)) return usageError("engwire status");
+      return refuseRelativeLocation() ?? status();
     case "doctor":
       return noArgs(rest) ? doctor() : usageError("engwire doctor");
     case "service": {
       const [action, ...flags] = rest;
       if (flags.length > 0) return usageError("engwire service <install|uninstall>");
+      // Neither action is guarded here. `serviceInstall` asks the environment
+      // *launchd* will supply, which is the one that decides what the job
+      // supervises — and it asks after the macOS-only check, so somebody on
+      // Linux gets the answer to the question they asked. `uninstall` boots out
+      // one label and deletes the plist beside it, both fixed per user and
+      // neither read from `paths()`; somebody whose shell points somewhere
+      // relative is exactly who may need to stop the job that is running.
       if (action === "install") return serviceInstall();
       if (action === "uninstall") return serviceUninstall();
       return usageError("engwire service <install|uninstall>");

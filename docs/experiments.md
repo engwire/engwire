@@ -958,6 +958,114 @@ The macOS column is the reason `DYLD_*` is dropped rather than trusted. dyld str
 
 And **Engwire's own binary loads it too, on both platforms.** No filter in this codebase can reach that: the constructor runs before `main.ts` gets control, so by the time any TypeScript could remove a variable, the code it names has already run. That is a residual rather than a bug to fix here, and `SECURITY.md` names it as one. What it bounds is the claim the rest of this makes: Engwire can decide what its *children* inherit, and cannot decide what its own process was started with.
 
+## Does systemd's `UnsetEnvironment=` actually keep a token out of the service?
+
+First, which variables are worth removing. A blocklist is only as good as its list, and reading one off a documentation page is the thing this file exists to avoid. Measured on 2026-09-09 against gh 2.98.0 and claude 2.1.265, entirely read-only — a bogus value in the environment, and a look at who the tool then thinks it is:
+
+```sh
+# Every known variable is removed first and exactly one put back, or the shell
+# running this decides the answer: a `GH_TOKEN` already exported outranks the
+# `GITHUB_TOKEN` under test, and the "control" would not be a control at all.
+CLEAN="env -u GH_TOKEN -u GITHUB_TOKEN -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u CLAUDE_CODE_OAUTH_TOKEN"
+
+$CLEAN gh api user --jq .login                             # control: the stored account
+$CLEAN claude --setting-sources user auth status | grep -q '"authMethod": "claude.ai"' ||
+  { echo "APPARATUS: the control is not a stored claude.ai account; nothing below is evidence"; exit 1; }
+
+for v in GH_TOKEN GITHUB_TOKEN; do
+  printf '%s -> ' "$v"
+  $CLEAN $v=engwire-bogus-token gh api user 2>&1 | grep -o '"message": *"[^"]*"' | head -1
+done
+$CLEAN GITHUB_TOKEN=engwire-bogus-token gh auth status     # names GITHUB_TOKEN as the token it tried
+
+for v in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN; do
+  printf '== %s ==\n' "$v"; $CLEAN $v=engwire-bogus-token claude --setting-sources user auth status
+done
+```
+
+The `grep -q` is the apparatus check. Every row below is "the tool stopped being the stored account", so a control that was never the stored account turns the whole table into a description of somebody's shell.
+
+| variable | what the tool then reports |
+| --- | --- |
+| none — the control | `gh`: the keyring account. `claude`: `authMethod: "claude.ai"`, with an email, org and subscription |
+| `GH_TOKEN` | `Bad credentials` |
+| `GITHUB_TOKEN` | `Bad credentials`, and `gh auth status` says "Failed to log in to github.com using token (GITHUB_TOKEN)" beside the working keyring entry |
+| `ANTHROPIC_API_KEY` | `apiKeySource: "ANTHROPIC_API_KEY"`, and `email`, `orgId`, `orgName` and `subscriptionType` all `null` |
+| `ANTHROPIC_AUTH_TOKEN` | `authMethod` becomes `"oauth_token"` |
+| `CLAUDE_CODE_OAUTH_TOKEN` | `authMethod` becomes `"oauth_token"` |
+
+So all five replace the stored identity, and `GITHUB_TOKEN` is the one that would have been missed: removing `GH_TOKEN` alone uncovers whatever is underneath it. What this does *not* establish is that the list is complete — Claude also supports cloud-provider authentication selected through the environment, which is the standing argument that a blocklist is the weaker shape.
+
+`docs/linux.md` recommends a systemd user unit, and a user unit inherits the user manager's environment wholesale — including any of those five present in or imported into that manager's environment. Both tools prefer a token to anything stored, so that token silently becomes the account every review posts as. launchd never had this problem: `service install` writes an allowlist. The two are not the same policy — a list of what to carry, against inherit-everything-then-remove-the-names-you-know — and what is measured here is the credential exclusion, not equivalence. The directive that does the same job here was recommended commented-out and unmeasured, which is a recommendation to run the unsafe version. Measured on 2026-09-09, systemd 252 (252.39-1~deb12u2) on Debian 12:
+
+```sh
+# From nothing: the directory is the volume the container mounts, and a leftover
+# container from an interrupted run would answer instead of a fresh one.
+rm -rf /tmp/rp && mkdir -p /tmp/rp
+docker rm -f engwire-systemd >/dev/null 2>&1 || true
+
+cat > /tmp/rp/report.sh <<'SH'
+#!/bin/sh
+for v in GH_TOKEN GITHUB_TOKEN ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN ENGWIRE_KEEP; do
+  eval "printf '%s=[%s] ' \"$v\" \"\${$v-unset}\""
+done > "$1"
+SH
+chmod +x /tmp/rp/report.sh
+printf '[Service]\nType=oneshot\nEnvironment=ENGWIRE_KEEP=kept\nUnsetEnvironment=GH_TOKEN GITHUB_TOKEN ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN\nExecStart=/probe/report.sh /probe/with-unset\n' > /tmp/rp/probe.service
+printf '[Service]\nType=oneshot\nEnvironment=ENGWIRE_KEEP=kept\nExecStart=/probe/report.sh /probe/without-unset\n' > /tmp/rp/control.service
+
+docker run -d --name engwire-systemd --privileged --cgroupns=host -v /tmp/rp:/probe debian:bookworm \
+  /bin/bash -c "export DEBIAN_FRONTEND=noninteractive; apt-get update -qq; apt-get install -y -qq systemd systemd-sysv; exec /lib/systemd/systemd"
+until docker exec engwire-systemd systemctl is-system-running >/dev/null 2>&1; do sleep 2; done
+docker exec engwire-systemd bash -c 'cp /probe/*.service /etc/systemd/system/ && systemctl daemon-reload &&
+  systemctl set-environment GH_TOKEN=leaked GITHUB_TOKEN=leaked ANTHROPIC_API_KEY=leaked ANTHROPIC_AUTH_TOKEN=leaked CLAUDE_CODE_OAUTH_TOKEN=leaked &&
+  systemctl start control.service probe.service'
+cat /tmp/rp/without-unset /tmp/rp/with-unset
+# The container stays up: the `KillMode` experiment below runs in it.
+```
+
+| the unit | the five credentials | `ENGWIRE_KEEP` |
+| --- | --- | --- |
+| no `UnsetEnvironment=` — the control | all five arrive as `leaked` | `kept` |
+| `UnsetEnvironment=` naming all five | all five arrive **unset** | `kept` |
+
+Unset rather than empty, which matters: `gh` treats an empty `GH_TOKEN` as no token, but the two are not the same for everything, and "removed" is what the launchd allowlist achieves. `Environment=` still applies, so the directive removes rather than replacing the block. The unit in `docs/linux.md` therefore ships this line active.
+
+`ENGWIRE_KEEP` is not decoration. The first attempt at this reported every credential empty in *both* units and looked like a pass; the control variable was empty too, which is how the shell expanding them before systemd ever saw them was caught. A row where the control also reads "safe" is an apparatus, not a result.
+
+**`KillMode=mixed`** is the other directive the unit leans on, and the one `TimeoutStopSec` is sized around, so it is measured in the same container. A leader that traps SIGTERM and a child that does the same, started under each policy and then stopped:
+
+```sh
+cat > /tmp/rp/leader.sh <<'SH'
+#!/bin/sh
+trap 'echo "leader got TERM" >> /probe/$1; exit 0' TERM
+/probe/child.sh "$1" &
+while :; do sleep 0.2; done
+SH
+cat > /tmp/rp/child.sh <<'SH'
+#!/bin/sh
+trap 'echo "child got TERM" >> /probe/$1' TERM
+while :; do sleep 0.2; done
+SH
+chmod +x /tmp/rp/leader.sh /tmp/rp/child.sh
+printf '[Service]\nType=simple\nKillMode=mixed\nTimeoutStopSec=5\nExecStart=/probe/leader.sh mixed\n' > /tmp/rp/mixed.service
+printf '[Service]\nType=simple\nTimeoutStopSec=5\nExecStart=/probe/leader.sh default\n' > /tmp/rp/default.service
+rm -f /tmp/rp/mixed /tmp/rp/default
+docker exec engwire-systemd bash -c 'cp /probe/mixed.service /probe/default.service /etc/systemd/system/ && systemctl daemon-reload
+  for u in default mixed; do systemctl start $u.service; sleep 1; systemctl stop $u.service; done'
+echo "default:"; cat /tmp/rp/default; echo "mixed:"; cat /tmp/rp/mixed
+docker rm -f engwire-systemd
+```
+
+| `KillMode` | who received SIGTERM on `systemctl stop` |
+| --- | --- |
+| default (`control-group`) | the leader **and** the child |
+| `mixed` | the leader only |
+
+Which is what the unit needs: Engwire's runner forwards the signal to the review itself and writes down how the run ended, and the default has systemd signalling the review directly, in parallel with the sequence the runner is in the middle of. `TimeoutStopSec` then bounds how long that sequence gets before systemd stops being polite.
+
+What this does not establish: another systemd version, or a system unit rather than a user one. The container runs the manager as PID 1 rather than as a user manager, so what is measured is the directive's effect on a service's environment, not the user-manager inheritance path that makes it necessary — that half is systemd's documented behaviour and the reason the line is there.
+
 ## Is a signal delivered before its handler is registered?
 
 `runClaude` puts the review in its own process group and is then the only process that can stop it. Whether the signal handlers may be registered *after* the spawn turns on what happens to a signal arriving in between. Measured on 2026-09-08, Bun 1.4.0, Darwin 24.6.0:
