@@ -6,7 +6,6 @@
  * environment other than its own.
  */
 
-import { loadConfig } from "../config/config.ts";
 import { LOCATORS, locatesData, paths } from "../config/paths.ts";
 import { isAbsolute } from "node:path";
 import * as launchd from "../service/launchd.ts";
@@ -123,13 +122,11 @@ export async function serviceInstall(): Promise<number> {
   }
 
   const p = paths(environment);
-  const config = await loadConfig(p.configFile);
   const previous = launchd.installedPlist(p.dataDir);
   await launchd.install({
     executable: process.execPath,
     logsDir: p.logsDir,
     environment,
-    runTimeoutMs: config.advanced.runTimeoutMs,
   });
   // The plist pins this exact binary, which may go stale after an upgrade.
   console.log(`Installed ${launchd.plistPath()} — runs ${process.execPath}`);

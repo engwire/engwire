@@ -1151,3 +1151,81 @@ The third row is the production shape — a timeout or a shutdown signals the gr
 Worth knowing before re-running this: the first two shapes were measured first and reported `EPERM` not once in 400 attempts. A group that was never signalled is not this measurement, and neither is one killed before its leader is reaped.
 
 What this does not establish: Linux, or the mechanism. `run.test.ts` covers the property Engwire needs — the review's tools are gone afterwards — so a platform that stops behaving this way arrives as a failing test rather than as a run that fails on its own cleanup.
+
+## Does `ExitTimeOut` budget a shutdown or a lifetime?
+
+The plist used to size `ExitTimeOut` as `run_timeout` plus a grace, on the assumption that launchd's patience had to cover the review as well as the stopping of it. If the countdown instead starts at SIGTERM, a review's twenty minutes has no business in the number, and a wedged runner survives twenty minutes longer than anything needs. Measured on 2026-09-10, Darwin 24.6.0, as a real user agent. Fed to a child shell rather than pasted into yours, because it wants to be able to exit:
+
+```sh
+sh <<'PROBE'
+d=$(mktemp -d); label=com.engwire.exittimeout.probe
+plist="$HOME/Library/LaunchAgents/$label.plist"
+# Exit on a signal, then clean up through EXIT so an interrupted trial cannot
+# resume against deleted state. bootout may return before the victim dies;
+# launchd's ExitTimeOut still governs its termination.
+cleanup() { launchctl bootout "gui/$(id -u)/$label" 2>/dev/null; rm -rf "$plist" "$d"; }
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+cat > "$d/victim.sh" <<'EOF'
+# Records when SIGTERM arrives and then refuses to exit, so what ends this
+# process is launchd's SIGKILL and nothing else. Short sleeps, because a shell
+# runs a trap between commands and not during one.
+out="$1"; : > "$out"; printf 'pid %s\n' "$$" >> "$out"
+trap 'printf "term %s\n" "$(date +%s.%N)" >> "$out"' TERM
+while true; do sleep 0.1; done
+EOF
+trial() { # $1 = ExitTimeOut, $2 = seconds to let it run before stopping it
+  out="$d/trial-$1-$2.txt"
+  cat > "$plist" <<XML
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$label</string>
+  <key>ProgramArguments</key><array>
+    <string>/bin/sh</string><string>$d/victim.sh</string><string>$out</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>ExitTimeOut</key><integer>$1</integer>
+</dict></plist>
+XML
+  launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$plist" || { echo "APPARATUS: would not load"; return 1; }
+  sleep "$2"
+  pid=$(awk '/^pid/{print $2}' "$out")
+  kill -0 "$pid" || { echo "APPARATUS: gone before it was asked to stop"; return 1; }
+  launchctl bootout "gui/$(id -u)/$label" 2>/dev/null & booting=$!
+  # Polled rather than trusting bootout's own return, which answers about the
+  # job rather than about the process — with a deadline, because a bootout that
+  # fails without killing anything would otherwise poll an immortal victim
+  # forever instead of reporting the apparatus failure it is.
+  give_up=$(( $(date +%s) + $1 + 10 ))
+  while kill -0 "$pid" 2>/dev/null; do
+    [ "$(date +%s)" -lt "$give_up" ] || { echo "APPARATUS: outlived its own budget"; return 1; }
+    sleep 0.05
+  done
+  died=$(date +%s.%N)
+  # Check bootout before reusing the label.
+  wait "$booting" || { echo "APPARATUS: bootout failed"; return 1; }
+  term=$(awk '/^term/{print $2}' "$out")
+  [ -n "$term" ] || { echo "APPARATUS: SIGTERM never observed"; return 1; }
+  awk -v t="$term" -v x="$died" 'BEGIN{printf "%.2fs\n", x-t}'
+}
+# Stop at the first invalid trial.
+trial 10 25 && trial 20 5 && trial 5 40
+PROBE
+# Preserve the probe's exit status without exiting the interactive shell.
+code=$?; echo "exit=$code"; (exit "$code")
+```
+
+| `ExitTimeOut` | alive before the stop | TERM trap to process death |
+| --- | --- | --- |
+| 10s | 25s | 10.01s |
+| 20s | 5s | 19.92s |
+| 5s | 40s | 4.94s |
+
+Each figure lands within a few hundredths either side of its key, and reruns move it: the clock starts when the victim's shell gets round to its trap, up to one `sleep 0.1` after delivery, and stops on a 50ms poll after the process is already gone. Both are noise beside the thing being asked about.
+
+Across these trials the interval follows `ExitTimeOut` rather than the job's prior lifetime: one already up for 40 seconds still got the whole of its five-second budget once asked to stop, and one up for 5 seconds got its twenty. This supports sizing `ExitTimeOut` for shutdown rather than review duration; [architecture.md](architecture.md#invariants) describes the current allowance and its limits. The three trials vary the key as well as the lifetime, since a number that had come from somewhere else would have been the same in all three.
+
+What this does not establish: what happens at system shutdown or logout rather than `bootout`, where launchd has budgets of its own; or what a zero means, which is documented as an infinite wait and not measured here.

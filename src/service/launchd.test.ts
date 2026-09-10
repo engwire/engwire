@@ -2,7 +2,11 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { paths } from "../config/paths.ts";
+import { KILL_GRACE_MS } from "../claude/run.ts";
+import { claudeRootProblem } from "../claude/skills.ts";
+import { GIT_KILL_GRACE_MS } from "../git/repository.ts";
+import { PRUNE_ABORT_MS } from "../git/worktree.ts";
+import { LOCATORS, paths } from "../config/paths.ts";
 import { bootoutSaysAbsent, installedPlist, plist, printSays, serviceEnvironment } from "./launchd.ts";
 
 describe("plist", () => {
@@ -11,7 +15,6 @@ describe("plist", () => {
       executable: "/Users/a&b/.local/bin/engwire",
       logsDir: "/Users/a&b/logs",
       environment: { PATH: "/usr/bin:/Users/a&b/bin" },
-      runTimeoutMs: 20 * 60_000,
     });
 
     expect(xml).toContain("<string>/Users/a&amp;b/.local/bin/engwire</string>");
@@ -20,17 +23,43 @@ describe("plist", () => {
     expect(xml).not.toMatch(/a&b/);
   });
 
-  test("launchd is told to wait longer than a review takes", () => {
-    // The default is system-defined, so leaving it out means launchd may SIGKILL
-    // a review partway through posting it — the one thing the run states exist
-    // to prevent.
+  test("launchd leaves headroom over either timed shutdown wait", () => {
+    // The default is system-defined, so leaving the key out means launchd may
+    // SIGKILL the runner before it has stopped the review it was supervising.
+    // Read back out of the generated plist, so this measures what ships rather
+    // than a copy of it.
+    const budget = Number(
+      /<key>ExitTimeOut<\/key><integer>(\d+)<\/integer>/.exec(
+        plist({ executable: "/bin/engwire", logsDir: "/logs", environment: { PATH: "/usr/bin" } }),
+      )?.[1],
+    );
+    expect(budget).toBe(90);
+
+    // These timed paths are alternatives after a stop: an aborted preparation
+    // cannot start an agent, and both loops skip further reaping. Prune's
+    // deadline starts git termination, so include its grace too. Recursive
+    // directory removal is untimed and cannot be covered by this assertion.
+    const waits = [
+      ["a review's process group termination grace", KILL_GRACE_MS],
+      ["a worktree prune and the git termination after it", PRUNE_ABORT_MS + GIT_KILL_GRACE_MS],
+    ] as const;
+    // Keep operational headroom as the component deadlines change. Fifteen
+    // seconds is a chosen reserve, not a measured cleanup duration.
+    const MIN_RESERVE_MS = 15_000;
+    for (const [what, wait] of waits) {
+      expect(
+        budget * 1000 - wait,
+        `${budget}s of shutdown budget leaves too little over ${what} (${wait}ms)`,
+      ).toBeGreaterThanOrEqual(MIN_RESERVE_MS);
+    }
+  });
+
+  test("the log launchd creates is private", () => {
     const xml = plist({
       executable: "/bin/engwire",
       logsDir: "/logs",
       environment: { PATH: "/usr/bin" },
-      runTimeoutMs: 20 * 60_000,
     });
-    expect(xml).toContain("<key>ExitTimeOut</key><integer>1230</integer>");
     // 63 decimal is 0077. Measured against launchd rather than pinned to the
     // generator's own output: both this and the octal-string form produce
     // 0600 files, and the integer is the spelling every version documents.
@@ -43,7 +72,6 @@ describe("plist", () => {
       executable: "/bin/engwire",
       logsDir: "/logs",
       environment,
-      runTimeoutMs: 60_000,
     });
     // Exactly, which is what the name claims and what two `toContain`s cannot
     // show: a `plist` that serialized anything of its own — or that a later
@@ -90,6 +118,72 @@ describe("serviceEnvironment", () => {
     expect(env.GH_TOKEN).toBeUndefined();
     expect(env.ANTHROPIC_API_KEY).toBeUndefined();
   });
+
+  test("carries classified selectors read by the installation and Claude path resolvers", () => {
+    // A dropped selector can make the service use a different installation or
+    // skill root from the one diagnosed. Classify newly observed reads rather
+    // than copying them automatically: a credential must stay out of the plist.
+    const EXPECTED: Record<string, "location" | "not carried"> = {
+      CLAUDE_CONFIG_DIR: "location",
+      ENGWIRE_HOME: "location",
+      HOME: "location",
+      XDG_CONFIG_HOME: "location",
+      XDG_DATA_HOME: "location",
+    };
+
+    // Observe property reads without depending on source syntax. Probe the
+    // fallbacks and each known selector separately; this does not cover reads
+    // reachable only through other values or combinations of selectors.
+    const asked = (env: Record<string, string | undefined>): string[] => {
+      const seen: string[] = [];
+      const watched = new Proxy(env, {
+        get(target, key) {
+          if (typeof key === "string") seen.push(key);
+          return target[key as keyof typeof target];
+        },
+        // Asking whether a name is set is consulting it too, and `in` does not
+        // go through `get`. Reflection beyond these two is not chased: this is
+        // a drift alarm, not an interpreter.
+        has(target, key) {
+          if (typeof key === "string") seen.push(key);
+          return key in target;
+        },
+      });
+      paths(watched);
+      claudeRootProblem(watched);
+      return seen;
+    };
+    const reads = new Set(
+      [{}, ...Object.keys(EXPECTED).map((name) => ({ [name]: "/probe" }))].flatMap(asked),
+    );
+
+    // Keep the observer honest: every installation locator must be exercised.
+    for (const locator of LOCATORS) {
+      expect(reads, `${locator} is no longer asked for — has paths.ts changed shape?`).toContain(
+        locator,
+      );
+    }
+
+    expect(
+      [...reads].sort(),
+      "the environment paths.ts and skills.ts ask for has changed — classify it here, and carry it only if it says where to look",
+    ).toEqual(Object.keys(EXPECTED).sort());
+
+    // Each set to something recognisable, so a name the plist drops shows up as
+    // `undefined` rather than as a default that happens to look right.
+    const supplied = Object.fromEntries([...reads].map((name) => [name, `/probe/${name}`]));
+    const carried = serviceEnvironment(supplied);
+
+    for (const [name, verdict] of Object.entries(EXPECTED)) {
+      // Enforce exclusions too when a read is classified as not carried.
+      expect(
+        carried[name],
+        verdict === "location"
+          ? `${name} decides where Engwire looks, but the plist would not carry it`
+          : `${name} is not the service's to keep, but the plist would carry it`,
+      ).toBe(verdict === "location" ? `/probe/${name}` : undefined);
+    }
+  });
 });
 
 describe("installedPlist", () => {
@@ -111,7 +205,6 @@ describe("installedPlist", () => {
         executable: "/bin/engwire",
         logsDir: join(dir, "logs"),
         environment,
-        runTimeoutMs: 20 * 60_000,
       }),
     );
     return file;

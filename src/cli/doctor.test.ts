@@ -980,7 +980,6 @@ describe("serviceChecks", () => {
         executable,
         logsDir: join(dir, "logs"),
         environment: { PATH: "/usr/bin", ENGWIRE_HOME: home },
-        runTimeoutMs: 20 * 60_000,
       }),
     );
     return file;
