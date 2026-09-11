@@ -7,8 +7,8 @@
  */
 
 import { lstatSync, readlinkSync, rmSync, type Stats } from "node:fs";
-import { basename, dirname, isAbsolute, join, sep } from "node:path";
-import { paths, resolveDeepest } from "../config/paths.ts";
+import { basename, dirname, join, sep } from "node:path";
+import { locationProblem, paths, resolveDeepest } from "../config/paths.ts";
 import type { InstalledPlist, JobState } from "../service/launchd.ts";
 import { acquireLock, LockedError } from "../service/lock.ts";
 
@@ -16,7 +16,7 @@ import { acquireLock, LockedError } from "../service/lock.ts";
  * Said by both invocations, because both are answering for the same thing: what
  * this installation has here. A kept service may have been listed directly
  * above it — foreign, or an orphan launchd still has — so the sentence speaks
- * for what this installation owns rather than for the machine.
+ * for what this installation can claim rather than for the machine.
  */
 const NOTHING = "Nothing here belongs to this installation: no service it can claim, no data, no config.";
 
@@ -72,27 +72,13 @@ function entry(path: string): string {
 }
 
 /**
- * Whether removing the config tree would take the lock's real location with it.
+ * Whether the runner lock entry itself is a symlink.
  *
- * `overlaps` leaves a root symlink unresolved because removal unlinks it. The
- * lock asks where `acquireLock` actually writes, so it is fully resolved. If
- * that location is inside the config tree, removing config would let another
- * runner create an independent lock at the same pathname.
- */
-function configConsumesLock(root: string, lockFile: string): boolean {
-  const lock = resolveDeepest(lockFile);
-  return lock === root || lock.startsWith(`${root}${sep}`);
-}
-
-/**
- * Whether the runner lock is reached through a symlink.
- *
- * `configConsumesLock` above asks where the lock lives, and answers from
- * `resolveDeepest` — which cannot see past a link whose target does not exist
- * yet: it climbs to the parent and re-appends the name, reporting the link's
- * own path. A link can therefore put the lock outside the model the removal
- * order is built on, and nothing here has to know what SQLite makes of one to
- * say that is not a position to delete from.
+ * Where the lock lives is answered from `resolveDeepest`, which cannot see past
+ * a link whose target does not exist yet: it climbs to the parent and re-appends
+ * the name, reporting the link's own path. A link can therefore put the lock
+ * outside the model the removal order is built on, and nothing here has to know
+ * what SQLite makes of one to say that is not a position to delete from.
  *
  * Rather than a cleverer resolver, the entry itself: Engwire only ever creates
  * `runner.lock` as a database, so a link there is somebody's arrangement this
@@ -117,6 +103,24 @@ function rootCannotHoldALock(error: unknown): boolean {
 }
 
 /**
+ * Whether `path` is reached through the entry `root` names.
+ *
+ * Compare device and inode along the lexical ancestors so differently cased
+ * paths to the same entry are caught. Use lstat to identify a root symlink
+ * itself: unlinking it cuts off paths through it without deleting its target.
+ * `entry` separately detects overlap through resolved ancestors.
+ */
+function reachedThrough(path: string, root: string): boolean {
+  const at = entryAt(root);
+  if (at === undefined) return false;
+  for (let head = path; ; head = dirname(head)) {
+    const here = entryAt(head);
+    if (here !== undefined && here.dev === at.dev && here.ino === at.ino) return true;
+    if (dirname(head) === head) return false;
+  }
+}
+
+/**
  * Remove one of the two directories this installation owns.
  *
  * A root that is a symlink is unlinked and reported, never followed: its target
@@ -126,11 +130,8 @@ function rootCannotHoldALock(error: unknown): boolean {
  * ancestors would be impossible to remove.
  */
 function removeTree(path: string): string | null {
-  // Asked again here, and by the same reading the listing used: a root beneath
-  // a regular file is as absent as one never made, and both `lstatSync` and
-  // `rmSync` answer that with `ENOTDIR` rather than a shrug. Without this the
-  // config root could throw on the way out — after the data directory had
-  // already gone, which is the worst moment for this command to stop talking.
+  // Recheck with the inventory's rules. A root beneath a regular file is
+  // absent too; attempting rm directly would raise ENOTDIR mid-removal.
   const at = entryAt(path);
   if (at === undefined) return null;
   // `lstat`, so the link itself was examined rather than its target, and a link
@@ -162,34 +163,44 @@ export async function uninstall(options: {
 }): Promise<number> {
   const p = paths();
   const configDir = dirname(p.configFile);
-  // Two questions with one answer, because the answer is the same sentence: the
-  // two roots cannot be removed one after the other and have the order mean
-  // what this command says it means.
-  const configRoot = entry(configDir);
+  // Refuse layouts that break config-first removal or consume the held lock.
+  const configEntry = entry(configDir);
+  // Three questions about the same two trees, and each answers one the others
+  // cannot. `entry` sees an overlap that only appears once aliased ancestors are
+  // followed. Entry identity sees one that no spelling shows at all — a casing
+  // the volume treats as the same directory — and is asked both ways round,
+  // since either root containing the other breaks the removal. And the lock is
+  // asked where it really lives: `acquireLock` writes through every link, so a
+  // lock inside the config tree is a pathname the config pass destroys while
+  // this still holds it, leaving the next runner free to take an independent
+  // one at the same place.
   const entangled =
-    overlaps(entry(p.dataDir), configRoot) || configConsumesLock(configRoot, p.lockFile);
-  // Relative roots move with the caller's working directory. Inventory remains
-  // useful, but a confirmed removal must not act on that unstable identity.
-  const adrift = !isAbsolute(p.dataDir) || !isAbsolute(configDir);
+    overlaps(entry(p.dataDir), configEntry) ||
+    reachedThrough(p.dataDir, configDir) ||
+    reachedThrough(configDir, p.dataDir) ||
+    reachedThrough(resolveDeepest(p.lockFile), configDir);
+  // Share the runner's location check and diagnostic so removal cannot accept
+  // an address the runner rejects or mislabel the reason it is unusable.
+  const locationIssue = locationProblem();
   const linkedLock = lockIsLinked(p.lockFile);
-  // One ordered list, read twice: the plain invocation prints the `short` line
-  // of the first that applies, and a confirmed run prints its `long` one. Two
-  // lists is how a preview and a refusal come to name different reasons for the
-  // same machine.
+  // One ordered list: the plain invocation prints the `short` line of the first
+  // that applies, and a confirmed run prints its `long` one. Two lists is how a
+  // preview and a refusal come to name different reasons for the same machine.
+  // The preview reaches it only when there is something to remove — with an
+  // empty machine it says so and stops, since a refusal to remove nothing is
+  // not news.
   const refusal = [
-    adrift && {
-      short: [
-        "Removing it is not possible while those paths are relative: their location",
-        "depends on the directory this command is run from.",
-      ],
+    locationIssue !== null && {
+      short: [locationIssue],
       long: [
-        "Those paths are relative, so their location depends on the directory this",
-        "command is run from — and removing them would delete whatever happens to sit",
-        "there now. Nothing was touched. Replace the relative base with an absolute",
-        // "The same location", because any other absolute path is a different
-        // installation: the data would still be wherever this was pointing, and
-        // the next run would report an empty machine and remove nothing.
-        "spelling of the same location, then run this again.",
+        locationIssue,
+        "",
+        "Removing anything on that footing would delete whatever happens to sit",
+        "there now, so nothing was touched. It has to name the same location this",
+        // Any other absolute path is a different installation: the data would
+        // still be wherever this was pointing, and the next run would report an
+        // empty machine and remove nothing.
+        "was already pointing at, then run this again.",
       ],
     },
     entangled && {
@@ -217,9 +228,9 @@ export async function uninstall(options: {
       short: ["Removing it is not possible while the runner lock is a symlink."],
       long: [
         `The runner lock ${p.lockFile} is a symlink, and taking it would follow`,
-        "that link — so the lock this command holds would live somewhere it has",
-        "not accounted for, and removing the config could delete it out from",
-        "under itself. Engwire never makes this a link. Nothing was touched.",
+        "that link — so the lock this command holds would live at a path Engwire",
+        "did not establish. Engwire never makes the lock a symlink. Nothing was",
+        "touched.",
         "",
         "A runner may be holding the lock at the far end right now, and replacing",
         "the link would leave the next attempt locking a different file from the",
@@ -252,25 +263,40 @@ export async function uninstall(options: {
   const dataHere = present(p.dataDir);
   const configHere = present(configDir);
   const hadRoots = dataHere || configHere;
+  // Inventory is not authority: a service may need revalidation even when its
+  // plist is absent from the listing, while kept services are listed but unclaimed.
+  const hasClaimedState = service !== null || hadRoots;
   const targets = [
     { label: "Service", path: plist !== null && present(plist) ? plist : null },
     { label: "Data", path: dataHere ? p.dataDir : null },
     { label: "Config", path: configHere ? configDir : null },
   ].filter((target) => target.path !== null);
 
-  for (const target of targets) console.log(`${target.label.padEnd(9)} ${target.path}`);
+  // Tracked as it is printed rather than rebuilt from the five conditions that
+  // can produce a line: every gap below separates the inventory from what
+  // follows, so a machine with nothing listed wants no gap.
+  let hasInventory = false;
+  const list = (line: string): void => {
+    hasInventory = true;
+    console.log(line);
+  };
+  const gap = (say: (line: string) => void): void => {
+    if (hasInventory) say("");
+  };
+
+  for (const target of targets) list(`${target.label.padEnd(9)} ${target.path}`);
   // Listed but never removed: deleting the running binary is a trick, not a
   // feature, and whoever installed it chose where it went.
   // `Bun.isStandaloneExecutable` is the only reliable way to tell an installed
   // engwire from a source checkout, where `process.execPath` is the Bun runtime
   // and must not be suggested to anybody.
-  if (Bun.isStandaloneExecutable) console.log(`Binary    ${process.execPath} (kept)`);
+  if (Bun.isStandaloneExecutable) list(`Binary    ${process.execPath} (kept)`);
   if (options.service.whose === "theirs") {
     const whose =
       options.service.supervises === null
         ? "cannot say which installation it supervises"
         : `supervises ${options.service.supervises}`;
-    console.log(`Service   ${options.service.plistPath} (kept — ${whose})`);
+    list(`Service   ${options.service.plistPath} (kept — ${whose})`);
   }
   // The `theirs` rule above, reached from the other side: a job this cannot
   // claim is named and left, never booted out. `jobState` carries where the
@@ -278,45 +304,45 @@ export async function uninstall(options: {
   // could not restore the plist it replaced, and somebody with `rm` — and needs
   // neither story to answer for it.
   if (options.job === "loaded") {
-    console.log("Service   loaded, and nothing on disk describes it (kept)");
+    list("Service   loaded, and nothing on disk describes it (kept)");
   } else if (options.job === "unknown") {
     // Not "loaded": `launchctl` refused the question, which is short of
     // evidence that a job is there. It is still reason enough to keep away
     // from the label, and that is what the line has to say without saying more.
-    console.log("Service   launchd would not say whether a job is loaded (kept)");
+    list("Service   launchd would not say whether a job is loaded (kept)");
   }
 
   if (!options.confirmed) {
-    console.log("");
-    if (targets.length === 0) {
+    gap(console.log);
+    if (!hasClaimedState) {
       console.log(NOTHING);
       return 0;
     }
-    console.log("Data holds Engwire's own clones of every repository it has reviewed, the");
-    console.log("transcripts of those reviews, and its record of what it has already seen.");
-    console.log("");
+    // Only where there is data to describe. This command is for installations
+    // that are already damaged, and one holding nothing but a config file does
+    // not need to be told what clones and transcripts it would lose.
+    if (dataHere) {
+      console.log("Data holds Engwire's own clones of every repository it has reviewed, the");
+      console.log("transcripts of those reviews, and its record of what it has already seen.");
+      console.log("");
+    }
     if (refusal) for (const line of refusal.short) console.log(line);
     else console.log("Remove this installation: engwire uninstall --yes");
     return 0;
   }
 
   // Listing is never unsafe, so a refusal waits until something is about to
-  // happen — and then it is the same one the listing just named.
-  if (refusal) {
-    console.error("");
+  // happen — and then it is the same one the listing just named. A machine with
+  // nothing to claim is nothing about to happen.
+  if (hasClaimedState && refusal) {
+    gap(console.error);
     for (const line of refusal.long) console.error(line);
     return 1;
   }
 
-  // First, and whether or not a plist was listed above: `bootout` is what stops
-  // a running service, and the file can go between the read that claimed it and
-  // this line. A job loaded with no plist at all never reaches here — that is
-  // the one named above, unidentifiable and so not this command's to boot out.
-  //
-  // False when this installation can no longer claim the job — `remove` re-asks
-  // whose it is before booting anything out, and another installation taking
-  // the label is only one way to lose it. Nothing was stopped then, and nothing
-  // may be reported as stopped.
+  // Attempt service removal before deleting roots, even if its plist was not
+  // listed. remove() revalidates ownership and returns false if the plist has
+  // vanished or changed hands; the initial ownership answer is not enough.
   const stopped = service ? await service.remove() : false;
   if (service && !stopped) {
     // Two reasons for the same `false`, and they want opposite things: another
@@ -329,7 +355,7 @@ export async function uninstall(options: {
     // Rather than a second ownership model, hand the question back to the one
     // that already answers it: another run reads the plist fresh, and a foreign
     // one, an unreadable one or none at all each get their own answer.
-    console.error("");
+    gap(console.error);
     console.error("The launchd job could no longer be claimed when the time came, so it was");
     console.error("left alone — another installation may hold the label now, or the plist may");
     console.error("simply be gone, in which case its job could still be loaded. Nothing was");
@@ -338,22 +364,21 @@ export async function uninstall(options: {
     return 1;
   }
 
-  // Held, not probed. A foreground `engwire run` could start in the moment
-  // between asking whether one is running and deleting the answer, and would
-  // then be reviewing from a database this command has already called gone.
-  // Taking the lock both proves no runner is live and keeps it that way.
-  let left: string[] = [];
-  // Held, not probed, still. Asking whether the data directory could hold a
-  // lock and only then taking one is the same shape this rejects: between the
-  // question and the answer a runner starts, and its data goes out from under
-  // it. So the attempt is the question, and the answer is read off the failure.
+  // Hold the lock throughout removal so a foreground runner cannot start
+  // between an idle check and deletion.
+  let linkReports: string[] = [];
+  // Attempt acquisition rather than predicting whether the root can hold a
+  // lock; only the specific malformed-root failure permits removal without it.
   let release: (() => void) | null = null;
+  // Skipped entirely with no roots on disk: there is nothing for a runner to
+  // race for, and `acquireLock` would create the data directory to hold a lock
+  // over an installation that is not there.
   try {
-    release = acquireLock(p.lockFile);
+    if (hadRoots) release = acquireLock(p.lockFile);
   } catch (error) {
     if (rootCannotHoldALock(error)) release = null;
     else if (error instanceof LockedError) {
-      console.error("");
+      gap(console.error);
       if (mayRestartThisRunner) {
         console.error("A runner is still running, and the service above was kept — it may be");
         console.error("what restarts it. `engwire service uninstall` stops that job.");
@@ -386,20 +411,19 @@ export async function uninstall(options: {
     // goes first, because a runner that cannot read one never reaches the lock.
     // Where no lock could be taken at all, the malformed data root is the only
     // thing standing in for one, and last is where that belongs too.
-    left = [configDir, p.dataDir].map(removeTree).filter((why) => why !== null);
+    if (hadRoots) {
+      linkReports = [configDir, p.dataDir].map(removeTree).filter((why) => why !== null);
+    }
   } finally {
     release?.();
   }
 
-  console.log("");
-  // `--yes` over an installation that was never here removed nothing, and the
-  // plain invocation already says so. A bare "Removed." is the same overclaim
-  // this command spends the rest of its output avoiding. A claimed service
-  // counts even when no plist was listed: `remove` boots the job out either
-  // way, and that is something happening.
-  for (const why of left) console.log(why);
-  const removed = left.length === 0 ? "Removed." : "Removed the rest.";
-  console.log(!stopped && !hadRoots ? NOTHING : removed);
+  gap(console.log);
+  // A successful service removal counts even without listed roots. Failed
+  // revalidation returned above; no claimed state means nothing was removed.
+  for (const why of linkReports) console.log(why);
+  const verdict = linkReports.length === 0 ? "Removed." : "Removed the rest.";
+  console.log(hasClaimedState ? verdict : NOTHING);
   // "Kept", not "still running": only an orphan is a job launchd was asked
   // about. A foreign plist is a file, and a file outlives its job — the one
   // left behind by a hand-deleted install is a plist with nothing loaded.
