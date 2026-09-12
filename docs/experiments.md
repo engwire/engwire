@@ -6,6 +6,8 @@ These are recipes, so re-running one against a new version is an afternoon's wor
 
 Close stdin on every `claude -p` below — `< /dev/null`, inside command substitution too. Left open, it waits three seconds and prints a warning of its own, which lands in the output some of these rows are reading; production closes it the same way.
 
+`gh api` needs a signed-in `gh`, public repository or not; every `gh` recipe below assumes one.
+
 ## Does killing a subprocess close its output?
 
 The direct `gh` boundary needs a deadline for the complete answer, including output reads. Measured on 2026-09-06 with Bun 1.4.0 on Darwin 24.6.0:
@@ -93,7 +95,7 @@ The exit code in the skill row is the other guarantee. An unknown slash command 
 
 ## Is the flag still there?
 
-`doctor` runs on a laptop, on demand, and must not spend an agent turn — so it cannot re-run the arena. What it can do is establish that `--setting-sources` still reaches an argument parser. That needs one more measured fact:
+`doctor` runs on a laptop, on demand, and must not spend an agent turn — so it cannot re-run the arena. What it can do is establish that `--setting-sources` still reaches an argument parser. That needs one more measured fact — recorded below on 2.1.259, and all four rows re-run unchanged on 2.1.263, the refusal's wording apart, which is why only its exit status is read:
 
 ```sh
 claude --setting-sources user --version                    # 2.1.259 (Claude Code), exit 0
@@ -136,12 +138,23 @@ The preflight in `claude/skills.ts` must not accept a value Claude fails to invo
 Probes at user scope — the scope `--setting-sources user` leaves loaded — each a `SKILL.md` whose body is "Reply with exactly the token PROBE_OK and nothing else", varying only the declaration under test:
 
 ```sh
-probe=~/.claude/skills/engwire-probe-yes
-# Refuse to overwrite a real skill before creating the temporary probe.
-[ -e "$probe" ] && { echo "refusing: $probe already exists" >&2; exit 1; }
+# A subshell, so the guard's `exit` leaves the probe rather than the terminal,
+# and an `if` rather than `[ … ] && { … }`, which is itself a non-zero
+# statement when it finds nothing. The trap is armed between the guard and
+# the directory, so neither a failed step nor an interrupt leaves a probe
+# behind in a real skills directory — and the signal traps exit rather than
+# only cleaning up, since a handler that returns lets the rest of the probe
+# run on with its cleanup already spent. The status of the line that matters
+# is taken by an `if` rather than from `$?`, because that non-zero exit is
+# the measurement and `set -e` would otherwise abort on it.
+( set -eu
+  probe=~/.claude/skills/engwire-probe-yes
+  # Refuse to overwrite a real skill before creating the temporary probe.
+  if [ -e "$probe" ]; then echo "refusing: $probe already exists" >&2; exit 1; fi
+  trap 'rm -rf "$probe"' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
 
-mkdir -p "$probe"
-cat > "$probe/SKILL.md" <<'EOF'
+  mkdir -p "$probe"
+  cat > "$probe/SKILL.md" <<'EOF'
 ---
 name: engwire-probe-yes
 description: Temporary Engwire measurement probe; safe to delete.
@@ -151,18 +164,19 @@ user-invocable: yes
 Reply with exactly the token PROBE_OK and nothing else.
 EOF
 
-out=$(claude --setting-sources user -p "/engwire-probe-yes" < /dev/null 2>&1); echo "exit=$? output=[$out]"
-rm -rf "$probe"
+  if out=$(claude --setting-sources user -p "/engwire-probe-yes" < /dev/null 2>&1); then code=0; else code=$?; fi
+  echo "exit=$code output=[$out]"
+)
 ```
 
-The status is captured before anything else runs, and the output is bracketed: for one row below, *empty* is the observation.
+The output is bracketed because for one row below, *empty* is the observation.
 
 | front matter | runs? | measured on |
 | --- | --- | --- |
 | no `user-invocable` | yes | 2.1.251, 2.1.257 |
 | `true` | yes | 2.1.259 |
 | `TRUE` | yes | 2.1.259 |
-| `yes` | yes | 2.1.251, 2.1.257 |
+| `yes` | yes | 2.1.251, 2.1.257, 2.1.270 |
 | `"yes"` | yes | 2.1.259 |
 | `1` | yes | 2.1.251, 2.1.257 |
 | `"1"` | yes | 2.1.259 |
@@ -183,31 +197,86 @@ Two of those mechanisms announce themselves and one does not, which is worth est
 | `skillOverrides: {"<name>": "off"}` | `Skill "…" is disabled via skillOverrides.`, exit 0 |
 | `user-invocable: false` | nothing at all, exit 0 |
 
-The `skillOverrides` row is the one that had to be run rather than assumed, so here it is in full. It edits the reviewer's own `~/.claude/settings.json`, because `--setting-sources user` is the scope under test and `CLAUDE_CONFIG_DIR` cannot be relocated — hence the copy and the `trap`:
+The `skillOverrides` row is the one that had to be run rather than assumed, so here it is in full — and self-contained, because an override naming a skill that is not there is answered by `Unknown command` with the same exit status, which would be a measurement of nothing. It edits the reviewer's own `~/.claude/settings.json`, because `--setting-sources user` is the scope under test and `CLAUDE_CONFIG_DIR` cannot be relocated:
 
 ```sh
 ( set -eu
+  probe=~/.claude/skills/engwire-probe-yes
+  settings=~/.claude/settings.json
+  if [ -e "$probe" ]; then echo "refusing: $probe already exists" >&2; exit 1; fi
+
   # A subshell, so EXIT is this probe finishing rather than the terminal closing
-  # hours later with the reviewer's settings still modified. The backup is taken
-  # before the trap exists, so `set -e` aborts on a copy that failed rather than
-  # arming a restore from a file that is not there; and it is deleted only once
-  # it has been put back.
-  backup=$(mktemp)
-  cp -p ~/.claude/settings.json "$backup"
-  trap 'if cp -p "$backup" ~/.claude/settings.json; then rm -f "$backup"; else echo "settings NOT restored; backup: $backup" >&2; fi' EXIT
+  # hours later with the reviewer's settings still modified, and EXIT owns the
+  # cleanup exactly once: the signal traps exit rather than running it and
+  # letting the probe carry on. One private directory holds both the original
+  # and the bytes to install, because a `mktemp` file starts at 0600 but `cp -p`
+  # would put the settings file's own 0644 on it, in a directory everyone can
+  # read. Cleanup is armed before anything is copied anywhere.
+  work=$(mktemp -d)
+  restore() {
+    # Settings first: the recovery that matters must not be skipped because
+    # removing a directory failed. `installing` exists from just before the
+    # settings are touched, so its absence means nothing was installed.
+    if [ ! -e "$work/installing" ]; then
+      rm -rf "$work"
+    elif cmp -s "$settings" "$work/candidate.json"; then
+      if [ -e "$work/original.json" ]; then cp -p "$work/original.json" "$settings"; else rm -f "$settings"; fi
+      rm -rf "$work"
+    elif [ -e "$work/original.json" ] && cmp -s "$settings" "$work/original.json"; then
+      rm -rf "$work"   # the copy never landed; the original is already in place
+    elif [ ! -e "$work/original.json" ] && [ ! -e "$settings" ]; then
+      rm -rf "$work"   # there was no settings file, and the copy never landed
+    else
+      # Somebody else's edit, or a copy that tore halfway. Either way it is not
+      # this probe's to overwrite: say where the original is, and stop.
+      echo "settings are not the bytes this probe installed; NOT restored. original: $work/original.json" >&2
+    fi
+    rm -rf "$probe"
+  }
+  trap restore EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
 
-  python3 -c 'import json, io, os
-p = os.path.expanduser("~/.claude/settings.json")
-d = json.load(io.open(p))
+  # A recovery copy that cannot be taken is a reason to stop, not a state: with
+  # no `original.json`, cleanup could not tell this from "there was no file".
+  if [ -e "$settings" ]; then cp -p "$settings" "$work/original.json"; fi
+
+  mkdir -p "$probe"
+  cat > "$probe/SKILL.md" <<'EOF'
+---
+name: engwire-probe-yes
+description: Temporary Engwire measurement probe; safe to delete.
+user-invocable: yes
+---
+
+Reply with exactly the token PROBE_OK and nothing else.
+EOF
+
+  # The candidate is built beside the file rather than in it, and from the
+  # snapshot rather than from the live file, so what is restored afterwards is
+  # what was read: an edit that arrived in between is refused, not absorbed and
+  # then quietly rolled back over.
+  python3 - "$work/original.json" "$work/candidate.json" <<'EOF'
+import json, io, os, sys
+src, dst = sys.argv[1], sys.argv[2]
+d = json.load(io.open(src)) if os.path.exists(src) else {}
 d.setdefault("skillOverrides", {})["engwire-probe-yes"] = "off"
-io.open(p, "w").write(json.dumps(d, indent=2))'
+io.open(dst, "w").write(json.dumps(d, indent=2))
+EOF
 
-  # `&& ... || ...` rather than `; echo "exit=$?"`, which `set -e` would never
-  # reach: the exit status is the observation.
-  claude --setting-sources user -p "/engwire-probe-yes" < /dev/null && code=0 || code=$?
-  echo "exit=$code"
+  if [ -e "$work/original.json" ]; then
+    cmp -s "$settings" "$work/original.json" ||
+      { echo "settings changed since the snapshot; nothing installed" >&2; exit 1; }
+  elif [ -e "$settings" ]; then
+    echo "a settings file appeared since the snapshot; nothing installed" >&2; exit 1
+  fi
+  touch "$work/installing"
+  cp "$work/candidate.json" "$settings"   # a copy, so a settings symlink stays one
+
+  if out=$(claude --setting-sources user -p "/engwire-probe-yes" < /dev/null 2>&1); then code=0; else code=$?; fi
+  echo "exit=$code output=[$out]"
 )
 ```
+
+Re-run in that form on 2.1.270, it prints exit 0 and `Skill "engwire-probe-yes" is disabled via skillOverrides. Remove the override from your settings to run it.` — the message is the observation, not the status. Two comparisons rather than one lock: the live file is checked against the snapshot before anything is installed, and against the installed bytes before anything is put back. Neither is synchronisation — a writer landing between a comparison and the copy behind it is overwritten by that copy — so do not edit or sync Claude's settings while this runs.
 
 `skillOverrides` is the disable mechanism the preflight deliberately does not check, since interpreting Claude's settings would duplicate another product's configuration model — so it was the candidate for a silent failure arriving *after* the preflight has passed. It is not silent. Every mechanism measured to be silent is one the preflight already refuses before the run is claimed, which is why Engwire records nothing about an empty transcript: there is no measured failure for it to catch, and a skill that posts its review through a tool and then says nothing would be the only thing it ever flagged.
 
@@ -221,15 +290,79 @@ That relocation was attempted properly on 2026-09-08 and does not work, which is
 
 SECURITY.md says Engwire checks out a revision and does not execute it. A checkout is git operating on content someone else wrote, and git has several ways to run a command while it works — so whether that sentence holds is a property of git, not a decision Engwire makes. Measured on git 2.54.0, through `ensureRepository` and `prepareRevision` themselves, against an origin carrying the vectors below.
 
-The checkout recipes below drive a single `git worktree add`, which is how the vectors were found. What Engwire runs now is `worktree add --no-checkout` followed by `reset --hard`, for the reason in the last of them — so re-running these against the current code means running both halves.
+The vectors were originally found by driving a single `git worktree add`. What Engwire runs now is `worktree add --no-checkout` followed by `reset --hard`, for the reason in the last of them, so the recipes below exercise the pair — along with the `clone` and `fetch` that precede it, and the agent's own `git diff`, where those are what the claim is about.
 
 **Repository-local configuration and hooks do not travel.** A `filter.evil.smudge` defined in the origin's own config, a `.git/hooks/post-checkout`, and a `core.hooksPath` set locally all failed to run, and the clone's config held nothing beyond what `clone` writes. Clone transfers refs and objects, not configuration and not hooks.
 
-**`post-checkout` fires, from two independent sources.** `git worktree add` runs it, with the new worktree as its working directory. A *relative* `core.hooksPath`, which a reviewer may well have set globally to share hooks across their own repositories, resolves next to the bare clone rather than inside the worktree: `.githooks` means `<clone>/.githooks`, a path the branch cannot write to. But an *absolute* one is the reviewer's own script, and it ran in the contributor's checkout — a hook written for repositories its author trusts, meeting one they have not read. Since git 2.54 a hook can also be configured outright, as `hook.<name>.command` with `hook.<name>.event = post-checkout`, and that source is not covered by `core.hooksPath` at all: with the hook path pointed at `/dev/null` the configured command still ran, and `git show HEAD:file` from inside it read the branch's own blobs. `hook.<name>.enabled = false` is git's documented way to switch one off, keyed by the hook's own name rather than by the event — `hook.post-checkout.enabled = false` reads `post-checkout` as a name and disables nothing.
+**A plain `worktree add` fires `post-checkout` from two independent sources.** It runs with the new worktree as its working directory. A *relative* `core.hooksPath`, which a reviewer may well have set globally to share hooks across their own repositories, resolves next to the bare clone rather than inside the worktree: `.githooks` means `<clone>/.githooks`, a path the branch cannot write to. But an *absolute* one is the reviewer's own script, and it ran in the contributor's checkout — a hook written for repositories its author trusts, meeting one they have not read. Since git 2.54 a hook can also be configured outright, as `hook.<name>.command` with `hook.<name>.event = post-checkout`, and that source is not covered by `core.hooksPath` at all: with the hook path pointed at `/dev/null` the configured command still ran, and `git show HEAD:file` from inside it read the branch's own blobs. `hook.<name>.enabled = false` is git's documented way to switch one off, keyed by the hook's own name rather than by the event — `hook.post-checkout.enabled = false` reads `post-checkout` as a name and disables nothing. Which leaves Engwire scraping the names out of the effective config, matching on `hook.<name>.event`. Whether that key is the whole binding was measured across both events Engwire's own sequence fires, each against a positive control, and each with the command-only stanza named after the event it would have caught — the case where a name-based heuristic would answer differently:
+
+```sh
+( set -eu
+  tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
+  export GIT_CONFIG_GLOBAL="$tmp/gitconfig" GIT_CONFIG_SYSTEM=/dev/null
+  git config --global user.email probe@example.invalid; git config --global user.name probe
+  git init -q "$tmp/origin"; (cd "$tmp/origin"; echo hi > f; git add f; git commit -qm c)
+  # Marks the event it caught, and records what git handed it, under a label.
+  printf '#!/bin/sh\ntouch "%s/$1_RAN"\nenv | grep ^GIT_DIR= | sed "s|^|$2 |" >> "%s/HOOK_ENV" || true\n' "$tmp" "$tmp" > "$tmp/mark"
+  chmod +x "$tmp/mark"
+
+  # Engwire's own acquisition and checkout, with the hook under test configured.
+  run() { event=$1; shift
+    rm -rf "$tmp/clone" "$tmp/wt" "$tmp"/*_RAN
+    git -c core.hooksPath=/dev/null "$@" clone -q --bare "$tmp/origin" "$tmp/clone"
+    git -C "$tmp/clone" -c core.hooksPath=/dev/null "$@" fetch -q --no-tags "$tmp/origin" "+HEAD:refs/engwire/probe"
+    git -C "$tmp/clone" -c core.hooksPath=/dev/null "$@" worktree add -q --no-checkout "$tmp/wt" HEAD
+    git -C "$tmp/wt" -c core.hooksPath=/dev/null "$@" reset -q --hard HEAD
+    [ -e "$tmp/${event}_RAN" ] && echo "$event: RAN" || echo "$event: did not run"
+  }
+  for e in reference-transaction post-index-change; do
+    run "$e" -c "hook.$e.command=$tmp/mark $e"
+    run "$e" -c "hook.probe.command=$tmp/mark $e" -c "hook.probe.event=$e"
+  done
+  # A bound hook on the event this sequence deliberately no longer fires.
+  run post-checkout -c "hook.probe.command=$tmp/mark post-checkout" -c hook.probe.event=post-checkout
+
+  # And what git hands a hook, labelled by the command that ran it.
+  rm -rf "$tmp/clone" "$tmp/wt"; : > "$tmp/HOOK_ENV"
+  bind() { echo "hook.probe.command=$tmp/mark $1 $2"; }
+  git -c core.hooksPath=/dev/null -c "$(bind reference-transaction clone)" -c hook.probe.event=reference-transaction clone -q --bare "$tmp/origin" "$tmp/clone"
+  git -C "$tmp/clone" -c core.hooksPath=/dev/null -c "$(bind reference-transaction fetch)" -c hook.probe.event=reference-transaction fetch -q --no-tags "$tmp/origin" "+HEAD:refs/engwire/probe"
+  git -C "$tmp/clone" -c core.hooksPath=/dev/null -c "$(bind reference-transaction worktree)" -c hook.probe.event=reference-transaction worktree add -q --no-checkout "$tmp/wt" HEAD
+  git -C "$tmp/wt" -c core.hooksPath=/dev/null -c "$(bind post-index-change reset)" -c hook.probe.event=post-index-change reset -q --hard HEAD
+  sort -u "$tmp/HOOK_ENV"
+)
+```
+
+On git 2.54.0 that prints `did not run`, `RAN`, `did not run`, `RAN`, `did not run`: for the events that fire here, a stanza is bound by its `event` key and by nothing else, its subsection name included — and the last row is the `--no-checkout` split below, seen from the hook's side. Whether some event outside that pair binds differently is not measured and does not need to be; the matcher only has to be right about the events Engwire triggers. The labelled pass answers a second question with the same probe: each of the four commands handed its hook a `GIT_DIR` — the bare clone from `clone`, the worktree's own gitdir from `reset`, and a bare `.` from `fetch` and `worktree add` — which is why an environment that starts under a hook is a plausible source of the ambient selectors SECURITY.md says are cleared. The empty value passed through `--config-env` disables a hook exactly as `false` does, which is what lets one `GIT_INERT` serve these keys and the filter keys alike.
 
 **`core.fsmonitor` runs a program too.** Git documents a non-boolean value as the pathname of a hook, and `worktree add` refreshes the index through it: the script ran in the new worktree, with the same reach as the others. Empty rather than `false` disables it, since git through 2.35.1 reads a boolean-looking value there as a pathname — measured inert on 2.54.0, including where the reviewer had set it to `true`.
 
-Engwire's clones carry no hooks of their own, so disabling both hook sources loses no Engwire-owned behaviour.
+Engwire's clones carry no hooks of their own, so disabling both hook sources loses no Engwire-owned behaviour. They can carry the reviewer's, though: a global `init.templateDir` — the usual way to share hooks between your own repositories — has `clone` copy its `hooks/` into every repository it creates, and the copies land in the bare clone Engwire owns. Measured on git 2.54.0, they never fire, because every git Engwire runs there pins `core.hooksPath` at `/dev/null`. That is a property of each command remembering to, so `clone` is passed `--template=` as well: an empty value copies nothing, and a file that is not there cannot be run by a command that forgets. Both halves, and both defences:
+
+```sh
+( set -eu
+  tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
+  export GIT_CONFIG_GLOBAL="$tmp/gitconfig" GIT_CONFIG_SYSTEM=/dev/null
+  git config --global user.email probe@example.invalid; git config --global user.name probe
+  git init -q "$tmp/origin"; (cd "$tmp/origin"; echo hi > f; git add f; git commit -qm c)
+  mkdir -p "$tmp/template/hooks"
+  printf '#!/bin/sh\ntouch "%s/HOOK_RAN"\n' "$tmp" > "$tmp/template/hooks/reference-transaction"
+  chmod +x "$tmp/template/hooks/reference-transaction"
+  git config --global init.templateDir "$tmp/template"
+
+  git clone -q --bare "$tmp/origin" "$tmp/a"             # the reviewer's template
+  git clone -q --template= --bare "$tmp/origin" "$tmp/b" # what Engwire passes
+  ls "$tmp/a/hooks"; ls "$tmp/b/hooks" || echo "no hooks directory at all"
+
+  for pin in "-c core.hooksPath=/dev/null" ""; do
+    rm -f "$tmp/HOOK_RAN"
+    git -C "$tmp/a" $pin fetch -q --no-tags "$tmp/origin" HEAD
+    [ -e "$tmp/HOOK_RAN" ] && echo "RAN [$pin]" || echo "did not run [$pin]"
+  done
+)
+```
+
+Measured on git 2.54.0: the template's `reference-transaction` lands in `a/hooks`, while `b` has no `hooks` directory at all; the copy stays inert under the pin and runs without it. Neither defence is redundant — the pin covers every git Engwire runs in a clone it already has, and `--template=` covers the one command that creates one.
 
 **The environment names programs too, not just repositories.** `git()` used to drop a list of variables — `GIT_DIR` and its relatives — and inherit the rest. The list was the wrong shape: it has to name every variable git will act on, and three of the ones it did not name run a program of the environment's choosing. Measured on git 2.54.0:
 
@@ -250,90 +383,133 @@ The helper ran. `GIT_EXEC_PATH` is where git finds its own subprocesses, so it r
 
 **The checkout answers to a second repository.** A plain `git worktree add` does the checkout in a child process with `GIT_DIR` set to the *new worktree's* gitdir, `<clone>/worktrees/<name>`. Config the reviewer scoped to that path is invisible from the bare clone: `[includeIf "gitdir:**/worktrees/**"]` matches the one and not the other, and a smudge filter behind such an include ran with every override in place, because the enumeration never saw it. So the worktree is created with `--no-checkout` and filled by a separate `reset --hard`, each overridden against the gitdir it runs in. That split also changes which hooks fire: `post-checkout` no longer runs at all, while `reference-transaction` fires in both halves and `post-index-change` in the second — so those are the events worth pinning a test to.
 
+**A diff driver runs on the agent's side of the boundary.** Engwire's git never runs `diff`; the skill does, and a diff driver is executable configuration a contributor can *select*. Measured on git 2.54.0: a committed `.gitattributes` naming `diff=evil`, with `diff.evil.command` set only in the reviewer's global configuration, ran that command on `git diff` — the filter finding again, in a place `inertOverrides` does not reach because it is not Engwire running the command.
+
+```sh
+( set -eu
+  tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
+  export GIT_CONFIG_GLOBAL="$tmp/gitconfig" GIT_CONFIG_SYSTEM=/dev/null
+  printf '#!/bin/sh\ntouch "%s/DIFF_RAN"\n' "$tmp" > "$tmp/driver"; chmod +x "$tmp/driver"
+  git config --global diff.evil.command "$tmp/driver"   # the reviewer's, not the branch's
+
+  # A committed `.gitattributes`, as a branch under review carries one. The
+  # identity is on the command, not in config: nothing here reads the machine's.
+  git init -q "$tmp/branch"; cd "$tmp/branch"
+  printf '* diff=evil\n' > .gitattributes; echo one > f; git add .gitattributes f
+  git -c user.name=probe -c user.email=probe@example.invalid commit -qm c
+  echo two > f
+
+  for e in "" "GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null"; do
+    rm -f "$tmp/DIFF_RAN"
+    env $e git diff > /dev/null
+    [ -e "$tmp/DIFF_RAN" ] && echo "RAN [$e]" || echo "did not run [$e]"
+  done
+)
+```
+
+The first row is a skill's ordinary `git diff` in the checkout and it runs the driver; the second is the same command with the environment the agent is given, and it does not. So the agent is handed `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_SYSTEM=/dev/null` rather than a growing list of executable keys. The worktree's own configuration still applies; Engwire wrote that one.
+
+**`url.<base>.insteadOf` changes the transport, not only the endpoint.** Engwire builds `https://github.com/...` itself and a rewrite of the reviewer's gets the last word anyway — rewritten to `ssh://`, the fetch runs whatever `core.sshCommand` names. What a rewrite does not do is let a repository that lacks the accepted SHA satisfy the fetch, because what Engwire asks for is that SHA by name. Both halves on git 2.54.0, against `clone` and `fetch` rather than `ls-remote`, since those are the commands Engwire runs, and the SHA half against a repository that carries it as well as one that does not — otherwise a git that could not fetch a raw SHA at all would look the same:
+
+```sh
+( set -eu
+  tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
+  export GIT_CONFIG_GLOBAL="$tmp/gitconfig" GIT_CONFIG_SYSTEM=/dev/null GIT_TERMINAL_PROMPT=0
+  git config --global user.email probe@example.invalid; git config --global user.name probe
+
+  # The rewrite picks the transport, and the transport picks a program.
+  printf '#!/bin/sh\ntouch "%s/SSH_RAN"\nexit 1\n' "$tmp" > "$tmp/ssh"; chmod +x "$tmp/ssh"
+  git config --global core.sshCommand "$tmp/ssh"
+  git config --global url."ssh://git@example.invalid/".insteadOf https://github.com/
+  git clone -q --bare https://github.com/acme/api.git "$tmp/c1" 2>/dev/null || true
+  [ -e "$tmp/SSH_RAN" ] && echo "clone RAN it" || echo "clone did not"
+  rm -f "$tmp/SSH_RAN"
+  git init -q --bare "$tmp/c2"; git -C "$tmp/c2" remote add origin https://github.com/acme/api.git
+  git -C "$tmp/c2" fetch -q origin 2>/dev/null || true
+  [ -e "$tmp/SSH_RAN" ] && echo "fetch RAN it" || echo "fetch did not"
+  git config --global --unset url."ssh://git@example.invalid/".insteadOf
+
+  # And what it does not change: which repository can answer for the accepted SHA.
+  mk() { git init -q "$tmp/$1"; (cd "$tmp/$1"; echo "$2" > f; git add f; git commit -qm c); git -C "$tmp/$1" rev-parse HEAD; }
+  sha=$(mk real "the revision under review"); mk decoy "somebody else's code" > /dev/null
+  for target in real decoy; do
+    rm -rf "$tmp/clone"; git init -q --bare "$tmp/clone"
+    git config --global url."file://$tmp/$target".insteadOf https://github.com/acme/api
+    git -C "$tmp/clone" fetch --no-tags https://github.com/acme/api "$sha" > /dev/null 2>&1 && code=0 || code=$?
+    git -C "$tmp/clone" cat-file -t "$sha" > /dev/null 2>&1 && has=present || has=absent
+    echo "redirected at $target: fetch exit=$code, object $has"
+    git config --global --unset url."file://$tmp/$target".insteadOf
+  done
+)
+```
+
+`clone RAN it`, `fetch RAN it`, then `redirected at real: fetch exit=0, object present` and `redirected at decoy: fetch exit=128, object absent`. So the residual recorded in SECURITY.md is where and over what the fetch happens. What this does not measure, and does not claim, is git's object integrity: it shows a repository without the SHA failing, not what one that answered with different bytes under that name would do.
+
 What the measurements settled about the shape of the fix:
 
 - **`required` has to be overridden too.** With the check-out-side commands disabled, a filter still marked required does not fall back to unfiltered content — `fatal: .gitattributes: smudge filter evil failed`, exit 128, no worktree. Since `git-lfs` marks its filter required, disabling the commands alone would have broken the checkout of every LFS repository.
 - **An empty value is enough to disable a driver**, reads as false for `required`, and leaves content byte-identical to having no filter at all.
 - **A disabled `process` does not fall back to a `smudge` beside it**, so each key has to be overridden on its own account rather than one standing in for the rest.
 - **Only the check-out direction reaches.** A filter defining nothing but `clean` did not run as the tree was written, so the overrides cover `smudge`, `process` and `required` and leave `clean` as the reviewer set it.
-- **`GIT_DIR` outranks the working directory.** `git -C <dir>` with `GIT_DIR` exported operates on `$GIT_DIR`, so naming a cwd guarantees nothing on its own; `git()` drops `GIT_DIR` and its relatives from the environment it hands to git, and keeps everything else.
+- **`GIT_DIR` outranks the working directory, and so does `GIT_WORK_TREE`.** `git -C <dir>` with `GIT_DIR` exported operates on `$GIT_DIR`, so naming a cwd guarantees nothing on its own. The second half is a two-line measurement of its own — from inside a clean repository, the same `git status` under an inherited `GIT_WORK_TREE` reports this repository's files as deleted and the other directory's as untracked:
+
+  ```sh
+  ( set -eu
+    tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
+    export GIT_CONFIG_GLOBAL="$tmp/gitconfig" GIT_CONFIG_SYSTEM=/dev/null
+    git init -q "$tmp/repo"; cd "$tmp/repo"; echo hi > f; git add f
+    git -c user.name=probe -c user.email=probe@example.invalid commit -qm c
+    mkdir "$tmp/elsewhere"; echo other > "$tmp/elsewhere/g"
+    git status --porcelain                                  # silent: nothing to report
+    GIT_WORK_TREE="$tmp/elsewhere" git status --porcelain   # " D f" and "?? g"
+  )
+  ```
+
+  How the environment is cleaned is no longer a list of names — see the namespace paragraph above.
 - **`-c` cannot express every key.** A subsection name may legally contain an `=`, and `-c <name>=<value>` splits on the first one: against a real `[filter "a=b"]` the argument `-c filter.a=b.smudge=` set `filter.a` instead and the smudge ran. `--config-env=<name>=<var>` splits on the last `=` and takes the value from the environment, which blocked it — and it exits 128 if the variable is missing, so a mistake there is loud rather than silent.
-- **Targeted beats blanket.** `GIT_CONFIG_GLOBAL=/dev/null` would also work, but the clone is blobless, so the checkout still fetches blobs and still needs whatever proxy and credential settings the reviewer's configuration carries.
+- **Targeted beats blanket, for Engwire's own git** — the opposite of what the agent gets, and for the opposite reason. `GIT_CONFIG_GLOBAL=/dev/null` would work here too, but the clone is blobless, so the checkout still fetches blobs and still needs whatever proxy and credential settings the reviewer's configuration carries.
 - **A relative config selector is resolved against the working directory.** Measured: with `GIT_CONFIG_GLOBAL=.gitconfig`, `git config --get` returned a value set only in a `.gitconfig` committed to the checkout, and `git -C <worktree>` from elsewhere resolved it the same way. Every git Engwire runs works in a directory Engwire chose, one of them a checkout of the branch under review — so a relative selector would let the branch supply the "global" configuration.
 - **Refusing such a selector is not the same as dropping it.** Measured with a temporary `HOME`: a relative `GIT_CONFIG_GLOBAL` reads the relative file; omitting the variable reads `$HOME/.gitconfig`; `/dev/null` reads neither. `HOME` is deliberately still passed to git, so dropping an unusable selector would hand a checkout configuration the caller's own git was never reading — sanitising is only ever allowed to narrow. `git()` therefore answers a non-absolute `GIT_CONFIG_GLOBAL` or `GIT_CONFIG_SYSTEM` with `/dev/null`, which is also what an empty one already means to git.
 - **`GIT_CONFIG_NOSYSTEM` is kept for the same reason, from the other direction.** It is the boolean that suppresses the system file. Measured: with `GIT_CONFIG_SYSTEM` naming a file and `GIT_CONFIG_NOSYSTEM=1`, git reads nothing from it; strip the boolean while restoring the selector and the file is read. Losing it would turn system configuration the caller had switched off back on.
 
 The cost is that a file which really is an LFS pointer stays a pointer in the checkout.
 
-**Acquiring the repository runs hooks too.** `reference-transaction` fires on every clone and every fetch, from both hook sources, before any tree exists — a hook of the reviewer's, running while a repository they have never read is downloaded. So the same overrides go on `clone` and `fetch` rather than on the checkout alone. One residual, stated rather than closed: a clone has no configuration of its own to enumerate, so config the reviewer scoped by `includeIf` to Engwire's own clone path is invisible to it. Nothing in a branch can ask for that, and every other form is covered.
+**Acquiring the repository runs hooks too.** `reference-transaction` fires on every clone and every fetch, from both hook sources, before any tree exists — a hook of the reviewer's, running while a repository they have never read is downloaded. So the same overrides go on `clone` and `fetch` rather than on the checkout alone. One residual remains in executable-config enumeration: a clone has no configuration of its own yet, so configuration scoped by `includeIf` to Engwire's clone path is invisible to it. Nothing in a branch can request that configuration.
 
 What none of this covers, and is not meant to: once Claude is running in that directory, a skill can execute whatever its `allowed-tools` permit. The claim measured here is narrower — what *Engwire's own* git does.
 
-## Does a losing deadline keep the process alive?
+## Do `GH_REPO` and `GH_HOST` pin pull-request commands?
 
-Two places race a deadline against work that may finish first: `capture` in `cli/doctor.ts`, and `createGh`. Whichever loses is never awaited again, and `Promise.race` does not cancel it — so whether the command can exit turns on whether a timer nobody cleans up still holds the event loop. Both places do clean theirs up, and the measurement below is why they have to. `engwire doctor`, `setup` and `service install` all run those probes, and all three are commands somebody is sitting and watching.
+The agent runs with `GH_REPO` set to the repository the checkout came from, so a plain `gh pr review 42` should target that repository rather than one inferred from the git remote. That precedence is a property of `gh`, not Engwire.
 
-Measured on macOS 15, Bun 1.4.0. Each script settles a race immediately and then does nothing; what is being timed is when the process exits, not when the race resolves:
-
-```sh
-# The work answers at once; the deadline is three seconds away.
-cat > sleep-race.ts <<'EOF'
-await Promise.race([Promise.resolve("done"), Bun.sleep(3000).then(() => null)]);
-console.log("raced at", Math.round(performance.now()), "ms");
-EOF
-
-# The same race, with a timer the script owns and unrefs.
-cat > settimeout-race.ts <<'EOF'
-let timer: ReturnType<typeof setTimeout> | undefined;
-const expired = new Promise<null>((resolve) => {
-  timer = setTimeout(() => resolve(null), 3000);
-  timer.unref();
-});
-await Promise.race([Promise.resolve("done"), expired]);
-console.log("raced at", Math.round(performance.now()), "ms");
-EOF
-
-# And a signal armed and abandoned, which is how `checkout_timeout` is built.
-echo 'AbortSignal.timeout(3000);' > abortsignal-timeout.ts
-
-for f in sleep-race settimeout-race abortsignal-timeout; do /usr/bin/time -p bun run $f.ts; done
-```
-
-| | race settles | process exits |
-| --- | --- | --- |
-| `Bun.sleep(3000)` as the losing side | 5 ms | **3.01 s** |
-| `setTimeout(…, 3000)` with `.unref()` | 2 ms | 0.00 s |
-| `AbortSignal.timeout(3000)`, armed and abandoned | — | 0.00 s |
-
-`Bun.sleep`'s timer is referenced, so a probe that answered promptly still held the runtime for the whole deadline. This is not theoretical: written that way, a `doctor` that had printed every row in 0.07 s took 20.4 s to return, on five sequential probes against a twenty-second deadline. `capture` therefore owns an explicit `setTimeout`, clears it when the answer arrives, and `unref`s it so a path that misses the clear cannot keep a finished command alive. `AbortSignal.timeout` needs neither, which is why `executeRun` composes one for `checkout_timeout` and does nothing further about it.
-
-`src/main.ts` sets `process.exitCode` rather than calling `process.exit`, so nothing forces the runtime down over a live handle — the difference above is the whole difference between a command that ends and one that waits.
-
-What this does not establish: that `Bun.sleep`'s referencing is documented or stable, or that the same holds on Linux. A test spawns `engwire doctor` and requires it to finish its probes and exit well inside the production deadline, guarding against regressions that leave a finished command waiting on live handles.
-
-## What `homedir()` does when there is no `HOME`
-
-`paths()` falls back to `homedir()` whenever neither `ENGWIRE_HOME`, the relevant XDG variable nor `HOME` supplies a root. If that fallback were empty, `join` would produce relative paths resolved against the working directory, which may be a checkout of the branch under review. Bun's `node:os` reference says POSIX `homedir()` uses `$HOME` whenever it is defined, so its documented reading of `HOME=` would produce that unsafe result.
-
-Measured on macOS 15, Bun 1.4.0, with Node 26 alongside for contrast:
+Measured against a git repository whose `origin` is `oven-sh/bun`, and carrying its own, since a document arguing that inherited selectors decide things cannot let one decide this — every row names the whole environment it is asking about:
 
 ```sh
-for runtime in bun node; do
-  HOME=       "$runtime" -e 'console.log(JSON.stringify(require("os").homedir()))'
-  env -u HOME "$runtime" -e 'console.log(JSON.stringify(require("os").homedir()))'
-done
+( set -eu
+  tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
+  cd "$tmp"; git init -q .
+  git remote add origin https://github.com/oven-sh/bun.git
+  env -u GH_HOST GH_REPO=cli/cli gh pr view 14259 --json number    # {"number":14259} — a pull request of cli/cli's
+  env -u GH_HOST GH_REPO=cli/cli gh repo view --json nameWithOwner # {"nameWithOwner":"oven-sh/bun"}
+)
 ```
 
-| | `HOME=""` | `HOME` unset |
-| --- | --- | --- |
-| Bun 1.4.0 | absolute home path | absolute home path |
-| Node 26.0.0 | `""` | absolute home path |
+`gh pr view` is the half that can be run against somebody else's pull request. The half that matters is `gh pr review`, which writes — so what gets measured is which repository it resolves against, with a pull-request number that does not exist in the target repository, so that the command fails before it posts anything:
 
-Bun returns the account's absolute home path when `HOME` is empty; Node returns the empty string. Bun therefore gives Engwire an absolute fallback today, contrary to the documented rule. `paths.test.ts` covers both rows in child processes so a runtime change arrives as a failing test rather than a relative config path.
+```sh
+( set -u
+  tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
+  cd "$tmp"; git init -q .
+  git remote add origin https://github.com/engwire/no-such-repo-probe.git
+  env -u GH_REPO -u GH_HOST                          gh pr review 999999999 --comment --body PROBE
+  env -u GH_HOST  GH_REPO=engwire/engwire                    gh pr review 999999999 --comment --body PROBE
+  env GH_HOST=github.invalid.example GH_REPO=engwire/engwire gh pr review 999999999 --comment --body PROBE
+)
+```
 
-`servicePathProblems` separately rejects an empty `HOME` and refuses installation when none of `ENGWIRE_HOME`, `XDG_DATA_HOME` or `HOME` identifies the data directory. The fallback still matters to foreground runs and to a service's config path when `XDG_DATA_HOME` alone identifies its data.
+Measured on 2026-09-12 with gh 2.98.0. Left to the remote, it is the *repository* that fails to resolve — `Could not resolve to a Repository with the name 'engwire/no-such-repo-probe'`. With `GH_REPO` set, the repository resolves and only the pull request does not — `Could not resolve to a PullRequest with the number of 999999999` — so the write was addressed to `engwire/engwire` while the remote said otherwise. The pinned repository is one of ours, not a third party's: the number does not exist there, and a recipe shaped like a write should not rest on that staying true of somebody else's project. With `GH_HOST` naming a host that does not exist, `error connecting to github.invalid.example`, rather than an answer from github.com. `gh repo view` is the counter-example that keeps this from being a rule about `gh`: it uses the remote, and outside a git repository it fails rather than falling back.
 
-What this does not establish: Bun's behavior on Linux. The test pins the property Engwire needs — an absolute root — rather than Bun's lookup mechanism.
+So the pin covers the two pull-request commands measured here, not every `gh` subcommand. That is enough for what is claimed, and worth knowing before claiming more: a skill that resolves the repository some other way is choosing its own answer, and Engwire only fixes the default.
 
 ## What a directory mode does not cover
 
@@ -438,7 +614,7 @@ gh api --paginate 'repos/cli/cli/issues/14259/events?per_page=5' | jq length
 # gh 2.31.0 -> 12        one array
 ```
 
-The change is [cli/cli#7190](https://github.com/cli/cli/pull/7190), released in 2.31.0 (June 2023). Note that `jq` accepts the concatenated form and Engwire's single `JSON.parse` does not, so on a multi-page response an old `gh` fails loudly rather than returning a quietly short list. Only on a multi-page one, though: a history that fits in a single page parses on either version, so an unsupported `gh` can look healthy until the first busy pull request. That is why the README states the floor.
+The change is [cli/cli#7190](https://github.com/cli/cli/pull/7190), released in 2.31.0 (June 2023). Note that `jq` accepts the concatenated form and Engwire's single `JSON.parse` does not, so on a multi-page response an old `gh` fails loudly rather than returning a quietly short list. Only on a multi-page one, though: a history that fits in a single page parses on either version, so an unsupported `gh` can look healthy until the first busy pull request. That is why the README states the floor, and why `doctor` reads `gh --version` against it rather than waiting for a page boundary to prove the point — a version rather than a probe, because nothing distinguishes the two `gh`s on a response that fits in one page.
 
 Cheaper is only free if the entries are the same entries. `UNIQUE(event_id)` is keyed on the id, so a database an earlier Engwire wrote has to go on matching, or the same GitHub request could be treated as fresh after the switch. Compared without normalising the two shapes — a team request carries no `requested_reviewer` and a user request no `requested_team`, and coalescing them would hide precisely the disagreement worth finding:
 
@@ -502,6 +678,35 @@ The first row is what the pipeline turns on, and it is worth measuring precisely
 
 Immutability freezes the tag only while the release exists, so it is not a substitute for a `v*` tag ruleset barring updates and deletions. The two cover different halves and Engwire keeps both.
 
+## Does a prerelease stay off `releases/latest`?
+
+The install command fetches `releases/latest/download/`, and `engwire doctor` offers whatever `releases/latest` names as an upgrade. Both have to keep pointing at the previous stable release while a candidate is still a prerelease, or an unverified build reaches installers, or gets recommended, before verification has finished. The throwaway-repository measurement above shows a *promoted* prerelease becoming `latest`; it does not show an unpromoted one being passed over while an older stable exists. A public repository whose newest release is a prerelease does. GitHub documents `latest` as the most recent non-prerelease, non-draft release by `created_at`, so both timestamps are recorded. The download URL is the alias `install.sh` actually fetches — a web redirect, not the API — so it is measured rather than assumed to agree:
+
+```sh
+( set -eu
+  fields='[.tag_name, (.prerelease|tostring), .created_at, .published_at] | @tsv'
+  # Somebody else's release schedule is the fixture, so the recipe stops unless
+  # it still poses the question: newest a prerelease, with a stable behind it.
+  gh api 'repos/neovim/neovim/releases?per_page=3' \
+    --jq 'if (.[0].prerelease and any(.[]; .prerelease | not)) then "ok" else "" end' \
+    | grep -qx ok || { echo "precondition gone — find another repository" >&2; exit 1; }
+
+  gh api 'repos/neovim/neovim/releases?per_page=3' --jq ".[] | $fields"
+  gh api repos/neovim/neovim/releases/latest --jq "$fields"
+  curl -sI https://github.com/neovim/neovim/releases/latest/download/nvim-linux-x86_64.tar.gz | grep -i '^location'
+)
+```
+
+Measured on 2026-09-05 with gh 2.98.0. The releases listing returned these, newest first; `releases/latest` returned the middle row; and the download URL redirected to `releases/download/v0.12.5/…`, the same release:
+
+| tag | prerelease | created_at | published_at |
+| --- | --- | --- | --- |
+| `nightly` | true | 2026-09-05T00:57:55Z | 2026-09-05T05:46:45Z |
+| `v0.12.5` | false | 2026-08-23T17:01:55Z | 2026-08-23T18:27:13Z |
+| `stable` | false | 2026-08-23T16:59:44Z | 2026-08-23T18:27:09Z |
+
+Re-run on 2026-09-12 the precondition still held, both answers were the same, and `nightly` had moved on to a 2026-09-11 build — the fixture drifting under the measurement, which is what the precondition is there to catch.
+
 ## Does a release asset download need `-L`?
 
 `install.sh` fetches with `curl -fsSL`, and `-f` fails on a 4xx or 5xx but not on a redirect — so if the `L` were ever dropped, the installer would carry on with whatever the first response contained. Whether that is a nicety or the whole download depends on what GitHub answers an asset URL with:
@@ -539,7 +744,7 @@ launchctl bootout "gui/$(id -u)/$missing";          echo "bootout missing: exit=
 | | |
 | --- | --- |
 | `print` on a loaded label | exit 0 |
-| `print` on a label the domain does not have | exit 113, `Could not find service "…" in domain for user gui: 501` on **stderr** |
+| `print` on a label the domain does not have | exit 113, and on **stderr** a bare `Bad request.` followed on the next line by `Could not find service "…" in domain for user gui: 501` |
 | `bootout` on a label the domain does not have | exit 3, `Boot-out failed: 3: No such process` |
 
 Two different codes for the same absence, which is why Engwire matches each against the command that produced it rather than sharing one predicate. Each predicate requires its row's code and message together; half a row may be the other command's answer, or none. `print` writes the whole job description to stdout, so the caller discards it and reads only stderr.
@@ -547,6 +752,72 @@ Two different codes for the same absence, which is why Engwire matches each agai
 `jobState` concludes absence only from both halves together — 113 *and* that message — and answers `unknown` for everything else rather than guessing at either. Three states because a question that failed is neither of the two answers launchd gives, and `uninstall` keeps away from the label on that third while saying only that launchd would not answer. Naming a job that is gone sends someone to `engwire service uninstall`, which tolerates an absent one; missing a job that is there leaves it supervising a runner after the user was told Engwire had been removed.
 
 What this does not establish: that 113 is a documented, stable contract. It is not in `launchctl`'s manual page, which is why the message is matched alongside it, and why the doubt resolves toward mentioning a service rather than toward silence.
+
+## Does a losing deadline keep the process alive?
+
+Two places race a deadline against work that may finish first: `capture` in `cli/doctor.ts`, and `createGh`. Whichever loses is never awaited again, and `Promise.race` does not cancel it — so whether the command can exit turns on whether a timer nobody cleans up still holds the event loop. Both places do clean theirs up, and the measurement below is why they have to. `engwire doctor`, `setup` and `service install` all run those probes, and all three are commands somebody is sitting and watching.
+
+Measured on macOS 15, Bun 1.4.0. Each script settles a race immediately and then does nothing; what is being timed is when the process exits, not when the race resolves:
+
+```sh
+# The work answers at once; the deadline is three seconds away.
+cat > sleep-race.ts <<'EOF'
+await Promise.race([Promise.resolve("done"), Bun.sleep(3000).then(() => null)]);
+console.log("raced at", Math.round(performance.now()), "ms");
+EOF
+
+# The same race, with a timer the script owns and unrefs.
+cat > settimeout-race.ts <<'EOF'
+let timer: ReturnType<typeof setTimeout> | undefined;
+const expired = new Promise<null>((resolve) => {
+  timer = setTimeout(() => resolve(null), 3000);
+  timer.unref();
+});
+await Promise.race([Promise.resolve("done"), expired]);
+console.log("raced at", Math.round(performance.now()), "ms");
+EOF
+
+# And a signal armed and abandoned, which is how `checkout_timeout` is built.
+echo 'AbortSignal.timeout(3000);' > abortsignal-timeout.ts
+
+for f in sleep-race settimeout-race abortsignal-timeout; do /usr/bin/time -p bun run $f.ts; done
+```
+
+| | race settles | process exits |
+| --- | --- | --- |
+| `Bun.sleep(3000)` as the losing side | 5 ms | **3.01 s** |
+| `setTimeout(…, 3000)` with `.unref()` | 2 ms | 0.00 s |
+| `AbortSignal.timeout(3000)`, armed and abandoned | — | 0.00 s |
+
+`Bun.sleep`'s timer is referenced, so a probe that answered promptly still held the runtime for the whole deadline. This is not theoretical: written that way, a `doctor` that had printed every row in 0.07 s took 20.4 s to return, on five sequential probes against a twenty-second deadline. `capture` therefore owns an explicit `setTimeout`, clears it when the answer arrives, and `unref`s it so a path that misses the clear cannot keep a finished command alive. `AbortSignal.timeout` needs neither, which is why `executeRun` composes one for `checkout_timeout` and does nothing further about it.
+
+`src/main.ts` sets `process.exitCode` rather than calling `process.exit`, so nothing forces the runtime down over a live handle — the difference above is the whole difference between a command that ends and one that waits.
+
+What this does not establish: that `Bun.sleep`'s referencing is documented or stable, or that the same holds on Linux. A test spawns `engwire doctor` and requires it to finish its probes and exit well inside the production deadline, guarding against regressions that leave a finished command waiting on live handles.
+
+## What `homedir()` does when there is no `HOME`
+
+`paths()` falls back to `homedir()` whenever neither `ENGWIRE_HOME`, the relevant XDG variable nor `HOME` supplies a root. If that fallback were empty, `join` would produce relative paths resolved against the working directory, which may be a checkout of the branch under review. Bun's `node:os` reference says POSIX `homedir()` uses `$HOME` whenever it is defined, so its documented reading of `HOME=` would produce that unsafe result.
+
+Measured on macOS 15, Bun 1.4.0, with Node 26 alongside for contrast:
+
+```sh
+for runtime in bun node; do
+  HOME=       "$runtime" -e 'console.log(JSON.stringify(require("os").homedir()))'
+  env -u HOME "$runtime" -e 'console.log(JSON.stringify(require("os").homedir()))'
+done
+```
+
+| | `HOME=""` | `HOME` unset |
+| --- | --- | --- |
+| Bun 1.4.0 | absolute home path | absolute home path |
+| Node 26.0.0 | `""` | absolute home path |
+
+Bun returns the account's absolute home path when `HOME` is empty; Node returns the empty string. Bun therefore gives Engwire an absolute fallback today, contrary to the documented rule. `paths.test.ts` covers both rows in child processes so a runtime change arrives as a failing test rather than a relative config path.
+
+`servicePathProblems` separately rejects an empty `HOME` and refuses installation when none of `ENGWIRE_HOME`, `XDG_DATA_HOME` or `HOME` identifies the data directory. The fallback still matters to foreground runs and to a service's config path when `XDG_DATA_HOME` alone identifies its data.
+
+What this does not establish: Bun's behavior on Linux. The test pins the property Engwire needs — an absolute root — rather than Bun's lookup mechanism.
 
 ## Where gh looks for its configuration, and what moves it
 
@@ -689,7 +960,7 @@ probe node -e 'try{require("evil")}catch(e){}'   # control
 
 Every row but the control loaded the file from the working directory. The two variables do it by different mechanisms, and the difference matters when describing what was shown: `NODE_OPTIONS` with `--require` or `--import` runs the file *before* the program it is loading into runs a line of its own, while `NODE_PATH` puts the directory on the search path, so a bare `require("evil")` the program performs itself resolves into the checkout. A review skill that runs `npm`, `npx` or a linter is a program full of bare lookups.
 
-Two mechanisms in one namespace, whose documented members keep growing, is the list-shaped mistake the `GIT_*` measurements above already caught once — so `runClaude` drops the whole `NODE_*` namespace rather than these two names.
+Two mechanisms in one namespace, whose documented members keep growing, is the list-shaped mistake the `GIT_*` measurements above already caught once — so Engwire drops the whole `NODE_*` namespace rather than these two names.
 
 The exposure also depends on how `claude` was installed, though the policy does not: the binary this was measured against reads none of it.
 
