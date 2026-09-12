@@ -1,18 +1,14 @@
 /**
- * @file Reserved extension authoring entry point: `import { definePlugin } from "engwire"`.
+ * @file Experimental extension authoring helper: `import { definePlugin } from "engwire"`.
  *
- * The package is private and there is no plugin runtime. Keep this module independent of the runner and runtime-specific APIs so future authors can import it outside Bun. The import boundary is checked in `plugin.test.ts`.
- *
- * Capability declarations belong with the future loader: they must provide enough static metadata to explain permissions before execution, and real workflows should determine their shape.
+ * The package is private and there is no plugin runtime or supported extension API. This retained design artifact has no runner dependencies; `plugin.test.ts` checks that import boundary. Possible extensions are sketched in docs/explorations/extensions.md.
  */
 
 /**
- * Plugin metadata. The planned canonical name comes from `.engwire/plugins/<name>/`, using the grammar in `workflow.schema.json` under `$defs/name`, so it is not duplicated here.
- *
- * Keep this type internal until authors need to name it; exporting it later is additive.
+ * Metadata accepted by the experimental helper. No runtime consumes it.
  */
 type Plugin = {
-  /** One-line summary intended for future listings; formatting is not validated here. */
+  /** Description text; formatting is not validated here. */
   description?: string;
 };
 

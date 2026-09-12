@@ -14,7 +14,7 @@ docs/adr/<NNNN>-<decision-slug>.md
 
 For example, `0012-snapshot-pr-head-on-claim.md` says more than `0012-revisions.md`. Allocate the next unused number and never reuse one.
 
-An ADR starts as `Proposed`, then becomes `Accepted` or `Rejected`. After acceptance, fix only errors that do not change the recorded decision, such as typos or broken links. If the decision changes, add a new ADR with status `Accepted`, mark the old one `Superseded by ADR-NNNN`, and link the two.
+An ADR starts as `Proposed`, then becomes `Accepted` or `Rejected`. After acceptance, fix only errors that do not change the recorded decision, such as typos or broken links. If the decision changes, add a new ADR with status `Accepted`, mark the old one `Superseded by ADR-NNNN`, and link the two. If only part of it changes, the old status names the superseded part and the new ADR names what it leaves standing.
 
 Do not manufacture a retrospective ADR from existing architecture prose unless the original context, decision, and alternatives can be recovered accurately. A neat fiction is still fiction.
 
