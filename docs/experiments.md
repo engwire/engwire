@@ -502,6 +502,21 @@ The first row is what the pipeline turns on, and it is worth measuring precisely
 
 Immutability freezes the tag only while the release exists, so it is not a substitute for a `v*` tag ruleset barring updates and deletions. The two cover different halves and Engwire keeps both.
 
+## Does a release asset download need `-L`?
+
+`install.sh` fetches with `curl -fsSL`, and `-f` fails on a 4xx or 5xx but not on a redirect — so if the `L` were ever dropped, the installer would carry on with whatever the first response contained. Whether that is a nicety or the whole download depends on what GitHub answers an asset URL with:
+
+```sh
+url=https://github.com/cli/cli/releases/download/v2.100.0/gh_2.100.0_macOS_arm64.zip
+curl -fsS  -I -o /dev/null -w 'code=%{http_code} hops=%{num_redirects}\n' "$url"
+curl -fsSL -I -o /dev/null -w 'code=%{http_code} hops=%{num_redirects} final=%{url_effective}\n' "$url"
+out=$(mktemp); curl -fsS -o "$out" "$url"; echo "exit=$?"; wc -c < "$out"; rm -f "$out"
+```
+
+Measured on 2026-09-12 against a public release asset of somebody else's project, since Engwire has none yet. The first returned `code=302 hops=0`; the second `code=200 hops=1`, landing on `release-assets.githubusercontent.com`; the third exited **0** having written a zero-byte file.
+
+So `-L` is the difference between an install and an empty file, and dropping it does not announce itself: `curl` succeeds, and the installer fails a step later in `gzip`, complaining about a truncated download rather than a download that never happened. `test/integration/install.test.ts` pins the flag, since the stub that stands in for `curl` cannot notice a redirect it was never asked to follow.
+
 ## Can launchd be asked whether a job is loaded?
 
 The plist is Engwire's durable record of a service, and it is not the job: `launchctl bootstrap` loads a copy, and deleting the file afterwards leaves the job running with nothing on disk pointing at it. `engwire uninstall` is where that gap is expensive — reporting no service and then "Removed." over a supervised runner is the one answer that command must not give — so it asks launchd directly when it finds no plist. That only works if a missing label is distinguishable from a failure to ask.
