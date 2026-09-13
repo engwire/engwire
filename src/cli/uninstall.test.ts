@@ -1,5 +1,14 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, relative } from "node:path";
@@ -7,6 +16,21 @@ import { paths } from "../config/paths.ts";
 import { acquireLock } from "../service/lock.ts";
 import type { InstalledPlist, JobState } from "../service/launchd.ts";
 import { uninstall } from "./uninstall.ts";
+
+/**
+ * Whether this volume spells one directory two ways. macOS is case-insensitive
+ * by default and APFS can be formatted either way, so the alias below is a real
+ * layout here and not a layout at all on a case-sensitive checkout.
+ */
+const ALIASES_CASE = (() => {
+  const probe = mkdtempSync(join(tmpdir(), "engwire-case-"));
+  try {
+    mkdirSync(join(probe, "Probe"));
+    return existsSync(join(probe, "probe"));
+  } finally {
+    rmSync(probe, { recursive: true, force: true });
+  }
+})();
 
 let dir: string;
 let home: string | undefined;
@@ -92,6 +116,46 @@ describe("uninstall", () => {
     expect(existsSync(dataDir)).toBe(true);
     expect(existsSync(configDir)).toBe(true);
     expect(removed).toBe(0);
+  });
+
+  test("a claimable job with no plist left is not previewed as nothing", async () => {
+    // The supplied ownership answer still requires action even though no plist
+    // can be listed. Confirmation will call remove(), which revalidates it.
+    const { code, said } = await run(false);
+
+    expect(code).toBe(0);
+    expect(said).not.toContain("Nothing here belongs");
+    expect(said).toContain("engwire uninstall --yes");
+    // And no data was described: there is none, and this command is read by
+    // people whose installation is already in pieces.
+    expect(said).not.toContain("Data holds Engwire's own clones");
+  });
+
+  test("--yes over an installation that was never here does nothing at all", async () => {
+    // Acquiring a lock here would create the absent data directory, or fail
+    // if its parent were unwritable, despite there being nothing to remove.
+    service = { whose: "none" };
+
+    const { code, said } = await run(true);
+
+    expect(code).toBe(0);
+    expect(said).toBe(
+      "Nothing here belongs to this installation: no service it can claim, no data, no config.\n",
+    );
+    expect(existsSync(paths().dataDir)).toBe(false);
+  });
+
+  test("an installation that was never here says so, and says only that", async () => {
+    // Clear the fixture's claimed service too: no inventory and no claim means
+    // one sentence, with no leading separator.
+    service = { whose: "none" };
+
+    const { code, said } = await run(false);
+
+    expect(code).toBe(0);
+    expect(said).toBe(
+      "Nothing here belongs to this installation: no service it can claim, no data, no config.\n",
+    );
   });
 
   test("--yes removes the service, the data and the config", async () => {
@@ -301,9 +365,9 @@ describe("uninstall", () => {
 
   test("a kept orphan is not followed by a sentence denying it", async () => {
     // Nothing of this installation's is left, but launchd still has a job —
-    // and the summary is about what this installation owns, not about what the
-    // machine has. "No service" two lines under "Service loaded" is the kind of
-    // contradiction that makes someone stop believing the rest of the output.
+    // and the summary is about what this installation can claim, not about what
+    // the machine has. "No service" two lines under "Service loaded" is the kind
+    // of contradiction that makes someone stop believing the rest of the output.
     service = { whose: "none" };
     job = "loaded";
 
@@ -315,12 +379,19 @@ describe("uninstall", () => {
     expect(said).not.toContain("no service, data or config");
   });
 
-  test("an installation that was never made has nothing to remove", async () => {
+  test("a lock symlink that resolves to itself is refused, not crashed into", async () => {
+    // Resolution must tolerate a cycle long enough for the lock-entry check
+    // to report the actionable refusal rather than throwing ELOOP.
+    const p = paths();
+    mkdirSync(p.dataDir, { recursive: true });
+    mkdirSync(dirname(p.configFile), { recursive: true });
+    writeFileSync(p.configFile, "");
+    symlinkSync(p.lockFile, p.lockFile);
+
     const { code, said } = await run(false);
 
     expect(code).toBe(0);
-    expect(said).toContain("belongs to this installation");
-    expect(removed).toBe(0);
+    expect(said).toContain("the runner lock is a symlink");
   });
 
   test("a symlinked removal root is unlinked and reported, not followed", async () => {
@@ -528,7 +599,11 @@ describe("uninstall", () => {
     const { code, said } = await run(true);
 
     expect(code).toBe(1);
-    expect(said).toContain("spelling of the same location");
+    // The shared rule's own sentence, and this command's consequence after it:
+    // the refusal quotes the cause rather than restating it, so a second cause
+    // arrives explained instead of mislabelled.
+    expect(said).toContain("which is a relative path");
+    expect(said).toContain("would delete whatever happens to sit");
     expect(removed).toBe(0);
     expect(existsSync(join(p.dataDir, "a-clone"))).toBe(true);
   });
@@ -567,6 +642,262 @@ describe("uninstall", () => {
       Object.assign(process.env, before);
     }
   });
+
+  test("the config root nested inside the data root is refused as well", async () => {
+    // Config physically beneath data, with the lock outside the config tree.
+    // Either resolved overlap or entry identity has to refuse two trees that are
+    // one, whichever of them sees it first.
+    const before = { ...process.env };
+    delete process.env.ENGWIRE_HOME;
+    process.env.XDG_DATA_HOME = join(dir, "root");
+    process.env.XDG_CONFIG_HOME = join(dir, "root", "engwire", "cfg");
+    try {
+      const p = paths();
+      mkdirSync(p.dataDir, { recursive: true });
+      mkdirSync(dirname(p.configFile), { recursive: true });
+      writeFileSync(join(p.dataDir, "a-clone"), "private source");
+      writeFileSync(p.configFile, "");
+
+      const plain = await run(false);
+      expect(plain.code).toBe(0);
+      expect(plain.said).toContain("inside the other");
+
+      const { code, said } = await run(true);
+
+      expect(code).toBe(1);
+      expect(said).toContain("would swallow");
+      expect(removed).toBe(0);
+      // Both roots, because a removal that ran before the refusal took either
+      // one of them, and the one that is nested is the one a partial run would
+      // reach first.
+      expect(existsSync(join(p.dataDir, "a-clone"))).toBe(true);
+      expect(existsSync(p.configFile)).toBe(true);
+    } finally {
+      for (const key of ["XDG_DATA_HOME", "XDG_CONFIG_HOME"]) delete process.env[key];
+      Object.assign(process.env, before);
+    }
+  });
+
+  test("a data root whose entry sits in the config tree is refused", async () => {
+    // A data root spelled inside the config tree and linking out of it, so the
+    // lock resolves nowhere near config and that question is satisfied. What
+    // still objects is that removing config unlinks the data root's own entry.
+    const before = { ...process.env };
+    delete process.env.ENGWIRE_HOME;
+    process.env.XDG_CONFIG_HOME = join(dir, "cfg");
+    process.env.XDG_DATA_HOME = join(dir, "cfg", "engwire", "store");
+    try {
+      const p = paths();
+      const elsewhere = join(dir, "elsewhere");
+      mkdirSync(elsewhere, { recursive: true });
+      writeFileSync(join(elsewhere, "a-clone"), "private source");
+      mkdirSync(dirname(p.dataDir), { recursive: true });
+      symlinkSync(elsewhere, p.dataDir);
+      mkdirSync(dirname(p.configFile), { recursive: true });
+      writeFileSync(p.configFile, "");
+
+      const plain = await run(false);
+      expect(plain.code).toBe(0);
+      expect(plain.said).toContain("inside the other");
+
+      const { code, said } = await run(true);
+
+      expect(code).toBe(1);
+      expect(said).toContain("would swallow");
+      expect(removed).toBe(0);
+      // The link itself, not only what it points at: removing the config tree
+      // would unlink the data root while leaving the target untouched, which a
+      // sentinel at the far end cannot see.
+      expect(lstatSync(p.dataDir).isSymbolicLink()).toBe(true);
+      expect(existsSync(p.configFile)).toBe(true);
+      expect(existsSync(join(elsewhere, "a-clone"))).toBe(true);
+    } finally {
+      for (const key of ["XDG_DATA_HOME", "XDG_CONFIG_HOME"]) delete process.env[key];
+      Object.assign(process.env, before);
+    }
+  });
+
+  test("a config root that is itself a link, with the data root spelled through it", async () => {
+    // Resolving the data root's ancestors hides that its path crosses the
+    // config symlink. Unlinking config first would strand the private clones
+    // and let the now-missing data path look successfully removed.
+    const before = { ...process.env };
+    delete process.env.ENGWIRE_HOME;
+    process.env.XDG_CONFIG_HOME = join(dir, "cfg");
+    process.env.XDG_DATA_HOME = join(dir, "cfg", "engwire", "store");
+    try {
+      const p = paths();
+      const configDir = dirname(p.configFile);
+      const target = join(dir, "target");
+      mkdirSync(join(target, "store", "engwire"), { recursive: true });
+      writeFileSync(join(target, "store", "engwire", "a-clone"), "private source");
+      writeFileSync(join(target, "config.toml"), "");
+      mkdirSync(dirname(configDir), { recursive: true });
+      symlinkSync(target, configDir);
+
+      const plain = await run(false);
+      expect(plain.code).toBe(0);
+      expect(plain.said).toContain("inside the other");
+
+      const { code, said } = await run(true);
+
+      expect(code).toBe(1);
+      expect(said).toContain("would swallow");
+      expect(removed).toBe(0);
+      expect(lstatSync(configDir).isSymbolicLink()).toBe(true);
+      expect(existsSync(join(target, "store", "engwire", "a-clone"))).toBe(true);
+    } finally {
+      for (const key of ["XDG_DATA_HOME", "XDG_CONFIG_HOME"]) delete process.env[key];
+      Object.assign(process.env, before);
+    }
+  });
+
+  test("a data root that resolves into the config tree without being spelled there", async () => {
+    // What the resolved comparison is for, and the only shape that isolates it.
+    // Two links: the data root's parent points into the config tree, and the
+    // data root itself points back out — so the spelling is nowhere near config,
+    // `resolveDeepest` follows both and puts the lock outside it, and the only
+    // thing that sees the entanglement is `entry`, which resolves the parent and
+    // leaves the root's own name alone. Removing config would take that name.
+    const before = { ...process.env };
+    delete process.env.ENGWIRE_HOME;
+    process.env.XDG_CONFIG_HOME = join(dir, "cfg");
+    process.env.XDG_DATA_HOME = join(dir, "outside", "link");
+    try {
+      const p = paths();
+      const configDir = dirname(p.configFile);
+      const elsewhere = join(dir, "elsewhere");
+      mkdirSync(elsewhere, { recursive: true });
+      writeFileSync(join(elsewhere, "a-clone"), "private source");
+      mkdirSync(join(configDir, "inner"), { recursive: true });
+      writeFileSync(p.configFile, "");
+      mkdirSync(join(dir, "outside"), { recursive: true });
+      symlinkSync(join(configDir, "inner"), join(dir, "outside", "link"));
+      // The data root's own last component, which `entry` leaves alone and
+      // `resolveDeepest` follows: the whole difference between the two answers.
+      symlinkSync(elsewhere, join(configDir, "inner", "engwire"));
+
+      const plain = await run(false);
+      expect(plain.code).toBe(0);
+      expect(plain.said).toContain("inside the other");
+
+      const { code, said } = await run(true);
+
+      expect(code).toBe(1);
+      expect(said).toContain("would swallow");
+      expect(removed).toBe(0);
+      expect(lstatSync(p.dataDir).isSymbolicLink()).toBe(true);
+      expect(existsSync(p.configFile)).toBe(true);
+      expect(existsSync(join(elsewhere, "a-clone"))).toBe(true);
+    } finally {
+      for (const key of ["XDG_DATA_HOME", "XDG_CONFIG_HOME"]) delete process.env[key];
+      Object.assign(process.env, before);
+    }
+  });
+
+  test.skipIf(!ALIASES_CASE)(
+    "a data root linking into differently cased config is refused for the lock",
+    async () => {
+      // The two roots really are separate here, by spelling and by entry — what
+      // is not separate is the lock. `acquireLock` writes through the link, so
+      // the real file sits inside the config tree under a casing no string
+      // comparison matches, and the config pass would delete the pathname this
+      // command is holding. Measured: it reported the link as gone with nothing
+      // removed through it, while the config pass had already taken everything
+      // at the far end.
+      const before = { ...process.env };
+      delete process.env.ENGWIRE_HOME;
+      process.env.XDG_CONFIG_HOME = join(dir, "cfg");
+      process.env.XDG_DATA_HOME = join(dir, "outside");
+      try {
+        const p = paths();
+        mkdirSync(join(dir, "cfg", "Engwire", "store"), { recursive: true });
+        writeFileSync(p.configFile, "");
+        writeFileSync(join(dir, "cfg", "Engwire", "store", "a-clone"), "private source");
+        mkdirSync(join(dir, "outside"), { recursive: true });
+        symlinkSync(join(dir, "cfg", "Engwire", "store"), p.dataDir);
+
+        const { code, said } = await run(true);
+
+        expect(code).toBe(1);
+        expect(said).toContain("would swallow");
+        expect(removed).toBe(0);
+        expect(existsSync(join(dir, "cfg", "Engwire", "store", "a-clone"))).toBe(true);
+        expect(existsSync(p.configFile)).toBe(true);
+      } finally {
+        for (const key of ["XDG_DATA_HOME", "XDG_CONFIG_HOME"]) delete process.env[key];
+        Object.assign(process.env, before);
+      }
+    },
+  );
+
+  test.skipIf(!ALIASES_CASE)(
+    "a config root under a differently cased data root is refused as well",
+    async () => {
+      // The mirror of the case above, and the reason entry identity is asked
+      // both ways round: here it is the *data* root whose casing differs, with
+      // config nested below it. Nothing is stranded — the data pass swallows
+      // config — but a removal that reports two separate trees when there was
+      // one is the thing this refusal exists to stop saying.
+      const before = { ...process.env };
+      delete process.env.ENGWIRE_HOME;
+      process.env.XDG_DATA_HOME = join(dir, "x");
+      process.env.XDG_CONFIG_HOME = join(dir, "x", "Engwire", "cfg");
+      try {
+        const p = paths();
+        mkdirSync(join(dir, "x", "Engwire"), { recursive: true });
+        mkdirSync(dirname(p.configFile), { recursive: true });
+        writeFileSync(p.configFile, "");
+        writeFileSync(join(p.dataDir, "a-clone"), "private source");
+
+        const { code, said } = await run(true);
+
+        expect(code).toBe(1);
+        expect(said).toContain("would swallow");
+        expect(removed).toBe(0);
+        expect(existsSync(join(p.dataDir, "a-clone"))).toBe(true);
+        expect(existsSync(p.configFile)).toBe(true);
+      } finally {
+        for (const key of ["XDG_DATA_HOME", "XDG_CONFIG_HOME"]) delete process.env[key];
+        Object.assign(process.env, before);
+      }
+    },
+  );
+
+  test.skipIf(!ALIASES_CASE)(
+    "a config root the data root reaches through under another casing is refused",
+    async () => {
+      // String comparisons miss this alias. The ancestor walk must recognise
+      // the same entry by device and inode before config deletion takes data too.
+      const before = { ...process.env };
+      delete process.env.ENGWIRE_HOME;
+      process.env.XDG_CONFIG_HOME = join(dir, "cfg");
+      process.env.XDG_DATA_HOME = join(dir, "cfg", "Engwire", "store");
+      try {
+        const p = paths();
+        // On disk as `Engwire`; `paths()` always spells it `engwire`.
+        mkdirSync(join(dir, "cfg", "Engwire"), { recursive: true });
+        mkdirSync(p.dataDir, { recursive: true });
+        writeFileSync(join(p.dataDir, "a-clone"), "private source");
+        writeFileSync(p.configFile, "");
+
+        const plain = await run(false);
+        expect(plain.code).toBe(0);
+        expect(plain.said).toContain("inside the other");
+
+        const { code, said } = await run(true);
+
+        expect(code).toBe(1);
+        expect(said).toContain("would swallow");
+        expect(removed).toBe(0);
+        expect(existsSync(join(p.dataDir, "a-clone"))).toBe(true);
+        expect(existsSync(p.configFile)).toBe(true);
+      } finally {
+        for (const key of ["XDG_DATA_HOME", "XDG_CONFIG_HOME"]) delete process.env[key];
+        Object.assign(process.env, before);
+      }
+    },
+  );
 
   test("a data root linked into the config tree is refused", async () => {
     // `overlaps` leaves a root symlink unresolved, which is right for removal —
@@ -715,23 +1046,20 @@ describe("uninstall", () => {
     expect(said).toContain("nothing was removed through it");
   });
 
-  test("--yes over nothing does not claim a removal", async () => {
-    // The plain invocation already answers this honestly; `--yes` said
-    // "Removed." over an installation that was never here. Nothing on disk and
-    // no service to boot out means nothing happened, whatever was typed.
-    service = { whose: "none" };
+  test("a verdict with no inventory above it does not open with a blank line", async () => {
+    // The mock refuses revalidation with no inventory printed. The error must
+    // stand alone, without a separator intended for preceding inventory rows.
+    changedHands = true;
 
     const { code, said } = await run(true);
 
-    expect(code).toBe(0);
-    expect(said).not.toContain("Removed.");
-    expect(said).toContain("belongs to this installation");
+    expect(code).toBe(1);
+    expect(said.startsWith("The launchd job could no longer be claimed")).toBe(true);
   });
 
   test("--yes still reports a removal when a service was claimed", async () => {
-    // A plist that vanished between the read and the delete leaves nothing to
-    // list, but `remove` boots the job out regardless — that is something
-    // happening, and the honest word for it is "Removed."
+    // The mock reports successful removal despite an empty inventory. Count
+    // that result; real remove() revalidates the plist before it can succeed.
     const { code, said } = await run(true);
 
     expect(code).toBe(0);

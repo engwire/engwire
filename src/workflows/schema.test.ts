@@ -24,7 +24,7 @@ function problems(workflow: unknown): string[] {
 
 describe("workflow.schema.json", () => {
   test("uses the canonical schema identifier", () => {
-    // Moving one without the other strands every published workflow.
+    // Keep the schema identifier and the value `$schema` accepts in sync.
     expect(schema.$id).toBe("https://engwire.com/schemas/workflow.json");
     expect(schema.properties.$schema.const).toBe(schema.$id);
   });
@@ -79,9 +79,8 @@ describe("workflow.schema.json", () => {
     expect(problems({ ...example(), steps: [] })).not.toEqual([]);
   });
 
-  test("required keys stay fixed and description is optional", () => {
-    // Pin required keys explicitly alongside the valid examples. These checks do not prove
-    // grow-only compatibility: constraint changes still need schema review (ADR-0002).
+  test("pins the current required keys and keeps description optional", () => {
+    // Assert the current format; compatibility is not guaranteed (ADR-0003).
     expect(new Set(schema.required)).toEqual(new Set(["title", "on", "steps"]));
     expect(schema.properties.on.additionalProperties.required).toEqual(["event"]);
     expect(schema.properties.steps.items.required).toEqual(["uses"]);

@@ -6,7 +6,7 @@ import { skillPreflightProblem } from "../claude/skills.ts";
 import { loadConfig, type Config } from "../config/config.ts";
 import { paths } from "../config/paths.ts";
 import { cloneUrl } from "../git/repository.ts";
-import { createGh, GhError, type Gh } from "../github/gh.ts";
+import { createGh, GhAnswerError, GhError, looksLikeLogin, type Gh } from "../github/gh.ts";
 import type { Runtime } from "../review/execute.ts";
 import { runLoop, sleep, tickOnce } from "../review/loop.ts";
 import { acquireLock, LockedError } from "../service/lock.ts";
@@ -14,13 +14,9 @@ import { Store } from "../store/store.ts";
 import { VERSION } from "../version.ts";
 
 /**
- * Resolve the GitHub account, waiting rather than exiting.
- *
- * A laptop that boots without a network would otherwise take the runner down
- * before the polling loop — which handles exactly this failure gracefully —
- * exists at all, and launchd would restart it into the same wall until it
- * throttled. Inside the loop a GitHub outage is a logged tick; it should not be
- * fatal ten lines earlier. Returns null if shutdown was requested while waiting.
+ * Retry startup invocation failures at the poll interval so a runner can boot
+ * offline. Malformed successful answers and local failures escape; shutdown
+ * returns null. Log the outage once while waiting.
  */
 async function waitForLogin(
   gh: Gh,
@@ -33,10 +29,11 @@ async function waitForLogin(
     try {
       return await gh.login();
     } catch (error) {
-      // Only a failed `gh` invocation is worth waiting out. A `gh` that cannot
-      // be spawned at all is a misconfigured path, and retrying it once a
-      // minute forever would hide that behind "waiting for GitHub".
-      if (!(error instanceof GhError)) throw error;
+      // Cancellation of an in-flight call is shutdown, not a GitHub outage.
+      if (error instanceof GhError && signal.aborted) return null;
+      // A spawn failure or malformed successful answer needs attention, not
+      // indefinite retries. A misconfigured gh_bin wrapper is one possible cause.
+      if (error instanceof GhAnswerError || !(error instanceof GhError)) throw error;
       if (!reported) {
         log(`waiting for GitHub: ${error.message}`);
         reported = true;
@@ -113,20 +110,26 @@ export async function run(options: { once: boolean }): Promise<number> {
     const config = await loadConfig(p.configFile);
     if (!usable(config, p.configFile)) return 1;
     store = new Store(p.dbFile);
-    const gh = createGh(config.advanced.ghBin);
+    // Interrupt in-flight calls too, including the identity check immediately
+    // before the agent starts; otherwise shutdown waits for gh's deadline.
+    const gh = createGh(config.advanced.ghBin, { signal: controller.signal });
     // Before GitHub is consulted, because none of it needs GitHub and all of it
     // is about this process starting. Waiting first would mean a runner that
     // booted offline began watching whenever the network returned — losing
     // every request made in between — while `status` showed the previous
     // process's pid and a crashed run stayed `running`.
+    const startedAt = new Date();
     store.recordRunner({
       pid: process.pid,
-      startedAt: new Date().toISOString(),
+      startedAt: startedAt.toISOString(),
       version: VERSION,
     });
-    // Reached only after the config was found to have rules, which is what
-    // makes this the moment watching begins.
-    store.watchingSince();
+    // Pass the exact start time so the returned watermark can identify the
+    // first runner. Announce it beside the write: GitHub may remain unreachable
+    // long afterwards, but requests made from this boundary are eligible.
+    if (store.watchingSince(startedAt) === startedAt.toISOString()) {
+      log("watching from now — review requests made earlier are not reviewed");
+    }
     // Once, here, where "this process just started" is known. Anything the
     // database still calls `running` belongs to a runner that is gone.
     store.recoverInterrupted(
@@ -142,6 +145,19 @@ export async function run(options: { once: boolean }): Promise<number> {
 
     const owner = store.bindReviewer(login);
     if (owner !== login) {
+      // No `gh auth switch` can match an owner that is not an account, and the
+      // binding is written once and never moved, so the advice below it would
+      // name a command nobody can run. Only reachable for a database already
+      // holding such an owner: `gh.login()` refuses that answer now.
+      if (!looksLikeLogin(owner)) {
+        console.error(
+          `This Engwire installation is bound to ${JSON.stringify(owner)}, which is not a GitHub account, so nothing can ever match it.`,
+        );
+        console.error(
+          "Point ENGWIRE_HOME at a fresh installation, or remove this one with `engwire uninstall --yes`.",
+        );
+        return 1;
+      }
       console.error(
         `This Engwire installation watches review requests for ${owner}, but gh is authenticated as ${login}.`,
       );
@@ -162,6 +178,15 @@ export async function run(options: { once: boolean }): Promise<number> {
       signal: controller.signal,
     };
 
+    // Before either mode, because "it ran and found nothing" and "it never ran"
+    // are the same silence, and `run --once` is the command someone types to
+    // tell those apart.
+    runtime.log(
+      options.once
+        ? `engwire ${VERSION} polling once for ${login}`
+        : `engwire ${VERSION} watching review requests for ${login}`,
+    );
+
     if (options.once) {
       await tickOnce(runtime);
       if (shutdownCode) return shutdownCode;
@@ -180,10 +205,15 @@ export async function run(options: { once: boolean }): Promise<number> {
       return ok ? 0 : 1;
     }
 
-    runtime.log(`engwire ${VERSION} watching review requests for ${runtime.login}`);
     await runLoop(runtime);
     runtime.log("stopped");
     return shutdownCode;
+  } catch (error) {
+    // In-flight gh cancellation rejects before the between-step checks,
+    // especially in --once. Preserve 130/143 on shutdown, even if an independent
+    // gh failure coincides with it; ordinary outages and local errors still fail.
+    if (error instanceof GhError && controller.signal.aborted) return shutdownCode;
+    throw error;
   } finally {
     // Removed on every path, not only the signalled one: `run` returns to a
     // caller, and a listener left behind would catch a signal meant for

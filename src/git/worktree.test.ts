@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, statSync, writeFileSync } from "nod
 import { chmod, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createOrigin, type Origin } from "../../test/fixtures/repo.ts";
+import { createOrigin, NO_DEADLINE, type Origin } from "../../test/fixtures/repo.ts";
 import { git } from "./repository.ts";
 import { prepareRevision, removeWorktree } from "./worktree.ts";
 
@@ -21,11 +21,14 @@ afterEach(async () => {
   if (globalConfig === undefined) delete process.env.GIT_CONFIG_GLOBAL;
   else process.env.GIT_CONFIG_GLOBAL = globalConfig;
   delete process.env.GIT_DIR;
+  if (execPath === undefined) delete process.env.GIT_EXEC_PATH;
+  else process.env.GIT_EXEC_PATH = execPath;
   await rm(dir, { recursive: true, force: true });
 });
 
 function where(name = "run-1") {
   return {
+    signal: NO_DEADLINE,
     pullNumber: 42,
     repoDir: join(dir, "repos", "acme", "api.git"),
     worktreeDir: join(dir, "worktrees", name),
@@ -35,6 +38,7 @@ function where(name = "run-1") {
 }
 
 const globalConfig = process.env.GIT_CONFIG_GLOBAL;
+const execPath = process.env.GIT_EXEC_PATH;
 
 /**
  * A reviewer's own git configuration, without touching theirs.
@@ -52,16 +56,16 @@ function reviewerGlobalConfig(contents: string): void {
 /** An origin whose `.gitattributes` points each file at one of the named filters. */
 async function originNaming(...filters: string[]): Promise<string> {
   const work = join(dir, "hostile");
-  await git(["init", "-b", "main", work], dir);
-  await git(["config", "user.email", "t@example.com"], work);
-  await git(["config", "user.name", "T"], work);
+  await git(["init", "-b", "main", work], dir, NO_DEADLINE);
+  await git(["config", "user.email", "t@example.com"], work, NO_DEADLINE);
+  await git(["config", "user.name", "T"], work, NO_DEADLINE);
   const attributes = filters.map((filter) => `${filter}.txt filter=${filter}\n`);
   await Bun.write(join(work, ".gitattributes"), attributes.join(""));
   for (const filter of filters) {
     await Bun.write(join(work, `${filter}.txt`), "content\n");
   }
-  await git(["add", "-A"], work);
-  await git(["commit", "-m", "hostile"], work);
+  await git(["add", "-A"], work, NO_DEADLINE);
+  await git(["commit", "-m", "hostile"], work, NO_DEADLINE);
   return work;
 }
 
@@ -101,7 +105,7 @@ describe("prepareRevision", () => {
     // of the two git reached first. Both names carry an `=`, which a subsection
     // may legally contain and which `-c key=value` would misparse.
     const work = await originNaming("smudge=x", "process=x");
-    const sha = (await git(["rev-parse", "HEAD"], work)).trim();
+    const sha = (await git(["rev-parse", "HEAD"], work, NO_DEADLINE)).trim();
     reviewerGlobalConfig(
       `[filter "smudge=x"]\n\tsmudge = ${marker("smudge-ran")}\n\trequired = true\n` +
         `[filter "process=x"]\n\tprocess = ${marker("process-ran")}\n\trequired = true\n`,
@@ -145,14 +149,48 @@ describe("prepareRevision", () => {
     await prepareRevision({ ...where("run-1"), sha: origin.sha });
     reviewerGlobalConfig(
       `[core]\n\thooksPath = ${hooks}\n\tfsmonitor = ${marker("fsmonitor-ran")}\n` +
-        `[hook "tidy=x"]\n${events}\tcommand = ${marker("confighook-ran")}\n`,
+        `[hook "tidy=x"]\n${events}\tcommand = ${marker("confighook-ran")}\n` +
+        // Named after an event and declaring no `event` of its own, which is
+        // the one shape the override cannot reach: the key to disable a
+        // configured hook is keyed by its *name*, so Engwire scrapes the names
+        // out of `hook.<name>.event` and this section has none to scrape.
+        // Measured inert — git binds a hook by that key and not by what the
+        // section is called (experiments.md) — so this asserts the composition
+        // rather than the override: what has to stay true is that no program
+        // of the reviewer's runs, and if a later git ever binds by name it
+        // should be this that says so rather than somebody's checkout.
+        `[hook "${FIRING_EVENTS[0]}"]\n\tcommand = ${marker("namedhook-ran")}\n`,
     );
 
     await prepareRevision({ ...where("run-2"), sha: origin.sha });
 
     expect(existsSync(join(dir, "hook-ran"))).toBe(false);
     expect(existsSync(join(dir, "confighook-ran"))).toBe(false);
+    expect(existsSync(join(dir, "namedhook-ran"))).toBe(false);
     expect(existsSync(join(dir, "fsmonitor-ran"))).toBe(false);
+  });
+
+  test("the repository Engwire creates holds none of the reviewer's programs", async () => {
+    // `init.templateDir` is how the husky and pre-commit crowd share hooks
+    // across their own repositories, and `clone` copies its `hooks/` into every
+    // repository it creates — Engwire's bare clone included. Those copies never
+    // fire, because every git below pins `core.hooksPath` at `/dev/null`; that
+    // is a property of each command remembering to, where this is a property of
+    // the directory, and a file that is not there cannot be run by a command
+    // that forgets.
+    const template = join(dir, "reviewer-template", "hooks");
+    mkdirSync(template, { recursive: true });
+    for (const event of ["post-checkout", ...FIRING_EVENTS]) {
+      await Bun.write(join(template, event), `#!/bin/sh\ncat > /dev/null\n`);
+      await Bun.$`chmod +x ${join(template, event)}`.quiet();
+    }
+    reviewerGlobalConfig(`[init]\n\ttemplateDir = ${join(dir, "reviewer-template")}\n`);
+
+    await prepareRevision({ ...where(), sha: origin.sha });
+
+    for (const event of ["post-checkout", ...FIRING_EVENTS]) {
+      expect(existsSync(join(dir, "repos", "acme", "api.git", "hooks", event))).toBe(false);
+    }
   });
 
   test("acquiring the repository does not run the reviewer's hooks either", async () => {
@@ -183,7 +221,7 @@ describe("prepareRevision", () => {
     // anything enumerating the clone, which is why the checkout is overridden
     // against its own gitdir rather than the clone's.
     const work = await originNaming("scoped");
-    const sha = (await git(["rev-parse", "HEAD"], work)).trim();
+    const sha = (await git(["rev-parse", "HEAD"], work, NO_DEADLINE)).trim();
     const scoped = join(dir, "worktrees-only.gitconfig");
     writeFileSync(
       scoped,
@@ -197,18 +235,39 @@ describe("prepareRevision", () => {
     expect(existsSync(join(dir, "scoped-ran"))).toBe(false);
   });
 
+  test("an exported GIT_EXEC_PATH does not choose the programs git runs", async () => {
+    // The half a list of repository selectors missed. `GIT_EXEC_PATH` is where
+    // git looks for its own helpers, so an ambient one replaces the program an
+    // https fetch runs — measured, and a cleaned `PATH` does not reach it. Same
+    // shape as `GIT_SSH_COMMAND` and `GIT_ASKPASS`: the environment naming a
+    // program to execute, in a command run against somebody else's branch.
+    const helpers = join(dir, "reviewer-exec");
+    const ran = join(dir, "helper-ran");
+    mkdirSync(helpers, { recursive: true });
+    for (const helper of ["git-remote-https", "git-remote-http", "git-upload-pack"]) {
+      await Bun.write(join(helpers, helper), `#!/bin/sh\necho ran > ${ran}\nexit 1\n`);
+      await Bun.$`chmod +x ${join(helpers, helper)}`.quiet();
+    }
+    process.env.GIT_EXEC_PATH = helpers;
+
+    const path = await prepareRevision({ ...where(), sha: origin.sha });
+
+    expect(existsSync(ran)).toBe(false);
+    expect((await git(["rev-parse", "HEAD"], path, NO_DEADLINE)).trim()).toBe(origin.sha);
+  });
+
   test("an exported GIT_DIR does not aim the checkout somewhere else", async () => {
     // git honours `GIT_DIR` over the working directory, so a run started from a
     // git hook — or from a shell that exports it — would otherwise build the
     // worktree inside whichever repository the reviewer was standing in.
     const decoy = join(dir, "decoy.git");
-    await git(["init", "--bare", decoy], dir);
+    await git(["init", "--bare", decoy], dir, NO_DEADLINE);
     process.env.GIT_DIR = decoy;
 
     const path = await prepareRevision({ ...where(), sha: origin.sha });
 
-    expect((await git(["rev-parse", "HEAD"], path)).trim()).toBe(origin.sha);
-    expect(await git(["worktree", "list", "--porcelain"], decoy)).not.toContain(path);
+    expect((await git(["rev-parse", "HEAD"], path, NO_DEADLINE)).trim()).toBe(origin.sha);
+    expect(await git(["worktree", "list", "--porcelain"], decoy, NO_DEADLINE)).not.toContain(path);
   });
 
   test("checks out the exact claimed revision", async () => {
@@ -216,7 +275,7 @@ describe("prepareRevision", () => {
 
     expect(path).toBe(where().worktreeDir);
     expect(await Bun.file(join(path, "README.md")).text()).toBe("# widgets\n");
-    expect((await git(["rev-parse", "HEAD"], path)).trim()).toBe(origin.sha);
+    expect((await git(["rev-parse", "HEAD"], path, NO_DEADLINE)).trim()).toBe(origin.sha);
   });
 
   test("reuses the clone for a second revision of the same repository", async () => {
@@ -237,9 +296,28 @@ describe("prepareRevision", () => {
   });
 
   test("never touches the origin repository", async () => {
-    const before = await git(["rev-parse", "HEAD"], origin.url);
+    const before = await git(["rev-parse", "HEAD"], origin.url, NO_DEADLINE);
     await prepareRevision({ ...where(), sha: origin.sha });
-    expect(await git(["rev-parse", "HEAD"], origin.url)).toBe(before);
+    expect(await git(["rev-parse", "HEAD"], origin.url, NO_DEADLINE)).toBe(before);
+  });
+});
+
+describe("a checkout that is stopped", () => {
+  test("prepareRevision fails rather than producing a half-written worktree", async () => {
+    // The signal reaches every command, not only the first: `prepareRevision`
+    // runs four or five of them, and the caller is waiting on the directory,
+    // not on any one of them.
+    const failure = await prepareRevision({
+      ...where(),
+      sha: origin.sha,
+      signal: AbortSignal.abort(),
+    }).then(
+      () => null,
+      (thrown: unknown) => thrown,
+    );
+
+    expect((failure as Error).name).toBe("GitAborted");
+    expect(existsSync(join(dir, "worktrees", "run-1"))).toBe(false);
   });
 });
 
@@ -251,7 +329,7 @@ describe("removeWorktree", () => {
     await removeWorktree(repoDir, worktreeDir);
 
     expect(existsSync(worktreeDir)).toBe(false);
-    expect(await git(["worktree", "list", "--porcelain"], repoDir)).not.toContain(worktreeDir);
+    expect(await git(["worktree", "list", "--porcelain"], repoDir, NO_DEADLINE)).not.toContain(worktreeDir);
   });
 
   test("tolerates a checkout the user already deleted", async () => {

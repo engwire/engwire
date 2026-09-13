@@ -1,6 +1,6 @@
 {
   "name": "engwire",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Runs your Claude Code review skill on the pull requests that ask for your review — on your laptop, with your credentials.",
   "type": "module",

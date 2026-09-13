@@ -14,10 +14,11 @@
 
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { skillFile, userSkills } from "../claude/skills.ts";
+import { claudeRootProblem, skillFile, userSkills } from "../claude/skills.ts";
 import { isSkillName, starterConfig } from "../config/config.ts";
 import { absolutePath, paths } from "../config/paths.ts";
 import { diagnose } from "./doctor.ts";
+import { LINUX_DOCS } from "./service.ts";
 
 /**
  * Wrap comma-separated names without breaking one across lines.
@@ -37,6 +38,50 @@ export function columns(names: string[], width = 78): string[] {
     }
   }
   return lines;
+}
+
+/** Point to launchd installation on macOS and the systemd guide elsewhere. */
+export function backgroundNote(platform: string = process.platform): string[] {
+  if (platform === "darwin") {
+    return ["  engwire service install  keep it running in the background"];
+  }
+  return [
+    "",
+    "Background supervision is macOS-only. To keep it running, put `engwire run`",
+    "under your own supervisor. Here is a systemd example:",
+    `  ${LINUX_DOCS}`,
+  ];
+}
+
+/**
+ * The skill names a rule could name, or why there is no list to show.
+ *
+ * Two ways this fails, and neither is an empty list: a configuration root
+ * Engwire cannot inspect from a fixed place, and a skills directory that will
+ * not list — a permission or a link loop, which `userSkills` rethrows rather
+ * than flattening. Answering "you have none" to either sends somebody off to
+ * write a skill they already have.
+ *
+ * The root is asked first because it is what both calls below resolve through:
+ * a relative one makes `skillFile` throw exactly like `userSkills`, so the
+ * fallback branch is no safer than the branch it stands in for.
+ */
+function skillListing(): { names: string[] } | { problem: string; reported: boolean } {
+  const problem = claudeRootProblem();
+  // `reported`, because the report above carries exactly one of these two: a
+  // root Engwire cannot name gets a red `claude root` row, and a directory that
+  // will not list gets nothing at all — the root is absolute, so that row is a
+  // ✓, and a config this command has only just written names no skill, so no
+  // per-skill row went looking either.
+  if (problem) return { problem, reported: true };
+  try {
+    return { names: userSkills().filter(isSkillName) };
+  } catch (error) {
+    return {
+      problem: error instanceof Error ? error.message : String(error),
+      reported: false,
+    };
+  }
 }
 
 export async function setup(): Promise<number> {
@@ -84,11 +129,20 @@ export async function setup(): Promise<number> {
     console.log("");
     // Engwire ships no skill. Offer installed names the config accepts without
     // inventing what a review should do or handing someone an invalid value.
-    const skills = userSkills().filter(isSkillName);
-    if (skills.length > 0) {
+    // Listing failures must still leave the next steps visible after writing config.
+    const listing = skillListing();
+    if ("problem" in listing) {
+      // Reuse the failed root row; directory-read failures need their own message.
+      console.log("Its `skill` names a Claude Code skill of yours. Which ones you have");
+      console.log(
+        listing.reported ? "cannot be read — see the ✗ above." : `cannot be read: ${listing.problem}`,
+      );
+    } else if (listing.names.length > 0) {
       console.log("Its `skill` names one of yours:");
-      for (const line of columns(skills)) console.log(`  ${line}`);
+      for (const line of columns(listing.names)) console.log(`  ${line}`);
     } else {
+      // Safe here and only here: the listing succeeded, so the root `skillFile`
+      // resolves through is one Engwire can name.
       console.log("Its `skill` names a Claude Code skill of yours, and none here can go");
       console.log(`in a rule yet — Engwire ships no reviewer. Create ${skillFile("<name>")}.`);
     }
@@ -101,9 +155,7 @@ export async function setup(): Promise<number> {
   // Re-read the edited config and its skill before starting a runner.
   console.log("  engwire doctor           re-check after editing the config");
   console.log("  engwire run --once       one poll, at most one review, then exit");
-  if (process.platform === "darwin") {
-    console.log("  engwire service install  keep it running in the background");
-  }
+  for (const line of backgroundNote()) console.log(line);
   console.log("");
   console.log("Engwire starts watching when a runner first starts with a rule");
   console.log("configured. Requests made before that are not reviewed.");

@@ -118,6 +118,7 @@ export function paths(env: Record<string, string | undefined> = process.env): Pa
         env.XDG_DATA_HOME || join(env.HOME || homedir(), ".local", "share"),
         "engwire",
       );
+
   const logsDir = join(dataDir, "logs");
 
   return {
@@ -133,6 +134,70 @@ export function paths(env: Record<string, string | undefined> = process.env): Pa
 }
 
 /**
+ * What is wrong with where this environment points Engwire, or null.
+ *
+ * Asked of the answers rather than of the variables, so a route added later
+ * cannot slip past it. Both answers have to hold still: an installation is its
+ * data directory, and a relative one is a different directory from every
+ * working directory — so the lock, the database and the watermark that make
+ * "one runner, one queue, one identity" true would each be per-cwd. A relative
+ * *config* directory is the smaller fault and a separate sentence, because what
+ * moves is which rules and which skill an invocation reads.
+ *
+ * A problem rather than a throw, because two commands need these paths *in
+ * order to* report on them: `uninstall` prints the inventory before refusing to
+ * delete anything at an address that moves, and `doctor` exists to say what is
+ * wrong. `locatesData` asks a narrower version of this at the launchd boundary,
+ * where the question is which installation a job supervises rather than whether
+ * one can exist at all.
+ */
+export function locationProblem(
+  env: Record<string, string | undefined> = process.env,
+): string | null {
+  const p = paths(env);
+  // The variable to send someone to, named in the order `paths` reads them;
+  // `ENGWIRE_HOME` shadows the rest, so nothing under it is worth blaming. A
+  // value has to be truthy to be blamed — an empty one is falsy at every use
+  // above and falls through to the same defaults as an unset one. Null when
+  // none is at fault: nothing in `env` reaches that, since every relative
+  // answer traces to one of the names consulted, but `homedir()` is not from
+  // `env`, and naming an unset `HOME` for the home lookup having gone wrong
+  // would send the reader to fix the wrong thing.
+  const blame = (...consulted: string[]): string | null => {
+    const name = (env.ENGWIRE_HOME ? ["ENGWIRE_HOME"] : consulted).find(
+      (key) => Boolean(env[key]) && !isAbsolute(env[key] as string),
+    );
+    return name ? `${name} is set to ${JSON.stringify(env[name])}` : null;
+  };
+
+  if (!isAbsolute(p.dataDir)) {
+    const blamed =
+      blame("XDG_DATA_HOME", "HOME") ??
+      `Engwire's data directory works out to ${JSON.stringify(p.dataDir)}`;
+    return (
+      `${blamed}, which is a relative path. Engwire's database, lock, clones and review ` +
+      "transcripts would land wherever each command happened to be run from — so two runs " +
+      "from two directories would be two installations, each reviewing the same requests. " +
+      "Use an absolute path."
+    );
+  }
+
+  const configDir = dirname(p.configFile);
+  if (!isAbsolute(configDir)) {
+    const blamed =
+      blame("XDG_CONFIG_HOME", "HOME") ??
+      `Engwire's config directory works out to ${JSON.stringify(configDir)}`;
+    return (
+      `${blamed}, which is a relative path. Which repositories are automated, and with which ` +
+      "skill, would then depend on the directory each command happened to be run from. " +
+      "Use an absolute path."
+    );
+  }
+
+  return null;
+}
+
+/**
  * What can name the data directory, in the order `paths` reads them.
  *
  * Exported because `service install` reports on the same three, and two
@@ -140,7 +205,15 @@ export function paths(env: Record<string, string | undefined> = process.env): Pa
  */
 export const LOCATORS = ["ENGWIRE_HOME", "XDG_DATA_HOME", "HOME"] as const;
 
-/** Whether the environment identifies a data directory without process fallbacks. */
+/**
+ * Whether the environment identifies a data directory without process
+ * fallbacks.
+ *
+ * Narrower than `locationProblem` above, and they disagree where it matters: an
+ * empty environment locates no data directory but is a perfectly good
+ * installation, because `homedir()` is a fine default for a shell and no
+ * default at all for a plist.
+ */
 export function locatesData(env: Record<string, string | undefined>): boolean {
   // A relative base depends on a working directory the plist does not preserve,
   // so it cannot identify which installation a service supervises.

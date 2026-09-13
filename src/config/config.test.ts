@@ -34,6 +34,67 @@ run_timeout = "5m"
     expect(config.advanced.runTimeoutMs).toBe(300_000);
   });
 
+  test("a value of the wrong type is refused by name, not as a stack trace", () => {
+    // `main` prints a `ConfigError` and exits 1, and rethrows everything else —
+    // so a shape that escaped as a `TypeError` would meet somebody's first
+    // config as a stack trace. These are the shapes TOML makes easy to write by
+    // accident: a duration without its quotes, one repository without its
+    // brackets, a table written as a value. Each has to come back naming the
+    // key that is wrong, because a config with a dozen settings gives the
+    // reader nowhere else to look.
+    // Field *and* reason. Naming the key alone would not be enough to hold
+    // these: a stray number in `repos` fails the pattern grammar downstream and
+    // an array read as a table fails the unknown-key check, so each shape is
+    // refused either way — what the guards here actually buy is being told the
+    // value is the wrong shape rather than that "0" is not a setting.
+    const wrong: [string, string, string][] = [
+      [
+        "a duration as a number",
+        `[advanced]\npoll_interval = 60\n`,
+        'advanced.poll_interval: expected a duration string like "45s"',
+      ],
+      [
+        "an executable as a number",
+        `[advanced]\ngh_bin = 5\n`,
+        "advanced.gh_bin: expected a command name or absolute path",
+      ],
+      [
+        "an executable left empty",
+        `[advanced]\ngh_bin = ""\n`,
+        "advanced.gh_bin: expected a command name or absolute path",
+      ],
+      ["advanced as an array", `advanced = [1]\n`, "advanced: expected a table"],
+      ["review as a string", `review = "x"\n`, "review: expected one or more [[review]] tables"],
+      ["a review entry that is not a table", `review = ["x"]\n`, "review[0]: expected a table"],
+      [
+        "repos as a bare string",
+        `[[review]]\nrepos = "acme/*"\nskill = "s"\n`,
+        "review[0].repos: expected an array of strings",
+      ],
+      [
+        "repos holding a non-string",
+        `[[review]]\nrepos = ["a/b", 5]\nskill = "s"\n`,
+        "review[0].repos: expected an array of strings",
+      ],
+      [
+        "a skill as a number",
+        `[[review]]\nrepos = ["a/b"]\nskill = 5\n`,
+        "review[0].skill: expected a skill name",
+      ],
+    ];
+
+    for (const [what, toml, says] of wrong) {
+      let thrown: unknown;
+      try {
+        parseConfig(toml);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown, what).toBeInstanceOf(ConfigError);
+      expect((thrown as Error).message, what).toContain(says);
+    }
+  });
+
   test("rejects a duration it cannot read rather than guessing", () => {
     expect(() => parseConfig(`[advanced]\npoll_interval = "soon"\n`)).toThrow(ConfigError);
   });
@@ -41,6 +102,11 @@ run_timeout = "5m"
   test("rejects durations outside the range a timer or a Date can hold", () => {
     expect(() => parseConfig(`[advanced]\npoll_interval = "0ms"\n`)).toThrow(ConfigError);
     expect(() => parseConfig(`[advanced]\nrun_timeout = "0ms"\n`)).toThrow(ConfigError);
+    // Both ends, because both are a way of switching the deadline off: zero
+    // aborts every checkout the instant it starts, and a year is no bound at
+    // all on the stalled clone this setting exists to cut short.
+    expect(() => parseConfig(`[advanced]\ncheckout_timeout = "0ms"\n`)).toThrow(ConfigError);
+    expect(() => parseConfig(`[advanced]\ncheckout_timeout = "8760h"\n`)).toThrow(ConfigError);
     // `new Date(Infinity).toISOString()` throws, so an unbounded TTL would take
     // the runner down when it finished a review rather than when it read this.
     expect(() =>

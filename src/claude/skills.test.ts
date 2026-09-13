@@ -216,6 +216,13 @@ describe("skillPreflightProblem", () => {
     // The root is what has to be absolute, not one of the two variables it can
     // come from — `HOME` reaches the same path by the other route.
     expect(skillPreflightProblem("review-pr", { HOME: "relative" })).toContain(relative);
+    // Whole, and carrying its remedy. `doctor` and `setup` both print this
+    // sentence verbatim, so a reader met with half of one has been told there
+    // is something wrong and not what to do about it — and matching a fragment
+    // from the middle, as the assertions above do, cannot tell the difference.
+    expect(skillPreflightProblem("review-pr", { HOME: "relative" })).toEndWith(
+      "Use an absolute path.",
+    );
   });
 
   test("unreadable is not the same problem as absent", () => {

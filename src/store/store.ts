@@ -21,8 +21,8 @@
  */
 
 import { Database } from "bun:sqlite";
-import { privateDir } from "../config/paths.ts";
 import { dirname } from "node:path";
+import { privateDir } from "../config/paths.ts";
 import type { ReviewRun, RunStatus, TerminalRunStatus } from "../review/model.ts";
 
 const SCHEMA = `
@@ -178,26 +178,34 @@ export class Store {
       privateDir(dirname(file));
     }
     this.db = new Database(file, { create: true });
-    // Check before any initialization below can persist state, so refusing a
-    // newer database leaves it untouched. Close the handle the caller never receives.
-    const version = schemaVersion(this.db);
-    if (version > SCHEMA_VERSION) {
+    try {
+      // Check before any initialization below can persist state, so refusing a
+      // newer database leaves it untouched.
+      const version = schemaVersion(this.db);
+      if (version > SCHEMA_VERSION) throw new DatabaseTooNewError(version);
+      this.db.exec("PRAGMA journal_mode = WAL");
+      this.db.exec("PRAGMA foreign_keys = ON");
+      // SQLite uses 0 for both a fresh file and a pre-stamp database. v0.1.0 had
+      // this same schema, so the idempotent statements preserve its rows. A
+      // stamped database skips creation: missing tables then fail loudly instead
+      // of being recreated empty and losing the deduplication guarantee. Create
+      // and stamp in one transaction so they cannot disagree after a crash.
+      if (version === 0) {
+        this.db.transaction(() => {
+          this.db.exec(SCHEMA);
+          // Pragmas take no bound parameters; the value is this file's own constant.
+          this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+        })();
+      }
+    } catch (error) {
+      // Every failure here, not only the version one: the constructor throws,
+      // so the caller never receives the handle and nothing else can close it.
+      // A `PRAGMA` refused on an unsuitable file, or a schema that will not
+      // apply, would otherwise hold the descriptor and SQLite's locks until the
+      // collector got to them — and the next attempt in this process would meet
+      // a lock nobody is holding.
       this.db.close();
-      throw new DatabaseTooNewError(version);
-    }
-    this.db.exec("PRAGMA journal_mode = WAL");
-    this.db.exec("PRAGMA foreign_keys = ON");
-    // SQLite uses 0 for both a fresh file and a pre-stamp database. v0.1.0 had
-    // this same schema, so the idempotent statements preserve its rows. A
-    // stamped database skips creation: missing tables then fail loudly instead
-    // of being recreated empty and losing the deduplication guarantee. Create
-    // and stamp in one transaction so they cannot disagree after a crash.
-    if (version === 0) {
-      this.db.transaction(() => {
-        this.db.exec(SCHEMA);
-        // Pragmas take no bound parameters; the value is this file's own constant.
-        this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
-      })();
+      throw error;
     }
   }
 
@@ -253,6 +261,38 @@ export class Store {
   }
 
   /**
+   * When a poll last finished, for `engwire status` to show.
+   *
+   * The runner row says a process is alive; this says it is getting through to
+   * GitHub. Between them they separate the two states a reviewer cannot
+   * otherwise tell apart — a runner working through a quiet queue, and one that
+   * has been holding since Tuesday because `gh` is signed in as somebody else.
+   * Queued work looks the same under both.
+   *
+   * Its own key rather than a field on the runner row, which would mean reading
+   * that row back and rewriting it whole once a minute to change one value.
+   *
+   * Takes the instant, not its spelling, as `watchingSince` does: the store owns
+   * the format `lastPoll` promises, so no caller can store one `status` cannot
+   * read back as a time.
+   */
+  recordPoll(at = new Date()): void {
+    this.db.run(
+      "INSERT INTO meta (key, value) VALUES ('polled_at', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      [at.toISOString()],
+    );
+  }
+
+  /** ISO 8601, or null if no poll has ever finished. */
+  lastPoll(): string | null {
+    return (
+      this.db
+        .query<{ value: string }, []>("SELECT value FROM meta WHERE key = 'polled_at'")
+        .get()?.value ?? null
+    );
+  }
+
+  /**
    * The GitHub account this installation belongs to, or null if unclaimed.
    *
    * Separate from `bindReviewer` because `doctor` has to be able to ask without
@@ -278,7 +318,12 @@ export class Store {
    */
   bindReviewer(login: string): string {
     const existing = this.reviewerLogin();
-    if (existing) return existing;
+    // Against `null`, not against truthiness. A row that exists is the answer
+    // whatever it holds: read as falsy, a stored value this code did not expect
+    // would fall through to an insert the primary key refuses, and turn a
+    // reportable identity mismatch into an installation that throws on every
+    // start and can never be started again.
+    if (existing !== null) return existing;
     this.db.run("INSERT INTO meta (key, value) VALUES ('reviewer_login', ?)", [login]);
     return login;
   }
@@ -318,11 +363,28 @@ export class Store {
       .map(toRun);
   }
 
+  /**
+   * The most recently active runs, newest first.
+   *
+   * Ordered by when a row last became what it says it is — its outcome, else
+   * its start, else the moment the decision was written — and not by when it
+   * was created, because those disagree exactly where it matters. A review
+   * queued before fifteen others and finished a minute ago is the most recent
+   * thing that happened; ordered by `created_at` it sorted below rows nothing
+   * had touched since, and once the limit bit it left the report altogether —
+   * from the one report whose question is whether anything is still moving.
+   *
+   * The expression is `asOf` in `cli/status.ts`, which dates each row the same
+   * way. They are one rule — sorted on one instant and labelled with the other,
+   * the age column does not descend — so it is pinned from both ends:
+   * `store.test.ts` for the order, `status.test.ts` for the column it prints.
+   */
   recentRuns(limit = 20): ReviewRun[] {
     return this.db
       .query<Row, [number]>(
         `SELECT * FROM review_runs
-          ORDER BY created_at DESC, requested_at DESC, CAST(event_id AS INTEGER) DESC
+          ORDER BY COALESCE(finished_at, started_at, created_at) DESC,
+                   created_at DESC, requested_at DESC, CAST(event_id AS INTEGER) DESC
           LIMIT ?`,
       )
       .all(limit)
@@ -412,7 +474,7 @@ export class Store {
    * Give back a claim whose review never started, and hand its checkout to the
    * reaper.
    *
-   * The pre-spawn checks are the only caller: nothing has run and nothing has
+   * Every caller is before the agent starts: nothing has run and nothing has
    * posted, so the request is still outstanding and belongs in the queue. A
    * terminal status would spend an event GitHub will not send again, and
    * `running` would describe a process that does not exist.

@@ -3,7 +3,7 @@
  *
  * The file describes outcomes — which repositories get reviewed, by which
  * skill — and nothing about how the runner achieves them. The poll interval,
- * worktree retention and review timeout are tuning parameters with defaults
+ * worktree retention, review timeout and checkout deadline have defaults
  * good enough that nobody should have to pick them; they live under `[advanced]`
  * for the case where a default is wrong on one machine, not as part of the
  * product's surface.
@@ -33,6 +33,13 @@ export type Config = {
     worktreeTtlMs: number;
     /** How long one review may take before Engwire terminates Claude. */
     runTimeoutMs: number;
+    /**
+     * One deadline for all checkout preparation's cancellable git work.
+     * Local removal may start or finish after expiry; worktree pruning has its
+     * own deadline, and stopped git processes get an additional kill grace.
+     * This is not an absolute wall-clock maximum.
+     */
+    checkoutTimeoutMs: number;
     /**
      * Absolute paths matter here: launchd hands a service a minimal PATH, so a
      * `gh` in Homebrew and a `claude` in `~/.local/bin` are both invisible
@@ -77,6 +84,7 @@ const DEFAULTS = {
   poll_interval: "60s",
   worktree_ttl: "24h",
   run_timeout: "20m",
+  checkout_timeout: "10m",
 } as const;
 
 /**
@@ -111,6 +119,12 @@ ${setting("claude_bin", bins.claudeBin)}
 
 # How long one review may run before Engwire stops it and everything it started.
 # ${setting("run_timeout", DEFAULTS.run_timeout)}
+
+# The deadline for the checkout's cancellable git work. Local cleanup may run
+# beyond it, and pruning a worktree has a deadline of its own. The first clone
+# of a large repository is the slow case; raise it on a slow link rather than
+# lowering it.
+# ${setting("checkout_timeout", DEFAULTS.checkout_timeout)}
 `;
 }
 
@@ -125,6 +139,7 @@ export const ADVANCED_KEYS = [
   "poll_interval",
   "worktree_ttl",
   "run_timeout",
+  "checkout_timeout",
   "gh_bin",
   "claude_bin",
 ] as const;
@@ -320,6 +335,11 @@ export function parseConfig(source: string): Config {
         min: 1_000,
         max: DAY,
       }),
+      checkoutTimeoutMs: duration(
+        advanced.checkout_timeout ?? DEFAULTS.checkout_timeout,
+        "advanced.checkout_timeout",
+        { min: 1_000, max: DAY },
+      ),
       ghBin: executable(advanced.gh_bin, "advanced.gh_bin", "gh"),
       claudeBin: executable(advanced.claude_bin, "advanced.claude_bin", "claude"),
     },
@@ -365,6 +385,9 @@ const REPO_PATTERN = /^(\*|[A-Za-z0-9._-]+\/(\*|[A-Za-z0-9._-]+))$/;
  * different owner wildcards never overlap. So `owner/*` is covered only by `*`
  * or the same wildcard, while a concrete `owner/name` is covered by anything
  * that matches it.
+ *
+ * The explicit guard keeps owner wildcard patterns out of the final
+ * `matchesRepo` call; their containment is settled by the first two checks.
  */
 function covers(earlier: string, later: string): boolean {
   const a = earlier.toLowerCase();

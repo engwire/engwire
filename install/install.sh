@@ -13,7 +13,7 @@ VERSION="${ENGWIRE_VERSION:-latest}"
 case "$(uname -s)" in
   Darwin) os="darwin" ;;
   Linux)  os="linux" ;;
-  *) echo "Unsupported OS: $(uname -s). Windows is not supported yet." >&2; exit 1 ;;
+  *) echo "Unsupported OS: $(uname -s). Engwire supports macOS and Linux." >&2; exit 1 ;;
 esac
 
 case "$(uname -m)" in
@@ -38,6 +38,11 @@ esac
 # Downloading to /tmp and moving would fall back to copy-and-delete whenever
 # $HOME is a separate mount, and an interrupted upgrade would leave a truncated
 # binary where a working one used to be.
+# Refuse a directory: `mv` would put the binary inside it and report success.
+if [ -d "$PREFIX/engwire" ]; then
+  echo "$PREFIX/engwire is a directory. Move it aside and run this again." >&2
+  exit 1
+fi
 [ -e "$PREFIX/engwire" ] && upgrade=yes || upgrade=no
 mkdir -p "$PREFIX"
 tmp="$(mktemp -d "$PREFIX/.engwire-install.XXXXXX")"
@@ -66,16 +71,22 @@ fi
 # the review it may be in the middle of.
 mv "$tmp/engwire" "$PREFIX/engwire"
 
-echo "Installed $PREFIX/engwire"
+# Report what arrived rather than the `latest` selector most installs use.
+echo "Installed engwire $reported at $PREFIX/engwire"
 case ":$PATH:" in
   *":$PREFIX:"*) ;;
   *) echo "Add $PREFIX to your PATH." ;;
 esac
 echo
-# launchd keeps running the binary it started, so an upgrade reaches the
-# background runner only when the service is installed again.
+# A supervisor keeps running the old binary until its job is replaced or
+# restarted. Engwire only owns that command on macOS; Linux setup is user-owned.
 if [ "$upgrade" = yes ]; then
-  echo "Running in the background? Reinstall the service to pick this up: engwire service install"
+  if [ "$os" = darwin ]; then
+    echo "Running in the background? Reinstall the service to pick this up: engwire service install"
+  else
+    echo "Running in the background? Restart your supervisor to pick this up, e.g."
+    echo "  systemctl --user restart engwire"
+  fi
 else
   echo "Next: engwire setup"
 fi

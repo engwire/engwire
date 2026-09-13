@@ -1,6 +1,6 @@
 # ADR-0002: Pin the workflow file format before a loader exists
 
-- Status: Accepted
+- Status: Accepted; grow-only compatibility decision superseded by [ADR-0003](0003-withdraw-the-workflow-formats-compatibility-promise.md)
 - Date: 2026-09-05
 - Supersedes: —
 

@@ -96,13 +96,26 @@ export function serviceEnvironment(
   return env;
 }
 
+/**
+ * launchd's shutdown allowance, measured from SIGTERM (docs/experiments.md).
+ *
+ * Leave headroom over the longer timed path: the agent's termination grace, or
+ * worktree pruning plus git's termination grace. They do not run sequentially
+ * after a stop: preparation cannot start an agent once aborted, and the loops
+ * skip further reaping. launchd.test.ts checks this fixed budget against those
+ * modules' deadlines without coupling the plist generator to them.
+ *
+ * Recursive directory removal has no deadline, so this is an allowance, not a
+ * guarantee that cleanup finishes. If launchd kills the runner first, startup
+ * marks remaining running rows interrupted rather than invoking the agent again.
+ */
+const EXIT_TIMEOUT_SECONDS = 90;
+
 export function plist(options: {
   executable: string;
   logsDir: string;
   /** Exactly what `service install` diagnosed against. */
   environment: Record<string, string>;
-  /** Upper bound used to leave enough time for review shutdown and cleanup. */
-  runTimeoutMs: number;
 }): string {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -122,13 +135,11 @@ export function plist(options: {
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <!--
-    Without this, launchd's wait between SIGTERM and SIGKILL is whatever the
-    system decides, so it may kill the runner before the review process group
-    has received the signal and completed cleanup. Bounded by Engwire's own
-    review timeout plus a grace period, because zero means infinity here and
-    would stall shutdown.
+    Allow time to terminate a review or finish worktree cleanup after SIGTERM.
+    This fixed shutdown budget is independent of the configured review timeout;
+    it does not guarantee completion of directory removal, which has no deadline.
   -->
-  <key>ExitTimeOut</key><integer>${Math.ceil(options.runTimeoutMs / 1000) + 30}</integer>
+  <key>ExitTimeOut</key><integer>${EXIT_TIMEOUT_SECONDS}</integer>
   <!--
     63 is decimal for 0077 — the log holds private repository names and review
     errors. Written as an integer because that is the form every version of
@@ -331,10 +342,9 @@ const KEY_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 /**
  * What may follow the environment: the pairs `plist()` writes, then the close.
  *
- * Values are shapes rather than contents — an `ExitTimeOut` computed from the
- * configured timeout and log paths under whatever `ENGWIRE_HOME` says are the
- * generated document as much as any other. Anything that is not a plainly
- * spelled key beside one of those values ends the answer.
+ * Match value types, not exact values: a different ExitTimeOut or log location
+ * does not change which installation owns the job. An unrecognised key or
+ * value type makes ownership unknown.
  */
 const TAIL_PAIR =
   /<key>([A-Za-z_][A-Za-z0-9_]*)<\/key>[ \t\n]*(?:<(true|false)\/>|<(integer)>-?\d+<\/integer>|<(string)>([^<]*)<\/string>)/g;
@@ -481,7 +491,6 @@ export async function install(options: {
   executable: string;
   logsDir: string;
   environment: Record<string, string>;
-  runTimeoutMs: number;
 }): Promise<void> {
   const file = plistPath();
   mkdirSync(join(homedir(), "Library", "LaunchAgents"), { recursive: true });

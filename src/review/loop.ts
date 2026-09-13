@@ -96,6 +96,15 @@ export async function pollAndSchedule(runtime: Runtime): Promise<ReviewDecision[
         }
       }
     }
+    // Last, and inside: what it records is a poll that *finished* — GitHub
+    // answered and its decisions are on disk — so it commits with them or not
+    // at all. Written after the commit instead, a crash in the gap between the
+    // two leaves durable proof that the poll happened beside a `status` still
+    // reporting the previous one, and disagreeing with itself is the one thing
+    // this fact cannot afford. A cycle that could not reach GitHub never gets
+    // here at all, which is the whole point: `status` can then show a runner
+    // that is up and not getting anywhere.
+    store.recordPoll();
   });
 
   // After the commit: a log line is a claim that something happened.
@@ -137,9 +146,15 @@ async function startRun(runtime: Runtime, run: ReviewRun): Promise<void> {
  * TTL until a disk actually fills — the revision is still on GitHub and the
  * transcript is still in the log.
  */
-export async function reapWorktrees(runtime: Runtime, now = new Date()): Promise<number> {
+async function reapWorktrees(runtime: Runtime, now = new Date()): Promise<number> {
   let removed = 0;
   for (const { id, worktreePath } of runtime.store.expiredWorktrees(now)) {
+    // Between worktrees, never inside one: `removeWorktree` deletes a checkout
+    // and then prunes the entry naming it, and a stop landing between those two
+    // would leave the clone pointing at a directory that is gone. One of them
+    // is a fast local pair; a backlog of them is what a shutdown should not sit
+    // through.
+    if (runtime.signal.aborted) break;
     const run = runtime.store.get(id);
     if (run) {
       try {
@@ -279,7 +294,10 @@ export async function runLoop(runtime: Runtime): Promise<void> {
       // Local failures, such as spawn errors, failed SQLite writes or bugs in
       // reconciliation, must escape rather than keep a broken runner polling.
       if (!(error instanceof GhError)) throw error;
-      runtime.log(`poll failed: ${error.message}`);
+      // Unless we are what stopped it. The shutdown signal now reaches a `gh`
+      // already in flight, and "poll failed" said on the way out reports a
+      // GitHub problem that did not happen.
+      if (!signal.aborted) runtime.log(`poll failed: ${error.message}`);
     }
 
     if (signal.aborted) break;
@@ -342,9 +360,9 @@ export async function runLoop(runtime: Runtime): Promise<void> {
 /**
  * Wait, unless we are stopping. Both paths clean up after themselves.
  *
- * `{ once: true }` removes the listener when abort fires — but the normal exit
- * is the timer, which fires every poll and leaves the listener attached. A
- * runner polling all day would accumulate one per minute.
+ * The listener is removed explicitly rather than left to `{ once: true }`,
+ * which only fires on abort: the normal exit is the timer, so a runner polling
+ * all day would otherwise accumulate an abort listener a minute.
  */
 export function sleep(ms: number, signal: AbortSignal): Promise<void> {
   // An abort that already happened fires no event, so a listener registered
