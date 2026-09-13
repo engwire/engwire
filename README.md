@@ -11,7 +11,7 @@ Engwire (your machine)
           ↓
   worktree at that revision
           ↓
-   claude -p /review-pr
+   claude -p /engwire-review
           ↓
    your skill posts as you
 ```
@@ -22,7 +22,7 @@ One installation belongs to one GitHub account — the one authenticated when it
 
 ## Requirements
 
-You need [`gh`](https://cli.github.com) 2.31 or newer (authenticated), [Claude Code](https://claude.com/claude-code), and a user-level review skill. Engwire invokes the configured skill as `/<skill> <repo>#<number> at <sha>` but ships none of its own: what a review reads, says and posts remains the skill's responsibility.
+You need [`gh`](https://cli.github.com) 2.31 or newer (authenticated), [Claude Code](https://claude.com/claude-code), and a user-level review skill. Engwire ships none of its own — [`engwire/skills`](https://github.com/engwire/skills) has one to copy. It invokes the configured skill as `/<skill> <repo>#<number> at <sha>`: what a review reads, says and posts remains the skill's responsibility.
 
 `engwire doctor` reports skills that fail Engwire's preflight. The runner leaves their reviews queued instead of claiming work that Claude can already be shown not to run.
 
@@ -69,7 +69,7 @@ skill = "review-payments"
 
 [[review]]
 repos = ["acme/*"]
-skill = "review-pr"
+skill = "engwire-review"
 ```
 
 The first matching rule wins, so put the specific one first — and getting that backwards is an error, not a rule that never runs. `repos` accepts `owner/name`, `owner/*` or `*`, and nothing else; a pattern Engwire cannot read is an error too.
@@ -94,7 +94,7 @@ Engwire polls GitHub for `review_requested` issue events naming you. Each event 
 
 Claude runs with `--setting-sources user`, so the review is governed by *your* configuration and *your* skill — never by a `.claude/` directory, `CLAUDE.md` or `.mcp.json` the pull request brought with it. `engwire doctor` checks that your Claude Code still validates the flag; [docs/experiments.md](docs/experiments.md) records how to verify that it still enforces the boundary.
 
-The skill is invoked as `/review-pr acme/api#42 at <sha>`. The checkout is pinned to that revision; if your skill asks GitHub for the diff instead, it sees whatever is current — so treat the checkout and the SHA you were given as authoritative.
+The skill is invoked as `/engwire-review acme/api#42 at <sha>`. The checkout is pinned to that revision; if your skill asks GitHub for the diff instead, it sees whatever is current — so treat the checkout and the SHA you were given as authoritative.
 
 Engwire never touches your own checkouts.
 

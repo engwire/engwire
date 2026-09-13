@@ -293,8 +293,12 @@ describe("starterConfig", () => {
     const config = parseConfig(uncommented);
 
     expect(config.reviews).toEqual([
-      { repos: ["your-org/*"], skill: "review-pr", skipDrafts: true },
+      { repos: ["your-org/*"], skill: "engwire-review", skipDrafts: true },
     ]);
+    // The sample names the reviewer the pointer above it leads to. Uncommenting
+    // it literally is what a first-time reader does, so a name nothing ships
+    // sends them straight to a `doctor` complaining about a missing skill.
+    expect(starter).toContain("https://github.com/engwire/skills");
     // Every shown value is also the default applied when its line is absent.
     expect(config.advanced).toEqual(parseConfig(starter).advanced);
     const silent = uncommented.replace(/^skip_drafts = .*$/m, "");
