@@ -202,8 +202,7 @@ export async function runClaude(options: {
       //
       // The group covers the tool tree, not a determined escape from it: a
       // descendant that calls `setsid` leaves the group and is beyond this.
-      // Engwire is not a sandbox, and the reviewer's `allowed-tools` is where
-      // that boundary actually lives.
+      // This is process cleanup, not a sandbox or tool-permission boundary.
       detached: true,
     });
     // A signal that arrived while the spawn was in flight found nothing to

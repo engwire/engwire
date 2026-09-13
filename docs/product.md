@@ -12,7 +12,7 @@ This document is the decision filter. When a build choice is not obviously right
 
 **Positioning.** Local-first automation for engineering routines.
 
-The current product is the local runtime. A cloud coordination layer, if justified, would sit alongside it for work such as event ingress or shared configuration. Moving execution itself requires a separate product and security decision; [Why local](#why-local) explains the tradeoffs. **Cloud** below names this possible capability, without committing to a service or account system.
+The current product is the local PR-review runner. A cloud coordination layer, if justified, would sit alongside it. Moving execution itself requires a separate product and security decision; [Why local](#why-local) explains the tradeoffs. **Cloud** below names this possible capability, without committing to a service or account system.
 
 ## The wedge
 
@@ -33,13 +33,13 @@ Not ideology, and not the pitch. The developer's code, tools, credentials, agent
 - when the skill posts, it posts as the developer, following review instructions they wrote;
 - it reaches private repositories without granting any new service access to source;
 - it spends a subscription they already pay for, instead of a second per-seat bill;
-- there is nothing to roll out — one engineer installs it without asking anybody.
+- there is nothing to roll out — one engineer installs it without a team-wide deployment.
 
 **Local is a default, not a dogma.** Keep work local wherever proximity to the developer's code, tools, credentials or environment is what creates the advantage — that is a durable preference, not an implementation accident. Cloud is not the opposite of it, and not an escape hatch for when local fails: the two compose, and the useful question is which half of a routine each is good at.
 
-Cloud can plausibly own **ingress and coordination**, alongside local execution rather than instead of it: event-driven ingress instead of polling, machine presence, shared routine configuration, run history a team can read. A webhook arriving at a queue and a laptop doing the work is the shape to expect.
+Cloud can plausibly own **ingress and coordination**, alongside local execution rather than instead of it — event-driven ingress instead of polling is the clearest candidate. What else belongs there is unsettled, and naming a shape now would be designing a hosted layer nobody has justified.
 
-That shape is not free, and the bill lands on the wedge's best argument. Receiving GitHub events means a hosted component GitHub is authorized to talk to: a new trusted party between the reviewer and their pull requests, where today there is none. What such a relay would actually have to be granted is unmeasured — [architecture.md](architecture.md#decisions) says the same, and it gets measured before a design leans on it either way. The party is the cost whatever the permission turns out to be, so Cloud never inherits the runner's trust proposition: any access it needs is justified on its own, to the same person who chose Engwire partly to avoid granting some.
+Even that is not free, and the bill lands on the wedge's best argument. Receiving GitHub events means a hosted component GitHub is authorized to talk to: a new trusted party between the reviewer and their pull requests, where today there is none. What such a relay would actually have to be granted is unmeasured — [architecture.md](architecture.md#decisions) says the same, and it gets measured before a design leans on it either way. The party is the cost whatever the permission turns out to be, so Cloud never inherits the runner's trust proposition: any access it needs is justified on its own, to the same person who chose Engwire partly to avoid granting some.
 
 What coordination does not by itself solve is **execution availability**. Buffering an event does not run an agent on a sleeping laptop, and waking one is a separate, platform-specific problem. The obvious alternatives are execution on an always-on machine the developer controls, or remote execution — and remote execution moves the credential, source-access and agent-account boundaries, which is precisely where this wedge's advantages live. What that would cost is a design question nobody has answered, so it is out of scope now and needs an explicit product and security decision before anyone reopens it. Treat it as an open bet, not a feature Cloud delivers.
 
@@ -47,7 +47,7 @@ Sell the outcome and explain the architecture second. Nobody buys "local-first";
 
 ## Who it is for
 
-A developer who regularly receives GitHub review requests and already runs a coding agent seriously enough to have configuration and skills they trust.
+A developer who regularly receives GitHub review requests and already runs Claude Code seriously enough to have configuration and skills they trust.
 
 Strengthening signals: several pull requests a week; review requests that land as interruptions; an agent in daily use; comfortable installing a CLI; private repositories that make a hosted reviewer awkward; wanting automation without another SaaS account.
 
@@ -64,7 +64,7 @@ What it actually has:
 - **No second per-seat bill.** The subscription is already paid for.
 - **It is built around execution, not review logic.** The thesis is that the same runtime carries other developer routines — a review bot would have to become a different product to do that, and this would not. That is the upside, not a fact yet: a second routine is what starts proving it.
 
-Where it loses, plainly: a sleeping laptop reviews nothing, installing a CLI costs more than clicking a button, and the first pass is only as good as a skill the user has to own. The third is deliberate — see [The wedge](#the-wedge). The second is an installer problem worth grinding down. The first has no answer inside the thesis at all, which is why it is written up as an open bet under [Why local](#why-local) rather than filed as a Cloud feature.
+Where it loses, plainly: a sleeping laptop reviews nothing, installing a CLI costs more than clicking a button, and the first pass is only as good as a skill the user has to own. The third is deliberate — see [The wedge](#the-wedge). The second is an installer problem worth grinding down. The first requires an available execution machine, which coordination alone cannot provide; [Why local](#why-local) distinguishes an always-on machine the developer controls from remote execution that moves the trust boundaries.
 
 CI- and hosted-agent approaches answer the same trigger from remote execution, including agents running the same CLI Engwire runs. The honest difference is whose configuration, whose credential and whose identity — not who has the better model. Which specific products do this is market research, and belongs there rather than here.
 
@@ -81,6 +81,8 @@ Evidence, roughly in order of how hard it is to fake:
 - **Usefulness** — the author says the first pass was worth having.
 - **Attention cost** — how often somebody had to nudge, fix or restart Engwire.
 
+These are learning goals, not instrumentation requirements. Do not add automatic outbound usage reporting to measure them: sending usage data off the machine creates a new data-handling and trust boundary, and needs its own product and security decision.
+
 Aim for ten active external developers, and do not turn ten into a threshold. Five people on real repositories, running for weeks, who would notice its absence is stronger evidence than twenty one-time installs. What counts is unrelated developers, real repositories, repeated runs, continued use.
 
 A north star worth growing into rather than crowning yet: **useful unattended routines per retained developer.**
@@ -95,9 +97,9 @@ The skill is the on-ramp, and the awkward part of it. Engwire ships none by desi
 
 The rest is unglamorous: be where developers already compare coding-agent setups, and watch for people saying out loud that review requests interrupt them — that sentence is the whole qualification. No paid acquisition until retention is understood, and no launch post until Engwire has shown sustained unattended use on a machine that is not this one. How long that takes is a launch checklist's business, not this document's.
 
-## Two independent questions
+## Two questions worth answering next
 
-Expansion has two axes, and they are not the same bet. Either can move first.
+Two expansion questions are open, and they are not the same bet. Either can move first.
 
 **Can another coding agent satisfy Engwire's execution contract?** Agent support is a contract, not a model name — [architecture.md](architecture.md#decisions) lists what one holds. Whether a materially different CLI can run unattended with isolated configuration, a pinned identity, no relative executable search path, a captured transcript, unambiguous exit semantics, cancellation and descendant cleanup is unmeasured.
 
@@ -106,6 +108,8 @@ Split that into two pieces of work with different gates. **Measuring** one mater
 **Which second routine is repeatedly demanded?** Candidates share the wedge's shape — an engineering event a developer would otherwise answer by hand: CI failed → investigate; issue assigned → prepare context; dependency alert → inspect. Let demand identify the candidates, then prefer the smallest one that exercises the same local-first advantage while testing a genuinely reusable part of the runtime — repeated demand for something that gains nothing from running locally, or needs a different authority model, is not automatically routine number two. If the strongest demand keeps landing outside the thesis, that is evidence about the thesis rather than a routine to force into it. One routine is a feature; two similar routines are the first evidence that a workflow abstraction exists.
 
 Neither answer needs the other. A second agent can land before a second routine.
+
+Widening the current wedge instead — another code host, another trigger, another operating system — waits for demonstrated demand from someone the current support boundary actually blocks. Completeness is not a reason.
 
 ## Not scope now
 
@@ -118,7 +122,7 @@ Neither answer needs the other. A second agent can land before a second routine.
 
 Open on purpose, with a leading hypothesis rather than a plan. The runner is MIT-licensed and free. That does not decide the monetization model, but it is a durable constraint on one: anything shipped can be forked, redistributed, bundled or hosted by somebody else, and no later decision takes that back.
 
-**A — open runner, paid Cloud.** Best fit with the thesis. Blocked on finding a Cloud job real enough to pay for, and the candidates are coordination rather than execution: event-driven ingress instead of polling, machine presence, shared routines, run history a team can read.
+**A — open runner, paid Cloud.** Best fit with the thesis. Blocked on finding a Cloud job real enough to pay for, and any candidate is coordination rather than execution.
 
 **B — paid individual product.** Simplest to charge for, weakest willingness to pay. The developer already pays for the agent, and a second personal subscription for a scheduler is a hard sell.
 
@@ -132,7 +136,7 @@ So a second teammate installing the runner is a signal to go and ask, not a trig
 
 These are prompts to go and find out why, not verdicts. Every one of them has a boring explanation as well as a strategic one, and the boring one is usually right first.
 
-- **Nobody keeps it running past week one.** Ask whether setup defeated them, whether it broke, or whether the runs were fine and they simply did not care. Only the third is a wrong wedge; the first two are bugs.
+- **Nobody keeps it running past week one.** Ask whether setup defeated them, whether it broke, or whether the runs were fine and they simply did not care. Only the third falsifies the wedge's value outright; the first two are implementation problems first — but friction that survives simplification is evidence against local delivery for this user.
 - **The first pass is reliably ignored.** Check timing before quality: this product polls and runs one review at a time, so a good pass that lands after the human review was late, not useless. Diagnose polling, queueing, checkout and machine availability before judging the wedge — and be honest that one of those may turn out to be structural rather than a bug. Then check whose skill ran, since a thin skill is a distribution problem and Engwire ships none on purpose. Only when a good skill arrives in time and is still ignored has the value turned out not to be here.
 - **A second agent turns out to need a different execution model entirely.** Then "runtime over developer-owned agents" is a story rather than an asset, and Engwire is a very good Claude Code companion — which is allowed, and changes what to build next.
 - **Teams ask before individuals do.** Interesting, and not yet a mandate. Go and find out what those teams cannot do today, then run it through the same gate as anything commercial — a named buyer, a coordination problem in their words, and money or a paid pilot. Only that reorders A and C; a team asking about Engwire is not a reason to build machine presence.
@@ -144,11 +148,8 @@ Do not change direction because a competitor shipped a feature.
 ## Decision rules
 
 - **Design authority and security boundaries before execution; generalize behavior only after repeated need.** Absolute YAGNI is wrong for a boundary that is expensive to retrofit, and right for everything above one.
-- **Do not build a platform capability for a hypothetical routine.** Prefer a concrete second routine over a reusable abstraction until repeated implementation proves the abstraction. The inert artifacts already here — the plugin entry point, the workflow schema — may stay as design evidence, but they earn no production behavior, no compatibility obligation and no new API surface until a real routine asks.
+- **Do not build a platform capability for a hypothetical routine.** Prefer a concrete second routine over a reusable abstraction until repeated implementation proves the abstraction. The experimental artifacts already here — the plugin entry point, the workflow schema — carry no compatibility obligation and may change or disappear freely. Compatibility begins only where Engwire deliberately offers an API or format as a supported contract for authors; a real routine may motivate that decision, but does not make it.
 - **Agent support is earned per CLI, and measurement is only part of the price.** External CLI behaviour is measured, the boundaries Engwire controls are tested, and the adapter is implemented and maintained. Access to a model is not support, and neither is a passing experiment.
 - **Claims about external systems get measured** into [experiments.md](experiments.md), never assumed.
 - **Unattended reliability beats features.** A routine that needs attention is not a routine.
-
-## Scope of hosted work
-
-A change that only makes sense as groundwork for another hosted product is out of scope. Any coordination layer considered here must earn its place through runner users' needs and the product and security decisions described under [Why local](#why-local).
+- **Hosted work earns its place from runner users.** A change that only makes sense as groundwork for another hosted product is out of scope, and any coordination layer considered here goes through the product and security decisions under [Why local](#why-local).

@@ -4,7 +4,7 @@
 
 Local Engwire holds no credentials of its own. It invokes your authenticated `gh` and your Claude Code installation as subprocesses, so it can do exactly what you can do, and revoking its access means revoking theirs.
 
-It listens on no port and accepts no inbound connection. Everything it does is outbound, initiated by its own polling.
+It listens on no port and accepts no inbound connection. The runner finds work by outbound polling; other network access comes from subprocesses started by Engwire or by the review agent.
 
 ## What runs in a worktree
 
@@ -24,7 +24,7 @@ A branch under review can also carry `.engwire/` extension files, as this reposi
 
 Claude's `PATH` is filtered to absolute directories. Its working directory is the checkout, so any relative entry — `.`, a bare `tools`, or the empty field a leading or trailing `:` produces — would be a directory the contributor controls, and a skill running `gh` by name would find their file rather than yours. All four forms were confirmed to execute from the working directory before this was written. Configuration cannot reintroduce it: a relative `gh_bin` or `claude_bin` is a config error.
 
-Ambient repository selectors are cleared from the agent's environment as well as from Engwire's own git. `GIT_DIR` and `GIT_WORK_TREE` outrank the working directory, so otherwise a skill's ordinary `git diff` could read a different repository. `GH_REPO` is pinned separately to the repository the checkout came from: the defaults for what a review reads and where it posts are decided here, not by the surrounding shell.
+Ambient repository selectors are cleared from the agent's environment as well as from Engwire's own git. `GIT_DIR` and `GIT_WORK_TREE` outrank the working directory, so otherwise a skill's ordinary `git diff` could read a different repository. `GH_REPO` is pinned separately to the repository the checkout came from: `gh pr view` and `gh pr review` were measured to resolve against it, so their default is Engwire's repository rather than the surrounding shell's. It is not a rule about every `gh` subcommand.
 
 The review agent also gets `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_SYSTEM=/dev/null`. A branch can select a reviewer-configured diff driver through `.gitattributes`, so clearing inherited `GIT_*` selectors alone would still let an ordinary skill-issued `git diff` execute it. Repository-local configuration remains available, but global and system Git aliases, credential helpers, signing settings and other preferences do not reach the review's Git commands. Engwire's own checkout commands keep their separate configuration policy described above.
 
@@ -36,13 +36,15 @@ That list is what has been measured, not a proof that nothing else in your envir
 
 One of these is a residual you should know about rather than a rule Engwire enforces. The same loader mechanism was confirmed against **Engwire's own binary** on both platforms: with a relative `LD_PRELOAD` or `DYLD_INSERT_LIBRARIES` in your environment, a library sitting in the directory you run `engwire` from executes inside Engwire itself, before its first line runs. Nothing in Engwire can prevent that — by the time any of the filtering above could happen, the code has already run. It is not something a branch can arrange on its own: it needs one of those variables already set in your environment *and* you to start Engwire from a directory someone else can write to. Both loader namespaces are stripped from everything Engwire starts, which is the part it can decide; what it was started with is not.
 
+Engwire is not a sandbox. Tool permissions do not replace the startup protections above: launching a permitted process can still trigger startup code. Engwire's experiments do not establish that a skill's `allowed-tools` is an exclusive tool boundary; do not rely on it as one.
+
 Pull requests from forks are skipped outright. A `[[review]]` rule names a base repository, and anyone can open a pull request into one — so matching a rule is not evidence that the branch's author is trusted, and the branch's contents are what an agent is about to read.
 
-What that does *not* prevent is influence through the code itself. Claude reads the diff, and a pull request can attempt prompt injection in source, comments, or documentation. Engwire does not defend against this on the agent's behalf: the tools the agent may use are your Claude Code configuration, not Engwire's. Configure your review skill with the narrowest `allowed-tools` that lets it do its job, and remember that a branch in the base repository is only as trustworthy as the people who can push to it.
+What that does *not* prevent is influence through the code itself. Claude reads the diff, and a pull request can attempt prompt injection in source, comments, or documentation. Engwire does not defend against this on the agent's behalf: tool permissions belong to your Claude Code configuration, not Engwire's. Review that configuration alongside your skill and keep permissions narrow; a branch in the base repository is only as trustworthy as the people who can push to it.
 
-The review is a process group, and Engwire ends the group rather than the `claude` process alone — when the review times out, when the agent exits, and when the runner itself is stopped, which it does not finish doing until the review has stopped too. A tool that outlives the agent therefore does not outlive the run, which is what makes "one review at a time" true; measured rather than assumed, because without the group a grandchild reparents to init and goes on working.
+The review is a process group, and Engwire ends the group rather than the `claude` process alone — when the review times out, when the agent exits, and when the runner itself is stopped, which it does not finish doing until the review has stopped too. An ordinary descendant that stays in the group therefore does not outlive the run, which keeps tool leakage from overlapping the next one; measured rather than assumed, because without the group a grandchild reparents to init and goes on working.
 
-This covers an ordinary tool tree, not a program determined to escape one: a descendant that calls `setsid` leaves the group and is beyond anything Engwire signals. Process groups are tidy-up, not a sandbox — `allowed-tools`, above, is the boundary that matters.
+This covers an ordinary tool tree, not a program determined to escape one: a descendant that calls `setsid` leaves the group and is beyond anything Engwire signals. Process groups are tidy-up, not a sandbox.
 
 ## What local Engwire keeps
 

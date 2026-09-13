@@ -1,6 +1,8 @@
 # Engwire
 
-Reviews the pull requests that ask for your review — on your laptop, with your GitHub account, your Claude subscription, and your own review skill. No Engwire account required.
+Pull requests wait on reviewers who are busy, and their authors wait on the feedback. For an eligible review request in a repository you have configured, Engwire gets feedback started: it runs your Claude Code review skill on your machine, with your GitHub account and Claude subscription. The author can work through that first pass before you switch context. No Engwire account required.
+
+Automated PR review is the first routine, and today the only one. The wider aim is developer routines that run themselves, on your machine, from the events that already interrupt you — [Product](docs/product.md) says which parts of that exist and which are still direction.
 
 ```text
 Review requested from you
@@ -14,9 +16,9 @@ Engwire (your machine)
    your skill posts as you
 ```
 
-GitHub.com only — `GH_HOST` is pinned, so `gh` and the checkout can never disagree about which repository they mean. No new service receives your source code: Engwire drives the Git, `gh` and Claude Code already on your machine. The local workflow needs no Engwire-hosted service, no bot account, no workflow to commit, and no additional credential to your source.
+GitHub.com is the only supported GitHub host — Engwire pins `GH_HOST` for its own `gh` calls and for the review agent, and pins `GH_REPO` for the agent, so `gh pr view` and `gh pr review` default to the repository Engwire selected. No new service receives your source code: Engwire drives the Git, `gh` and Claude Code already on your machine. The local workflow needs no Engwire-hosted service, no bot account, no GitHub Actions workflow to commit, and no additional credential to your source.
 
-One installation belongs to one GitHub account — the one authenticated when it first ran. Point `ENGWIRE_HOME` somewhere else for a second. On macOS, Engwire's launchd integration supervises one installation per user: it keeps one job under a fixed label, so `engwire service install` in a second installation replaces the first one's service and says so.
+One installation belongs to one GitHub account — the one authenticated when it first ran. Point `ENGWIRE_HOME` at another *absolute* path for a second; a relative one is refused, because it would name a different installation from every directory you ran a command in. On macOS, Engwire's launchd integration supervises one installation per user: it keeps one job under a fixed label, so `engwire service install` in a second installation replaces the first one's service and says so.
 
 ## Requirements
 
@@ -40,7 +42,9 @@ That redirects to the latest release's installer, which is also reachable direct
 curl -fsSL https://engwire.com/install.sh | ENGWIRE_VERSION=0.1.0 sh
 ```
 
-macOS 13+ and Linux with glibc 2.17+, Intel and ARM. The x64 builds require AVX2 — Haswell-era Intel or newer, Excavator or newer on AMD. Those are Bun's own floors, since the binary carries its runtime; Alpine and other musl distributions are not supported yet. The installer runs what it downloaded before replacing anything, so a machine outside that range fails with nothing lost. Upgrading is the same command; it replaces the binary without disturbing a review in flight, and a background service picks the new one up on the next `engwire service install`.
+macOS 13+ and Linux with glibc 2.17+, Intel and ARM. The x64 builds require AVX2 — Haswell-era Intel or newer, Excavator or newer on AMD. Those are Bun's own floors, since the binary carries its runtime; Alpine and other musl distributions are not supported yet. The installer runs what it downloaded before replacing anything, so a machine outside that range fails with nothing lost.
+
+Upgrading is the same command; `engwire doctor` says when there is a newer release to run it for. The upgrade replaces the binary without disturbing a review in flight, and a background service picks the new binary up only when its job restarts — `engwire service install` does that on macOS; elsewhere, restart it under your own supervisor. `engwire status` names the version the runner is actually on, so you can tell when it has not.
 
 ## Use
 
@@ -52,7 +56,7 @@ engwire status              # what it is doing and what it last did
 engwire doctor              # diagnose the local setup
 ```
 
-Run `engwire setup` first to check prerequisites and write a starter config. Background supervision is macOS-only; on Linux, run `engwire run` directly under your preferred supervisor.
+Run `setup`, then [configure review rules](#configure) before starting the runner. Built-in service management is macOS-only; on Linux, run `engwire run` under your own supervisor — [docs/linux.md](docs/linux.md) provides a systemd user unit and explains its environment and shutdown differences from launchd.
 
 ## Configure
 
@@ -70,7 +74,7 @@ skill = "review-pr"
 
 The first matching rule wins, so put the specific one first — and getting that backwards is an error, not a rule that never runs. `repos` accepts `owner/name`, `owner/*` or `*`, and nothing else; a pattern Engwire cannot read is an error too.
 
-`engwire setup` writes the file with every rule commented out: Engwire starts an agent on a contributor's code, so which repositories that happens for is yours to choose, and `engwire run` refuses to start until you have.
+For a new installation, `engwire setup` writes the file with every rule commented out; it leaves an existing config unchanged. Engwire starts an agent on a contributor's code, so which repositories that happens for is yours to choose, and `engwire run` refuses to start until you have.
 
 A review request on a draft is held, not dropped: Engwire reviews it once the pull request is marked ready, without you having to ask again. A rule can opt in to reviewing drafts with `skip_drafts = false`.
 
@@ -116,7 +120,7 @@ bun run build     # cross-compiled binaries in dist/
 
 `bun run engwire <command>` runs any of the commands above straight from the source tree, so trying a change out does not need a build.
 
-The scheduling logic in `src/review/reconcile.ts` is pure, and every way this tool could embarrass you — a duplicate review, a review of a replaced revision, a review nobody asked for — is a test over plain objects in `reconcile.test.ts`.
+The scheduling logic in `src/review/reconcile.ts` is pure, with policy cases tested over plain objects in `reconcile.test.ts`. `src/store/store.test.ts` covers durable deduplication and claim transitions; `test/integration/review.test.ts` checks the path from a request to an agent invocation, including revision pinning and preflight races.
 
 ### Releases
 

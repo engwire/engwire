@@ -476,7 +476,7 @@ The cost is that a file which really is an LFS pointer stays a pointer in the ch
 
 **Acquiring the repository runs hooks too.** `reference-transaction` fires on every clone and every fetch, from both hook sources, before any tree exists — a hook of the reviewer's, running while a repository they have never read is downloaded. So the same overrides go on `clone` and `fetch` rather than on the checkout alone. One residual remains in executable-config enumeration: a clone has no configuration of its own yet, so configuration scoped by `includeIf` to Engwire's clone path is invisible to it. Nothing in a branch can request that configuration.
 
-What none of this covers, and is not meant to: once Claude is running in that directory, a skill can execute whatever its `allowed-tools` permit. The claim measured here is narrower — what *Engwire's own* git does.
+What none of this covers, and is not meant to: commands a skill asks Claude to execute once it is running in that directory. The claim measured here is narrower — what *Engwire's own* git does.
 
 ## Do `GH_REPO` and `GH_HOST` pin pull-request commands?
 
