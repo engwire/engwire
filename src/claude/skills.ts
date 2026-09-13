@@ -4,6 +4,9 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 
+/** Where to get a reviewer Engwire deliberately does not ship. */
+export const SKILLS_REPO = "https://github.com/engwire/skills";
+
 /**
  * Where Claude keeps the reviewer's own configuration.
  *

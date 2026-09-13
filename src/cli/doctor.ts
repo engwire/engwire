@@ -31,7 +31,7 @@ type Check = { label: string; ok: boolean; note: string };
  */
 export async function diagnose(
   env: Record<string, string | undefined> = process.env,
-  options: { requireReviewRules?: boolean; probeTimeoutMs?: number } = {},
+  options: { allowNoReviewRules?: boolean; probeTimeoutMs?: number } = {},
 ): Promise<Check[]> {
   // A test seam: production never passes it. `createGh`'s `timeoutMs` is not
   // one — this is what production hands it. The constant on `PROBE_TIMEOUT_MS`
@@ -62,13 +62,20 @@ export async function diagnose(
       // `setup`, which writes one deliberately. Whether it counts is the
       // caller's question, not this one's.
       const rules = config.reviews.length;
+      // One condition, two readings, so the note follows the verdict rather
+      // than the glyph alone: a ✓ beside "nothing will be reviewed" says two
+      // opposite things at once, and the same sentence marked ✗ a moment later
+      // by `doctor` reads as a report that cannot make its mind up.
+      const ok = rules > 0 || options.allowNoReviewRules === true;
       checks.push({
         label: "config",
-        ok: rules > 0 || options.requireReviewRules === false,
+        ok,
         note:
           rules > 0
             ? `${rules} rule(s) in ${p.configFile}`
-            : `no [[review]] rules in ${p.configFile} — nothing will be reviewed`,
+            : ok
+              ? `no [[review]] rules yet`
+              : `no [[review]] rules in ${p.configFile} — add one, then re-run`,
       });
     } catch (error) {
       checks.push({

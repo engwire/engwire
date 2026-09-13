@@ -58,8 +58,10 @@ const PREAMBLE = `# Engwire — automatic local review of pull requests that req
 # which Claude Code skill should look at it?
 #
 # The skill is yours. Engwire ships none and writes none: \`skill\` names one
-# already installed in your Claude user skills, and what a review *is* — what
-# it reads, what it says, whether it posts — is entirely that skill's business.
+# installed in your Claude user skills, and what a review *is* — what it reads,
+# what it says, whether it posts — is entirely that skill's business. There is
+# one to start from at https://github.com/engwire/skills, and a reviewer you
+# wrote yourself goes in the same place under a name of your own.
 #
 # Nothing is reviewed until you uncomment a rule and name the repositories you
 # want reviewed. Engwire starts an agent on a contributor's code, so which
@@ -67,7 +69,7 @@ const PREAMBLE = `# Engwire — automatic local review of pull requests that req
 
 # [[review]]
 # repos = ["your-org/*"]
-# skill = "review-pr"
+# skill = "engwire-review"
 #
 # A review request on a draft waits until the pull request is marked ready,
 # without you having to ask again. Set this to false to review drafts too.

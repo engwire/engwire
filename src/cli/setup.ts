@@ -14,7 +14,7 @@
 
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { claudeRootProblem, skillFile, userSkills } from "../claude/skills.ts";
+import { claudeRootProblem, skillFile, SKILLS_REPO, userSkills } from "../claude/skills.ts";
 import { isSkillName, starterConfig } from "../config/config.ts";
 import { absolutePath, paths } from "../config/paths.ts";
 import { diagnose } from "./doctor.ts";
@@ -66,20 +66,20 @@ export function backgroundNote(platform: string = process.platform): string[] {
  * a relative one makes `skillFile` throw exactly like `userSkills`, so the
  * fallback branch is no safer than the branch it stands in for.
  */
-function skillListing(): { names: string[] } | { problem: string; reported: boolean } {
+function skillListing(): { names: string[] } | { problem: string; reportedAbove: boolean } {
   const problem = claudeRootProblem();
-  // `reported`, because the report above carries exactly one of these two: a
+  // `reportedAbove`, because the report carries exactly one of these two: a
   // root Engwire cannot name gets a red `claude root` row, and a directory that
   // will not list gets nothing at all — the root is absolute, so that row is a
   // ✓, and a config this command has only just written names no skill, so no
   // per-skill row went looking either.
-  if (problem) return { problem, reported: true };
+  if (problem) return { problem, reportedAbove: true };
   try {
     return { names: userSkills().filter(isSkillName) };
   } catch (error) {
     return {
       problem: error instanceof Error ? error.message : String(error),
-      reported: false,
+      reportedAbove: false,
     };
   }
 }
@@ -114,7 +114,7 @@ export async function setup(): Promise<number> {
   // A fresh install has no review rules on purpose, so their absence is not a
   // failed setup. `doctor` and `service install` still treat it as fatal,
   // because a runner with no rules cannot do anything.
-  const checks = await diagnose(process.env, { requireReviewRules: !created });
+  const checks = await diagnose(process.env, { allowNoReviewRules: created });
   for (const check of checks) {
     console.log(`${check.ok ? "✓" : "✗"} ${check.label.padEnd(11)} ${check.note}`);
   }
@@ -127,24 +127,30 @@ export async function setup(): Promise<number> {
     console.log("on a contributor's code, so which repositories that happens for is");
     console.log(`yours to choose. Uncomment a [[review]] rule in ${p.configFile}.`);
     console.log("");
-    // Engwire ships no skill. Offer installed names the config accepts without
-    // inventing what a review should do or handing someone an invalid value.
+    // Engwire ships no reviewer, so a fresh reader may have nothing `skill`
+    // can name — the single step between a configured runner and a first
+    // review. Saying that first, with somewhere to get one, is what the
+    // listing alone never said: names of skills that review nothing read as a
+    // menu of candidates, and the nearest-sounding one gets picked.
     // Listing failures must still leave the next steps visible after writing config.
     const listing = skillListing();
+    console.log("Its `skill` names the Claude Code skill that does the reviewing.");
+    console.log(`Engwire ships none — there is one to copy at ${SKILLS_REPO}`);
+    console.log("");
     if ("problem" in listing) {
       // Reuse the failed root row; directory-read failures need their own message.
-      console.log("Its `skill` names a Claude Code skill of yours. Which ones you have");
       console.log(
-        listing.reported ? "cannot be read — see the ✗ above." : `cannot be read: ${listing.problem}`,
+        listing.reportedAbove
+          ? "Installed skills cannot be listed — see ✗ claude root above."
+          : `Installed skills cannot be listed: ${listing.problem}`,
       );
     } else if (listing.names.length > 0) {
-      console.log("Its `skill` names one of yours:");
+      console.log("Or name one you already have. Engwire cannot tell which of these is a reviewer:");
       for (const line of columns(listing.names)) console.log(`  ${line}`);
     } else {
       // Safe here and only here: the listing succeeded, so the root `skillFile`
       // resolves through is one Engwire can name.
-      console.log("Its `skill` names a Claude Code skill of yours, and none here can go");
-      console.log(`in a rule yet — Engwire ships no reviewer. Create ${skillFile("<name>")}.`);
+      console.log(`Or write your own at ${skillFile("<name>")}.`);
     }
   } else {
     console.log(`Config: ${p.configFile}`);

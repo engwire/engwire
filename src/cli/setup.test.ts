@@ -125,15 +125,25 @@ esac
     expect(config.advanced.ghBin).toBe(join(tools, "gh"));
     expect(config.advanced.claudeBin).toBe(join(tools, "claude"));
 
-    // The skill list as a terminal receives it: every name a rule could hold and
-    // no other, wrapped at the default width and indented by two.
-    const lines = said.split("\n");
-    const first = lines.indexOf("Its `skill` names one of yours:") + 1;
-    expect(first).toBeGreaterThan(0);
-    const listed = lines.slice(first, lines.indexOf("", first));
+    // A reviewer has to come from somewhere, and Engwire ships none: the one
+    // step between a written config and a first review is named here or
+    // nowhere a new reader will look.
+    expect(said).toContain("https://github.com/engwire/skills");
+    expect(said).toContain("cannot tell which of these is a reviewer");
 
-    expect(listed.length).toBeGreaterThan(1);
-    expect(listed).toEqual(columns(installed).map((line) => `  ${line}`));
+    // The skill list as a terminal receives it: every name a rule could hold and
+    // no other, wrapped at the default width and indented by two. Offered as
+    // the alternative to copying one, not as an answer to "which of these
+    // reviews a pull request" — none of them need.
+    const lines = said.split("\n");
+    const expected = columns(installed).map((line) => `  ${line}`);
+    expect(expected.length).toBeGreaterThan(1);
+    // Located by the list itself rather than by the sentence above it: the
+    // heading is copy, and rewording it should not fail a test whose subject
+    // is that every name a rule could hold is listed, wrapped and indented.
+    const first = lines.indexOf(expected[0]!);
+    expect(first).toBeGreaterThan(-1);
+    expect(lines.slice(first, first + expected.length)).toEqual(expected);
     expect(said).not.toContain("not a skill name");
   });
 
@@ -169,18 +179,55 @@ esac
 
     // Not an empty list: "you have none" sends somebody off to write a skill
     // they may already have.
-    expect(said).not.toContain("none here can go");
-    expect(said).toContain("cannot be read");
+    expect(said).not.toContain("Or write your own at");
+    expect(said).toContain("cannot be listed");
+    // However the listing fails, the way out of it does not.
+    expect(said).toContain("https://github.com/engwire/skills");
     // Pointed at, not repeated. The `claude root` row above has already spent
     // forty words on this exact root, and the listing saying them again puts
     // the same paragraph twice on the one screen somebody is reading to find
     // out what to do next — so presence is not the assertion, count is.
-    expect(said).toContain("see the \u2717 above");
+    expect(said).toContain("see \u2717 claude root above");
+    // "above" is a claim about the page, so the row has to precede the sentence
+    // that sends the reader back to it: the first mark is the row's, not the
+    // one inside the sentence, and a guidance block printed before the table
+    // would fail this rather than quietly point the wrong way.
+    expect(said.indexOf("\u2717 claude root")).toBeLessThan(
+      said.indexOf("see \u2717 claude root above"),
+    );
     expect(said.split("not an absolute path")).toHaveLength(2);
     // The guidance it exists to print still gets printed. Whether the command
     // *fails* is `doctor`'s row to decide and is asserted there; what this pins
     // is that setup reaches its own last line instead of a stack trace.
     expect(said).toContain("engwire run --once");
+    expect(said).toContain("Requests made before that are not reviewed");
+  });
+
+  test("a root with no skills says where one goes, not that there is nothing to name", async () => {
+    // The third way the listing can end, and the one a genuinely new machine
+    // hits. There is nothing to list, so the answer is the known source and
+    // where an owned reviewer would go — and the heading that introduces a
+    // list must not print, leaving a sentence with nothing under it.
+    const root = join(dir, "empty-claude");
+    mkdirSync(join(root, "skills"), { recursive: true });
+    // Pinned to the stubs `beforeEach` wrote, for the reason the tests above give.
+    process.env.PATH = dir;
+    process.env.CLAUDE_CONFIG_DIR = root;
+
+    const log = console.log;
+    let said = "";
+    console.log = (message: unknown) => {
+      said += `${message}\n`;
+    };
+    try {
+      await setup();
+    } finally {
+      console.log = log;
+    }
+
+    expect(said).toContain("https://github.com/engwire/skills");
+    expect(said).toContain(`Or write your own at ${skillFile("<name>")}.`);
+    expect(said).not.toContain("Engwire cannot tell");
     expect(said).toContain("Requests made before that are not reviewed");
   });
 
@@ -218,9 +265,10 @@ esac
       console.log = log;
     }
 
-    expect(said).not.toContain("none here can go");
-    expect(said).not.toContain("see the ✗ above");
-    expect(said).toContain("cannot be read: ");
+    expect(said).not.toContain("Or write your own at");
+    expect(said).not.toContain("claude root above");
+    expect(said).toContain("cannot be listed: ");
+    expect(said).toContain("https://github.com/engwire/skills");
     expect(said).toContain("ELOOP");
     expect(said).toContain("Requests made before that are not reviewed");
   });

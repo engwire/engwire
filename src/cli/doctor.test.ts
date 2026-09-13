@@ -550,6 +550,28 @@ case "$*" in
 esac
 `;
 
+  test("a config with no rules reads as one thing to each caller that asks", async () => {
+    // The same file, two questions. For `setup` the rule is
+    // the next thing the reader is told to add; `doctor` is asked whether a
+    // review could run, and none can. Sharing one sentence across both put a ✓
+    // beside "nothing will be reviewed" and then marked that exact sentence ✗
+    // seconds later, which reads as a report that cannot make its mind up.
+    const { home } = tools(WORKING_CLAUDE);
+    writeFileSync(join(home, "config", "config.toml"), "[advanced]\n");
+    const env = { ENGWIRE_HOME: home, PATH: join(dir, "tools"), HOME: dir };
+
+    const afterSetup = await diagnose(env, { allowNoReviewRules: true });
+    const row = (checks: Awaited<ReturnType<typeof diagnose>>) =>
+      checks.find((check) => check.label === "config");
+    expect(row(afterSetup)).toMatchObject({ ok: true });
+    expect(row(afterSetup)?.note).toBe("no [[review]] rules yet");
+
+    // And the failing one carries the remedy, as every other red row does.
+    const asked = await diagnose(env);
+    expect(row(asked)).toMatchObject({ ok: false });
+    expect(row(asked)?.note).toContain("add one");
+  });
+
   test("a broken config does not stop the rest of the report", async () => {
     // This is the command someone runs *because* something is wrong. A config
     // it cannot parse has to become one red row, not the end of the report —
@@ -871,6 +893,11 @@ case "$1" in --version) echo 'gh version 2.31.0 (2023-06-06)' ;; *) echo alice ;
     expect(existsSync(ran), "claude was not started").toBe(false);
     expect(checks.find((check) => check.label === "claude root")).toMatchObject({ ok: false });
     expect(checks.find((check) => check.label === "claude")?.note).toContain("claude root above");
+    // That sentence points at a row, so the row has to be there: a reorder
+    // would otherwise leave the report telling the reader to look up at
+    // something printed below.
+    const at = (label: string) => checks.findIndex((check) => check.label === label);
+    expect(at("claude root")).toBeLessThan(at("claude"));
     // Only Claude's probe is gated by Claude's root — the other two ran, which
     // is the asymmetry that separates this from the zsh gate.
     expect(existsSync(gitRan), "git was started").toBe(true);
