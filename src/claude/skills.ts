@@ -5,33 +5,59 @@ import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 
 /**
+ * Where Claude keeps the reviewer's own configuration.
+ *
+ * `env` is an argument for the same reason it is one in `paths()` — `service
+ * install` asks what the *service* will see, not what this shell sees.
+ */
+function claudeRoot(env: Record<string, string | undefined>): string {
+  return env.CLAUDE_CONFIG_DIR ?? join(env.HOME || homedir(), ".claude");
+}
+
+/**
+ * The one thing Engwire can establish about that root without inspecting it,
+ * asked of the resolved answer rather than of the variable it came from, since
+ * either source can be relative. Engwire's preflight resolves a relative root
+ * from the directory the runner started in; the review runs from another. What
+ * Claude makes of a relative root is unmeasured, so what follows from that is
+ * not "Claude will read the checkout" but the weaker and sufficient "these two
+ * cannot be shown to name the same skills".
+ */
+function relativeRootProblem(root: string): string | null {
+  return isAbsolute(root)
+    ? null
+    : `Claude's configuration root is not an absolute path (${JSON.stringify(root)}); a review runs in the pull request's own checkout, so Engwire cannot tell whether the skills it checks are the ones Claude will load there. Use an absolute path.`;
+}
+
+/**
  * `--setting-sources user` is the boundary, so user scope is the only scope
  * that counts — a skill checked into the branch under review is deliberately
  * not loaded, and one from a plugin is not what a rule names.
  *
  * That skills follow `CLAUDE_CONFIG_DIR` is inferred from the CLI's treatment
  * of the rest of that root, so a failed check names the exact path inspected
- * rather than claiming more.
+ * rather than claiming more. It stays an inference: measuring it needs a
+ * relocated root, and authentication does not follow one (`docs/experiments.md`).
  *
- * What is validated is the resolved root, not the variable it came from: either
- * source can be relative, and Claude resolves a relative root from the pull
- * request it runs in rather than from wherever the runner started. Throwing is
- * what keeps listing and preflight from answering about different directories.
- *
- * `env` is an argument for the same reason it is one in `paths()` — `service
- * install` asks what the *service* will see, not what this shell sees.
+ * Throwing is what keeps listing and preflight from answering about different
+ * directories; `claudeRootProblem` is the same refusal as evidence, for the
+ * callers that render a problem rather than act on a path.
  */
 function skillsDir(env: Record<string, string | undefined>): string {
-  const root = env.CLAUDE_CONFIG_DIR ?? join(env.HOME || homedir(), ".claude");
-  if (!isAbsolute(root)) {
-    throw new Error(
-      `Claude's configuration root is not an absolute path (${JSON.stringify(root)}); Claude resolves it from the directory it runs in, which is the pull request`,
-    );
-  }
+  const root = claudeRoot(env);
+  const problem = relativeRootProblem(root);
+  if (problem) throw new Error(problem);
   return join(root, "skills");
 }
 
-/** The path Claude uses to identify an installed skill. Throws on a root this cannot inspect. */
+/** What is wrong with Claude's configuration root, or null. */
+export function claudeRootProblem(
+  env: Record<string, string | undefined> = process.env,
+): string | null {
+  return relativeRootProblem(claudeRoot(env));
+}
+
+/** The path Engwire preflights for an installed skill. Throws on a root this cannot inspect. */
 export function skillFile(
   name: string,
   env: Record<string, string | undefined> = process.env,
@@ -143,14 +169,11 @@ export function skillPreflightProblem(
   if (name.toLowerCase() === RESERVED) {
     return `${name} is a folder name Claude Code reserves, so it is skipped rather than run`;
   }
-  // The root is resolved here rather than guarded separately: `skillsDir`
-  // refuses one it cannot inspect, and this is where that becomes evidence.
-  let file: string;
-  try {
-    file = skillFile(name, env);
-  } catch (error) {
-    return error instanceof Error ? error.message : String(error);
-  }
+  // Asked before the path is built rather than caught afterwards: `skillFile`
+  // cannot throw once the root is known to be one Engwire can inspect.
+  const rootProblem = claudeRootProblem(env);
+  if (rootProblem) return rootProblem;
+  const file = skillFile(name, env);
 
   let source: string;
   try {

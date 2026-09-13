@@ -55,6 +55,42 @@ describe("Store", () => {
     expect(second).toBe(first);
   });
 
+  test("every poll overwrites the last one, rather than being refused", () => {
+    // `meta.key` is the primary key, so a second plain insert here would not
+    // record the poll — it would throw `UNIQUE constraint failed`, which is not
+    // a `GhError` and so takes the runner down rather than costing one cycle.
+    // The runner polls once a minute, so that is a crash about sixty seconds
+    // in, and the first poll always works.
+    expect(store.lastPoll()).toBeNull();
+    store.recordPoll(new Date("2026-08-01T10:00:00Z"));
+    expect(store.lastPoll()).toBe("2026-08-01T10:00:00.000Z");
+
+    store.recordPoll(new Date("2026-08-01T10:01:00Z"));
+    store.recordPoll(new Date("2026-08-01T10:02:00Z"));
+
+    // The latest, not the first: `status` shows how long the runner has been
+    // getting nowhere, which the very first poll would answer wrongly forever.
+    expect(store.lastPoll()).toBe("2026-08-01T10:02:00.000Z");
+  });
+
+  test("a poll recorded inside a transaction goes back with it", () => {
+    // `pollAndSchedule` records the poll as the last statement of the same
+    // transaction that writes the decisions, so the two land together or not
+    // at all. Recorded outside it, a crash in the gap leaves durable decisions
+    // beside a `status` still reporting the previous poll — the report
+    // disagreeing with the very fact it exists to make trustworthy.
+    expect(store.lastPoll()).toBeNull();
+
+    expect(() =>
+      store.transaction(() => {
+        store.recordPoll(new Date("2026-08-01T10:00:00Z"));
+        throw new Error("the cycle failed after deciding");
+      }),
+    ).toThrow();
+
+    expect(store.lastPoll()).toBeNull();
+  });
+
   test("an installation belongs to the first account that used it", () => {
     // The queue is a list of decisions made on one person's behalf, and no run
     // row names them; a restart under another account must not inherit it.
@@ -62,6 +98,21 @@ describe("Store", () => {
     expect(store.bindReviewer("alice")).toBe("alice");
     expect(store.bindReviewer("bob")).toBe("alice");
     expect(store.reviewerLogin()).toBe("alice");
+  });
+
+  test("a stored owner is the answer whatever it holds, rather than a second insert", () => {
+    // A database an older Engwire poisoned by recording an empty answer from
+    // `gh`. Read as falsy, this fell through to an insert the primary key
+    // refuses — so every later start threw `UNIQUE constraint failed` and the
+    // installation could not be started again even once `gh` was fixed. It is
+    // a reportable mismatch, not a crash.
+    store.bindReviewer("");
+
+    expect(store.bindReviewer("")).toBe("");
+    // And it stays that owner: the binding is written once and never moved, so
+    // a later good answer does not silently adopt the installation.
+    expect(store.bindReviewer("alice")).toBe("");
+    expect(store.reviewerLogin()).toBe("");
   });
 
   test("knownEventIds reports only what it has seen", () => {
@@ -80,6 +131,19 @@ describe("Store", () => {
     expect(store.claimNext()?.id).toBe("old");
     expect(store.claimNext()?.id).toBe("new");
     expect(store.claimNext()).toBeNull();
+  });
+
+  test("claimNext breaks a tie on the event id as a number, not as text", () => {
+    // One poll discovers a batch of requests, and GitHub's timestamps resolve
+    // only to the second — so `requested_at` can tie exactly, leaving the event
+    // id as the only thing left to order by. The column is TEXT, where "10"
+    // sorts before "9", so the cast is what keeps the queue in the order GitHub
+    // numbered them. `reconcile` orders the same way and its property test
+    // holds that end; nothing held this one.
+    seed(store, { id: "ninth", eventId: "9", requestedAt: "2026-08-01T10:00:00Z" });
+    seed(store, { id: "tenth", eventId: "10", requestedAt: "2026-08-01T10:00:00Z" });
+
+    expect(store.claimNext()?.id).toBe("ninth");
   });
 
   test("claiming records the start, and says so in what it returns", () => {
@@ -283,6 +347,27 @@ describe("Store", () => {
     store.finish("done", "dismissed", "no_automation");
 
     expect(store.activeRuns().map((run) => run.id).sort()).toEqual(["queued", "running"]);
+  });
+
+  test("recentRuns is ordered by what happened last, not by what arrived last", () => {
+    // The two disagree exactly where the report needs them not to. A review
+    // asked for before everything else and finished a moment ago is the most
+    // recent thing this installation did; ordered by arrival it printed below
+    // rows nothing had touched since, and once the limit bit it dropped out of
+    // the report altogether while staler rows stayed.
+    //
+    // `asOf` in `cli/status.ts` dates each row the same way. They are one rule,
+    // and this is where the two are held to it: sorted on one clock and
+    // labelled with the other, the age column simply does not descend.
+    seed(store, { id: "old", eventId: "1", requestedAt: "2026-08-01T10:00:00Z", createdAt: "2026-08-01T10:00:00Z" });
+    seed(store, { id: "new", eventId: "2", requestedAt: "2026-08-01T11:00:00Z", createdAt: "2026-08-01T11:00:00Z" });
+
+    expect(store.claimNext({ now: new Date("2026-08-01T12:00:00Z") })?.id).toBe("old");
+    store.finish("old", "completed", null, { now: new Date("2026-08-01T13:00:00Z") });
+
+    expect(store.recentRuns().map((run) => run.id)).toEqual(["old", "new"]);
+    // And the limit cuts the least recently active, not the earliest created.
+    expect(store.recentRuns(1).map((run) => run.id)).toEqual(["old"]);
   });
 });
 

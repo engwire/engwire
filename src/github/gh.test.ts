@@ -1,9 +1,9 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createGh, GH_TIMEOUT_MS, GhError } from "./gh.ts";
+import { createGh, ghConfigProblem, GH_TIMEOUT_MS, GhAnswerError, GhError } from "./gh.ts";
 
 // A local gh stub exercises environment pinning and subprocess failures.
 // These tests make no GitHub requests.
@@ -15,6 +15,14 @@ writeFileSync(
 [ "$1" = "fail" ] && { echo "could not resolve host" >&2; exit 4; }
 [ "$1" = "hang" ] && { echo $$ > "${dir}/hang.pid"; trap "" TERM; sleep 5 & wait; }
 [ "$1" = "signal" ] && { echo >&2; kill -TERM $$; sleep 5; }
+# A wrapper that exits 0 saying nothing, or saying something that is not a
+# login. Tested for being set rather than non-empty, since empty is the case
+# that matters most and a plain -n cannot tell it from unset.
+[ -n "\${FAKE_GH_ANSWER+set}" ] && { printf '%s' "$FAKE_GH_ANSWER"; exit 0; }
+# The loader and interpreter selectors, for the test that asserts none of them
+# survive this edge. Echoed rather than recorded to a file so the assertion
+# reads the same answer the caller does.
+[ "$1" = "startup" ] && { printf 'LD_PRELOAD=[%s] NODE_OPTIONS=[%s] BASH_ENV=[%s]' "\${LD_PRELOAD-unset}" "\${NODE_OPTIONS-unset}" "\${BASH_ENV-unset}"; exit 0; }
 echo "$GH_HOST"
 `,
 );
@@ -24,14 +32,14 @@ afterAll(() => rm(dir, { recursive: true, force: true }));
 
 describe("createGh", () => {
   test("pins GH_HOST over whatever the caller's environment says", async () => {
-    const gh = createGh(bin, { PATH: process.env.PATH, GH_HOST: "github.acme.example" });
+    const gh = createGh(bin, { env: { PATH: process.env.PATH, GH_HOST: "github.acme.example" } });
     expect((await gh.text(["api", "user"])).trim()).toBe("github.com");
   });
 
   test("a non-zero gh is a GhError carrying what went wrong", async () => {
     // The type the loop's outage policy is keyed on: a `GhError` waits for the
     // next poll, anything else takes the runner down.
-    const gh = createGh(bin, { PATH: process.env.PATH });
+    const gh = createGh(bin, { env: { PATH: process.env.PATH } });
     const error = await gh.text(["fail"]).then(
       () => null,
       (thrown: unknown) => thrown,
@@ -53,7 +61,7 @@ describe("createGh", () => {
     // Remove an earlier invocation's pid before starting this one.
     const pidfile = join(dir, "hang.pid");
     rmSync(pidfile, { force: true });
-    const gh = createGh(bin, { PATH: process.env.PATH }, 1_000);
+    const gh = createGh(bin, { env: { PATH: process.env.PATH }, timeoutMs: 1_000 });
     const error = await gh.text(["hang"]).then(
       () => null,
       (thrown: unknown) => thrown,
@@ -77,7 +85,7 @@ describe("createGh", () => {
   });
 
   test("reports signal termination when stderr says nothing", async () => {
-    const gh = createGh(bin, { PATH: process.env.PATH });
+    const gh = createGh(bin, { env: { PATH: process.env.PATH } });
     const error = await gh.text(["signal"]).then(
       () => null,
       (thrown: unknown) => thrown,
@@ -89,7 +97,7 @@ describe("createGh", () => {
 
   test("wraps invalid JSON in a GhError", async () => {
     // A bare `SyntaxError` would be treated as a local failure.
-    const gh = createGh(bin, { PATH: process.env.PATH });
+    const gh = createGh(bin, { env: { PATH: process.env.PATH } });
     const error = await gh.json(["api", "user"]).then(
       () => null,
       (thrown: unknown) => thrown,
@@ -110,7 +118,7 @@ describe("createGh", () => {
     const cwd = process.cwd();
     process.chdir(dir);
     try {
-      const poisoned = createGh("gh", { PATH: `.:${join(dir, "nowhere")}` });
+      const poisoned = createGh("gh", { env: { PATH: `.:${join(dir, "nowhere")}` } });
       const error = await poisoned.text(["api", "user"]).then(
         () => null,
         (thrown: unknown) => thrown,
@@ -122,9 +130,193 @@ describe("createGh", () => {
       expect(error).toBeInstanceOf(Error);
       expect(String(error)).toContain("gh");
       // The same call with the relative entry honoured is what this prevents.
-      expect((await createGh("gh", { PATH: dir }).text(["api", "user"])).trim()).toBe("github.com");
+      const honoured = await createGh("gh", { env: { PATH: dir } }).text(["api", "user"]);
+      expect(honoured.trim()).toBe("github.com");
     } finally {
       process.chdir(cwd);
     }
+  });
+});
+
+describe("a gh the caller stops", () => {
+  test("refuses to start once the caller has already stopped", async () => {
+    // The same reason `git` refuses one: a listener added to an aborted signal
+    // never fires, so this would spawn a `gh` nothing could hurry and then wait
+    // out the full deadline — during a shutdown, which is when it costs most.
+    const pidfile = join(dir, "hang.pid");
+    rmSync(pidfile, { force: true });
+    const gh = createGh(bin, { env: { PATH: process.env.PATH }, signal: AbortSignal.abort() });
+
+    const error = await gh.text(["hang"]).then(
+      () => null,
+      (thrown: unknown) => thrown,
+    );
+
+    expect(error).toBeInstanceOf(GhError);
+    expect((error as GhError).message).toContain("stopped before it started");
+    expect(existsSync(pidfile)).toBe(false);
+  });
+
+  test("returns when stopped, instead of waiting out the deadline", async () => {
+    // The gap this closes: `runLoop` checks for a shutdown after every awaited
+    // step, but the identity check runs immediately before the agent spawns, so
+    // a `gh` already in flight would otherwise hold the stop for the whole of
+    // GH_TIMEOUT_MS. The production deadline is deliberately left in place here
+    // — two minutes is what the call would take without the signal.
+    const pidfile = join(dir, "hang.pid");
+    rmSync(pidfile, { force: true });
+    const controller = new AbortController();
+    const gh = createGh(bin, { env: { PATH: process.env.PATH }, signal: controller.signal });
+    const running = gh.text(["hang"]).then(
+      () => null,
+      (thrown: unknown) => thrown,
+    );
+
+    // The stub is up, so the abort has a process to reach rather than racing it.
+    while (!existsSync(pidfile)) await Bun.sleep(10);
+    const startedAt = Date.now();
+    controller.abort();
+    const error = await running;
+
+    expect(error).toBeInstanceOf(GhError);
+    expect((error as GhError).message).toContain("stopped before it answered");
+    expect((error as GhError).exitCode).toBeNull();
+    // That it returns at all, and quickly. What this does *not* prove is that
+    // the reads were cancelled: `abandon` rejects the race directly, so the
+    // call comes back at the same speed either way. Measured, and further than
+    // this file — deleting the cancels leaves the entire suite green, so
+    // nothing at this call site holds them to account and `read-text.test.ts`
+    // is where that happens.
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
+  });
+});
+
+describe("login", () => {
+  test.each([
+    ["nothing at all", ""],
+    ["only whitespace", "   \n"],
+    ["something with a space in it", "not a login\n"],
+    // A wrapper that dropped the `--jq` and handed back the body.
+    ["a whole JSON object", '{"login":"alice","id":1}\n'],
+    ["a quoted string", '"alice"\n'],
+    // The empty answer in a costume: no whitespace and no object punctuation,
+    // so only the opening bracket tells it apart from a name.
+    ["an empty JSON array", "[]\n"],
+    ["a one-element JSON array", "[123]\n"],
+    // The one that arrives by accident: a wrapper that lets colour through.
+    // It carries no space, no JSON punctuation and no leading bracket, so only
+    // the control characters themselves tell it from a name — and bound, it
+    // matches no reviewer and cannot be undone.
+    ["an account wrapped in colour codes", "\u001b[32malice\u001b[0m\n"],
+    ["an account carrying a C1 line break", "al\u0085ice\n"],
+  ])("refuses a gh that answers %s", async (_name, answer) => {
+    // This value is an identity, not a string: it is written to the database
+    // once and never moved, discovery matches it against
+    // `requested_reviewer.login`, and the runner refuses to start under any
+    // other account. An empty one was recorded as the owner, matched no
+    // reviewer so nothing was ever reviewed, and then failed the next run's
+    // insert on the primary key — a silent installation that could not be
+    // started again even after `gh` was fixed.
+    const gh = createGh(bin, { env: { PATH: process.env.PATH, FAKE_GH_ANSWER: answer } });
+
+    const error = await gh.login().then(
+      () => null,
+      (thrown: unknown) => thrown,
+    );
+
+    // A `GhError`, so `accountMatches` still holds a review rather than taking
+    // the runner down mid-checkout — but its own type, because this is not an
+    // outage: waiting cannot repair a `gh_bin` wrapper, and both `run` and
+    // `doctor` would otherwise report it as GitHub being unreachable.
+    expect(error).toBeInstanceOf(GhAnswerError);
+    expect(error).toBeInstanceOf(GhError);
+    expect((error as GhError).message).toContain("expected a GitHub login");
+  });
+
+  test.each([
+    ["an ordinary login, hyphens and all", "octo-cat-99"],
+    // Refusing this is why the rule is drawn around response shapes rather
+    // than around GitHub's username grammar: a token-authenticated app answers
+    // with a name that grammar rejects, and this repository's own pull
+    // requests are opened by one.
+    ["a token-authenticated app", "engwire-agent[bot]"],
+  ])("accepts %s", async (_name, answer) => {
+    const gh = createGh(bin, {
+      env: { PATH: process.env.PATH, FAKE_GH_ANSWER: `${answer}\n` },
+    });
+
+    expect(await gh.login()).toBe(answer);
+  });
+});
+
+describe("what the environment can run before gh does", () => {
+  test("the startup-code selectors do not reach gh", async () => {
+    // Not a precaution carried over from Claude's edge: measured, a relative
+    // `LD_PRELOAD` ran a constructor inside `gh --version` on Debian and inside
+    // an ordinary macOS `gh` too — the `DYLD_*` stripping that protects a
+    // signed binary does not extend to one installed the usual way. This edge
+    // is given no cwd of its own, so it stands wherever the runner does, which
+    // can be a checkout of the branch.
+    // `DYLD_*` is deliberately not among them. Darwin strips that whole
+    // namespace before a SIP-protected binary starts and `#!/bin/sh` is one, so
+    // a row here would read `[unset]` with the rule removed — a test that cannot
+    // fail. Namespace membership is asserted directly in `environment.test.ts`.
+    const answer = await createGh(bin, {
+      env: {
+        ...process.env,
+        LD_PRELOAD: "./libengwire.so",
+        NODE_OPTIONS: "--require ./engwire.cjs",
+        BASH_ENV: "./engwire-bash-env",
+      },
+    }).text(["startup"]);
+
+    expect(answer).toBe(
+      "LD_PRELOAD=[unset] NODE_OPTIONS=[unset] BASH_ENV=[unset]",
+    );
+  });
+});
+
+describe("ghConfigProblem", () => {
+  // Every route to gh's configuration, each with a value that resolves from
+  // whatever directory a command was run in — which for a review is the pull
+  // request. The branch would then supply `hosts.yml`, deciding which account
+  // posts, beside a `config.yml` whose aliases can be `!` shell commands.
+  //
+  // Refused rather than resolved absolutely. Naming the same directory
+  // absolutely would stop it moving between the runner and the review and pin
+  // the branch's copy just as faithfully — absolute is not trusted, and this is
+  // the one relative-path hazard in the project where the origin, not the
+  // movement, is the fault.
+  //
+  // The `HOME` rows are the ones that hide: empty and unset both look like no
+  // setting at all, and both mean "here" — gh does not ask the operating system
+  // for the account's home the way `paths()` does (measured, experiments.md),
+  // so `locationProblem` passes exactly these two.
+  test.each([
+    ["GH_CONFIG_DIR names it", { GH_CONFIG_DIR: "gh-config" }, "GH_CONFIG_DIR"],
+    ["XDG_CONFIG_HOME reaches it", { XDG_CONFIG_HOME: "cfg" }, "XDG_CONFIG_HOME"],
+    ["HOME reaches it", { HOME: "home" }, "HOME"],
+    ["HOME is empty", { HOME: "" }, "HOME"],
+    ["HOME is not set at all", {}, "HOME"],
+    // The fall-through rows: an empty value at a higher precedence is not a
+    // root of its own, so the variable blamed has to be the one that decided.
+    ["GH_CONFIG_DIR is empty over a relative XDG_CONFIG_HOME", { GH_CONFIG_DIR: "", XDG_CONFIG_HOME: "cfg" }, "XDG_CONFIG_HOME"],
+    ["XDG_CONFIG_HOME is empty over a relative HOME", { XDG_CONFIG_HOME: "", HOME: "home" }, "HOME"],
+  ])("refuses a configuration root when %s", (_case, env, blamed) => {
+    const problem = ghConfigProblem(env);
+
+    expect(problem).toContain(blamed);
+    expect(problem).toContain("absolute path");
+  });
+
+  test.each([
+    ["GH_CONFIG_DIR", { GH_CONFIG_DIR: "/opt/gh", XDG_CONFIG_HOME: "cfg", HOME: "home" }],
+    ["XDG_CONFIG_HOME", { XDG_CONFIG_HOME: "/etc/xdg", HOME: "home" }],
+    ["HOME", { HOME: "/Users/dev" }],
+  ])("accepts a root %s names absolutely, whatever it shadows", (_case, env) => {
+    // The shadowed values are relative on purpose: gh reads one root, so a
+    // refusal that fired on a variable gh never consults would refuse a
+    // perfectly good machine.
+    expect(ghConfigProblem(env)).toBeNull();
   });
 });

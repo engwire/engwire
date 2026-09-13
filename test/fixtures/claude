@@ -5,6 +5,37 @@ echo "argv: $*"
 echo "cwd: $(pwd)"
 echo "PATH: $PATH"
 echo "GH_REPO: $GH_REPO"
+# Unset and empty are different answers here, and only one of them is the
+# boundary holding: git honours an empty GIT_DIR too.
+echo "GIT_DIR: [${GIT_DIR-<unset>}]"
+echo "GIT_CONFIG_GLOBAL: [${GIT_CONFIG_GLOBAL-<unset>}]"
+echo "GIT_CONFIG_SYSTEM: [${GIT_CONFIG_SYSTEM-<unset>}]"
+# The three roots gh resolves its configuration from. A relative one would be
+# read from this checkout, not from wherever the runner verified the account.
+echo "GH_CONFIG_DIR: [${GH_CONFIG_DIR-<unset>}]"
+echo "XDG_CONFIG_HOME: [${XDG_CONFIG_HOME-<unset>}]"
+echo "HOME: [${HOME-<unset>}]"
+# Two mechanisms from one namespace: startup code, and a module search path.
+# The sentinel is neither, and belongs to nobody — it is here so a test can
+# tell a namespace being dropped from a list of two names being dropped.
+echo "NODE_OPTIONS: [${NODE_OPTIONS-<unset>}]"
+echo "NODE_PATH: [${NODE_PATH-<unset>}]"
+echo "NODE_ENGWIRE_SENTINEL: [${NODE_ENGWIRE_SENTINEL-<unset>}]"
+# The loader reads these before the program it loads runs anything. `DYLD_*` is
+# dropped by the same policy and deliberately not echoed here: dyld strips that
+# whole namespace before a SIP-protected binary starts, and `#!/bin/sh` is one,
+# so a row here would read `<unset>` on Darwin whatever Engwire did. That half
+# is asserted on the policy itself.
+echo "LD_PRELOAD: [${LD_PRELOAD-<unset>}]"
+echo "LD_LIBRARY_PATH: [${LD_LIBRARY_PATH-<unset>}]"
+echo "LD_ENGWIRE_SENTINEL: [${LD_ENGWIRE_SENTINEL-<unset>}]"
+# The same mechanism for shells: a review reaches one the moment it runs a
+# command. `BASH_ENV` names the file itself, so it is dropped; `ZDOTDIR` names
+# the directory it is looked for in and falls back to `HOME`, so an unsafe one
+# is refused before a review starts and a safe one is passed through untouched —
+# which is what this row shows.
+echo "BASH_ENV: [${BASH_ENV-<unset>}]"
+echo "ZDOTDIR: [${ZDOTDIR-<unset>}]"
 if [ -n "$FAKE_CLAUDE_RECORD" ]; then
   printf '%s\t%s\n' "$*" "$(pwd)" >> "$FAKE_CLAUDE_RECORD"
 fi

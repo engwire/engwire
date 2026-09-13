@@ -13,6 +13,7 @@ import { reviewPrompt, runClaude, type ClaudeResult } from "../claude/run.ts";
 import { skillPreflightProblem } from "../claude/skills.ts";
 import type { Config } from "../config/config.ts";
 import type { Paths } from "../config/paths.ts";
+import { GitAborted } from "../git/repository.ts";
 import { prepareRevision } from "../git/worktree.ts";
 import { GhError, type Gh } from "../github/gh.ts";
 import type { Store } from "../store/store.ts";
@@ -50,7 +51,15 @@ export async function accountMatches(runtime: Runtime): Promise<boolean> {
     // Only a failed `gh` waits. A local failure obeys the same fail-loudly rule
     // as everything else.
     if (!(error instanceof GhError)) throw error;
-    runtime.log(`holding: could not verify the gh account: ${error.message}`);
+    // A shutdown is not a GitHub outage. The runner's `gh` carries the shutdown
+    // signal, so a stop refuses the call before it spawns and cuts short one
+    // already in flight — both arrive here, and both would otherwise be
+    // reported as "could not verify the gh account": a claim about GitHub,
+    // printed while somebody watches the runner exit and decides whether it
+    // exited cleanly. The caller reads the same signal to say what happened.
+    if (!runtime.signal.aborted) {
+      runtime.log(`holding: could not verify the gh account: ${error.message}`);
+    }
     return false;
   }
   if (account !== runtime.login) {
@@ -105,6 +114,15 @@ export async function executeRun(runtime: Runtime, run: ReviewRun): Promise<void
   const worktree = paths.worktreeDir(run.id);
   store.setWorktree(run.id, worktree);
 
+  // Every caller of this has one property in common: no agent has run, so
+  // nothing has been posted and the request is still outstanding. That now
+  // includes a shutdown during the checkout, which is why stopping mid-clone
+  // is not recorded as a failed review.
+  const release = (why: string) => {
+    store.releaseClaim(run.id, new Date().toISOString());
+    log(`holding ${run.repo}#${run.pullNumber}: ${why}`);
+  };
+
   try {
     await prepareRevision({
       sha: run.headSha,
@@ -113,24 +131,50 @@ export async function executeRun(runtime: Runtime, run: ReviewRun): Promise<void
       worktreeDir: worktree,
       url: runtime.cloneUrlFor(run.repo),
       ghBin: config.advanced.ghBin,
+      // Two ways to stop a checkout, and the catch below tells them apart
+      // because they mean opposite things afterwards: the deadline is this
+      // run's own failure, while a shutdown stops every run there is and
+      // spends none of them.
+      signal: AbortSignal.any([
+        runtime.signal,
+        AbortSignal.timeout(config.advanced.checkoutTimeoutMs),
+      ]),
     });
   } catch (error) {
-    store.finish(run.id, "failed", `checkout failed: ${message(error)}`, {
-      retainUntil: retainUntil(),
-    });
-    log(`failed to check out ${run.repo}#${run.pullNumber}: ${message(error)}`);
+    // Three outcomes, told apart by the error rather than by the signals.
+    // Asking the signals alone would be wrong twice over: unwinding a real
+    // failure takes time of its own — `ensureRepository` removes its staging
+    // directory before rethrowing — so a deadline elapsing in that gap would
+    // bury "could not read Username" under a report about the clock.
+    //
+    // A git that *stopped* while the runner is stopping gives the claim back:
+    // that is not this pull request's fault, nothing ran, so the request is
+    // still outstanding, and the half-written checkout goes to the reaper. The
+    // existing bare clone survives, making the next attempt cheaper; an
+    // unfinished first clone gets best-effort cleanup in `ensureRepository`.
+    // `prepareRevision` replaces the worktree either way. A git stopped by the
+    // deadline alone spends the run — that is the stalled clone or fetch the
+    // deadline exists for, and a runner reviewing one pull request at a time
+    // cannot wait it out. Anything else is what git said.
+    if (error instanceof GitAborted && runtime.signal.aborted) {
+      release("shutdown was requested while the checkout was being prepared");
+      return;
+    }
+    // Named without its milliseconds, which are this program's spelling of the
+    // setting rather than the reviewer's.
+    const why =
+      error instanceof GitAborted
+        ? "checkout exceeded checkout_timeout"
+        : `checkout failed: ${message(error)}`;
+    store.finish(run.id, "failed", why, { retainUntil: retainUntil() });
+    log(`${run.repo}#${run.pullNumber}: ${why}`);
     return;
   }
 
   // Checkout preparation may clone, so recheck both dependencies immediately
   // before the agent starts. Identity goes first because it awaits; the skill
-  // check is synchronous and stays adjacent to the spawn. Either failure can
-  // release the claim because no agent has run, and the retention deadline lets
-  // the reaper remove the now-unneeded checkout.
-  const release = (why: string) => {
-    store.releaseClaim(run.id, new Date().toISOString());
-    log(`holding ${run.repo}#${run.pullNumber}: ${why}`);
-  };
+  // check is synchronous and stays adjacent to the spawn.
+  //
   // A stop asked for during the checkout is a stop asked for before the review:
   // starting one here commits the next twenty minutes to work launchd is
   // already counting down to kill. Asked before the account check as well as
@@ -139,12 +183,17 @@ export async function executeRun(runtime: Runtime, run: ReviewRun): Promise<void
     release("shutdown was requested before the agent started");
     return;
   }
-  if (!(await accountMatches(runtime))) {
-    release("gh is no longer the account this review was accepted for");
-    return;
-  }
+  const matches = await accountMatches(runtime);
+  // Asked again after the check, and before its answer is read: the runner's
+  // `gh` carries the shutdown signal, so a stop landing inside the identity
+  // call comes back as a plain `false`. Filed as the account answer it is not,
+  // that would tell the reviewer `gh auth switch` happened during their review.
   if (runtime.signal.aborted) {
     release("shutdown was requested before the agent started");
+    return;
+  }
+  if (!matches) {
+    release("gh is no longer the account this review was accepted for");
     return;
   }
   const problem = skillPreflightProblem(run.skill);

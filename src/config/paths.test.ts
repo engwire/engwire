@@ -3,7 +3,7 @@ import { chmodSync, mkdirSync, mkdtempSync, realpathSync, statSync, symlinkSync 
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
-import { absolutePath, privateDir } from "./paths.ts";
+import { absolutePath, locationProblem, privateDir } from "./paths.ts";
 
 let dir: string;
 
@@ -108,6 +108,13 @@ describe("paths", () => {
          console.log(paths({}).configFile);`,
       ],
       env: { ...process.env, ...home },
+      // Anywhere but here. A child with no usable `HOME` resolves *its own*
+      // caches relative to the working directory, so run from the repository
+      // this left a `Library/` in it on every suite run — untracked junk in the
+      // one place this project reviews its work. It also sharpens the
+      // assertion: a relative answer is obviously wrong from a directory that
+      // is not the source tree.
+      cwd: tmpdir(),
       stdout: "pipe",
       stderr: "inherit",
     });
@@ -118,5 +125,52 @@ describe("paths", () => {
 
     expect(exitCode).toBe(0);
     expect(isAbsolute(configFile.trim())).toBe(true);
+  });
+});
+
+describe("locationProblem", () => {
+  test.each([
+    ["ENGWIRE_HOME", { ENGWIRE_HOME: "engwire-bob" }],
+    ["XDG_DATA_HOME", { XDG_DATA_HOME: "share", HOME: "/Users/dev" }],
+    ["XDG_CONFIG_HOME", { XDG_CONFIG_HOME: "cfg", HOME: "/Users/dev" }],
+  ])("names %s when it points somewhere relative", (name, env) => {
+    // The README offers `ENGWIRE_HOME` as the way to keep a second
+    // installation, so a relative one is a thing somebody types, not an exotic
+    // environment. Neither answer may move with the working directory, and they
+    // move differently: a relative data base is a second installation per
+    // directory, while a relative config base changes which automation rules
+    // one installation reads. The test below holds those two apart.
+    const problem = locationProblem(env);
+
+    expect(problem).toContain(name);
+    expect(problem).toContain("absolute path");
+  });
+
+  test.each([
+    ["absolute throughout", { ENGWIRE_HOME: "/opt/engwire" }],
+    ["empty, which falls back like an unset one", { XDG_DATA_HOME: "", HOME: "/Users/dev" }],
+  ])("accepts an environment that is %s", (_name, env) => {
+    expect(locationProblem(env)).toBeNull();
+  });
+
+  test("does not call a relative config directory a second installation", () => {
+    // Both refusals are right, but they are not the same fault. With the data
+    // directory absolute, the database, the lock and the clones stay at one
+    // address: two shells read different rules, they do not answer the same
+    // review request twice.
+    const problem = locationProblem({
+      XDG_CONFIG_HOME: "cfg",
+      XDG_DATA_HOME: "/var/lib/engwire",
+      HOME: "/Users/dev",
+    });
+
+    expect(problem).toContain("XDG_CONFIG_HOME");
+    expect(problem).not.toContain("two installations");
+  });
+
+  test("blames the variable that decided, not one it shadows", () => {
+    // `ENGWIRE_HOME` outranks both XDG bases in `paths`, so an absolute one
+    // makes a relative `XDG_DATA_HOME` beside it irrelevant rather than wrong.
+    expect(locationProblem({ ENGWIRE_HOME: "/opt/engwire", XDG_DATA_HOME: "share" })).toBeNull();
   });
 });

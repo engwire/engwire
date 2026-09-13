@@ -1,18 +1,13 @@
 /**
  * @file Cross-compiled release binaries.
  *
- * One artifact per platform from one source tree, and every installer places
- * that same artifact — otherwise behaviour drifts between the paths users take.
+ * One binary per platform from one source tree, and every installer places that
+ * same binary — otherwise behaviour drifts between the paths users take. The
+ * release workflow gzips them; the `.gz` is what it publishes.
  */
 
 import { $ } from "bun";
-
-const TARGETS = [
-  "bun-darwin-arm64",
-  "bun-darwin-x64",
-  "bun-linux-x64",
-  "bun-linux-arm64",
-] as const;
+import { rm } from "node:fs/promises";
 
 /**
  * The binary reads no configuration from the directory it is run in.
@@ -34,22 +29,41 @@ const AUTOLOAD_OFF = [
   "--no-compile-autoload-package-json",
 ];
 
-const version = (await Bun.file("package.json").json()).version as string;
+/**
+ * Each binary beside the target that compiles it. Keep the pairs explicit so
+ * the installer test can compare its independent `uname` mapping before a tag
+ * is spent; deriving names from targets would leave swapped pairs undetectable.
+ * The release publishes each name with `.gz` appended.
+ */
+export const BINARIES = [
+  { target: "bun-darwin-arm64", name: "engwire-darwin-arm64" },
+  { target: "bun-darwin-x64", name: "engwire-darwin-x64" },
+  { target: "bun-linux-arm64", name: "engwire-linux-arm64" },
+  { target: "bun-linux-x64", name: "engwire-linux-x64" },
+] as const;
 
-for (const target of TARGETS) {
-  const name = `engwire-${target.replace("bun-", "")}`;
-  console.log(`building ${name}`);
-  await $`bun build --compile --minify ${AUTOLOAD_OFF} --target=${target} --outfile=dist/${name} src/main.ts`;
+// Importing this file asks what the build emits; running it builds.
+if (import.meta.main) {
+  const version = (await Bun.file("package.json").json()).version as string;
+
+  // The smoke test must not pass on a host binary left by an earlier build.
+  await rm("dist", { recursive: true, force: true });
+
+  for (const { target, name } of BINARIES) {
+    console.log(`building ${name}`);
+    await $`bun build --compile --minify ${AUTOLOAD_OFF} --target=${target} --outfile=dist/${name} src/main.ts`;
+  }
+
+  // The compiled binary is smoke-tested here rather than in CI so a local build
+  // gets the same answer. `VERSION` is inlined from package.json at compile
+  // time, so a binary that will not start, or that disagrees about which
+  // release it is, fails the build that produced it instead of the install that
+  // unwrapped it.
+  const host = `engwire-${process.platform}-${process.arch}`;
+  const reported = (await $`./dist/${host} --version`.text()).trim();
+  if (reported !== version) {
+    throw new Error(`dist/${host} reports ${reported}, expected ${version}`);
+  }
+
+  console.log(`\nengwire ${version} → dist/`);
 }
-
-// The compiled binary is smoke-tested here rather than in CI so a local build
-// gets the same answer. `VERSION` is inlined from package.json at compile time,
-// so a binary that will not start, or that disagrees about which release it is,
-// fails the build that produced it instead of the install that unwrapped it.
-const host = `engwire-${process.platform}-${process.arch}`;
-const reported = (await $`./dist/${host} --version`.text()).trim();
-if (reported !== version) {
-  throw new Error(`dist/${host} reports ${reported}, expected ${version}`);
-}
-
-console.log(`\nengwire ${version} → dist/`);
