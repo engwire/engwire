@@ -67,6 +67,11 @@ function noWork(): void {
   writeFileSync(join(ghDir, "search.json"), "[]");
 }
 
+/** GitHub's measured whole-second timestamp shape; see docs/experiments.md. */
+function githubTime(at: Date): string {
+  return `${at.toISOString().slice(0, 19)}Z`;
+}
+
 /**
  * One outstanding request, and a git that quietly resolves `acme/api` to the
  * fixture origin.
@@ -75,18 +80,6 @@ function noWork(): void {
  * computes exactly the URL it computes in production — this is git's own test
  * seam rather than an escape hatch in Engwire.
  */
-/**
- * A timestamp in the shape GitHub reports one in: whole seconds, no fraction.
- *
- * Measured across request and removal timestamps that carried one shape between
- * them (docs/experiments.md, which keeps the count) — and the shape is the point
- * here, because the cutoff is stored truncated to the second to admit a request
- * made in it.
- */
-function githubTime(at: Date): string {
-  return `${at.toISOString().slice(0, 19)}Z`;
-}
-
 function oneRequest(
   options: {
     /** The pull request's `review_requested` history, oldest first. */
@@ -128,9 +121,8 @@ function oneRequest(
     `[url "${origin.url}"]\n\tinsteadOf = https://github.com/acme/api.git\n`,
   );
 
-  // Watching began before the request, which is otherwise older than the
-  // watermark the first runner writes. `watchingSince: undefined` leaves that to
-  // the runner — the fresh install a first review has to survive.
+  // Optionally seed an existing installation's cutoff. Otherwise the runner
+  // establishes it on first start, which may exclude the fixture's requests.
   if (options.watchingSince !== undefined) {
     const store = new Store(paths({ ENGWIRE_HOME: home }).dbFile);
     store.watchingSince(options.watchingSince);
@@ -233,13 +225,8 @@ describe("engwire run", () => {
   test(
     "every start says it is watching; only the first says where watching starts",
     async () => {
-      // Two different facts, and conflating them cost a first review. Readiness
-      // is what `setup` and the README tell the reader to wait for before asking
-      // for a review, so it has to be true on every start — printed only by the
-      // runner that wrote the watermark, the instruction was a lie from the
-      // second start onwards. Where watching *starts* is the opposite: the
-      // boundary never moves again, so repeating it would claim a cutoff that is
-      // no longer where the notice puts it.
+      // Readiness is announced on every start. Only the first establishes the
+      // cutoff; later starts must not describe their own start time as its value.
       noWork();
       const first = start({}, ["run", "--once"]);
       const [firstOut, firstCode] = await Promise.all([
@@ -291,21 +278,14 @@ describe("engwire run", () => {
 
       expect(firstCode).toBe(0);
       expect(firstOut).toContain("watching from now");
-      // Not reviewed, and not recorded either: an unrecorded request is one a
-      // later poll can still pick up, which is what the remedy relies on.
+      // The old request triggers no agent. Recovery below supplies a new event;
+      // the old event remains excluded by the unchanged cutoff.
       expect(existsSync(claudeLog)).toBe(false);
 
-      // What the printed remedy was measured to produce against a live pull
-      // request (docs/experiments.md): removing the reviewer and asking again adds
-      // a `review_requested` event with a new id, beside the original, which
-      // GitHub keeps in the history and the watermark goes on excluding. Same pull
-      // request, same revision.
-      //
-      // Stamped in the very second the runner drew its boundary, which is the
-      // case somebody following the notice actually produces: the request is
-      // removed and made again the moment they read it, and GitHub timestamps the
-      // new one to the second.
-      // A watermark carrying milliseconds excluded exactly this, for ever.
+      // Model the fresh event produced by removal and re-requesting, as measured
+      // in docs/experiments.md. Keep the old event and the same PR revision.
+      // Place the new event exactly at the cutoff to exercise inclusive,
+      // whole-second comparison; this fixture does not measure recovery timing.
       const store = new Store(paths({ ENGWIRE_HOME: home }).dbFile);
       const cutoff = store.watchingSince();
       store.close();

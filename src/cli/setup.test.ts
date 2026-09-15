@@ -64,9 +64,7 @@ case "$*" in
 esac
 `,
   );
-  // `authenticated: false` is the one failure a config has already been written
-  // for by the time it is reported: the binaries are there, the skill is there,
-  // and `gh` is simply not signed in.
+  // Simulate a diagnostic failure after setup has written the config.
   const login = options.authenticated === false ? 'echo "not logged in" >&2; exit 1' : "echo alice";
   writeFileSync(
     join(tools, "gh"),
@@ -336,21 +334,14 @@ describe("setup --repo", () => {
     // rather than leaving somebody waiting for a line that never appears.
     expect(out).toContain(WATCHING);
     expect(out).toContain("ask for your review after that line");
-    // The cutoff is the second the runner starts, not the line: a first runner
-    // that waits for GitHub still watches from when it started, and requests made
-    // during that wait are eligible. Saying otherwise would put back the
-    // conflation `run` was untangled to remove — and the second is the precision
-    // the boundary is stored at, so "earlier" cannot be stated as absolute.
+    // The cutoff precedes readiness if startup waits for GitHub, and includes
+    // the whole second in which the first runner starts.
     expect(out).toContain("Watching begins the second `engwire run` starts");
   });
 
   test("a check that fails after the write sends the reader to doctor, not back here", async () => {
-    // The config is written before the prerequisites are diagnosed, and it has to
-    // be: writing it is what `--repo` was asked for, and the rule in it is valid.
-    // But `setup` never edits a config that exists, so the reader who fixes a red
-    // row and retypes the command they just ran would be refused — the one-way
-    // repair loop this flag exists to remove, one layer later. So the failing case
-    // names `doctor` and says this command is finished with the file.
+    // Diagnostics run after the write. Retrying setup --repo would refuse the
+    // existing file, so the recovery guidance must point to doctor.
     healthyTools({ authenticated: false });
     installSkill(REVIEW_SKILL);
 
@@ -445,10 +436,8 @@ describe("setup --repo", () => {
     expect(existsSync(paths().configFile)).toBe(false);
   });
 
-  test("a reviewer Engwire cannot read is reported as that, without an install to run", async () => {
-    // The preflight reports five different problems and the difference is the
-    // whole value: telling somebody to reinstall a file that is already there
-    // sends them past the permission that is actually stopping them.
+  test("a skill disabled by front matter is reported without an install command", async () => {
+    // The file is readable; its invocation setting needs repair, not installation.
     healthyTools();
     installSkill(REVIEW_SKILL);
     writeFileSync(skillFile(REVIEW_SKILL), "---\nuser-invocable: false\n---\n");

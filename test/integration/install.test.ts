@@ -321,12 +321,8 @@ describe("install.sh", () => {
   });
 
   test("a first install of the latest release names the steps that reach a review", async () => {
-    // The installer is part of the activation contract: it was the last dead end
-    // found, because `Next: engwire setup` steers a fresh reader into a config
-    // with every rule commented out and then into a `setup --repo` that refuses
-    // for want of a skill. The order is the design — the skill first, since the
-    // flag checks for it — and the skills repository stays on the page for the
-    // machine with no Node on it, which the `npx` line would otherwise end at.
+    // setup --repo requires the skill first. Keep the manual-install link for
+    // machines without Node, and match the command printed by setup.
     const dir = await machine(reports("0.3.0"));
     try {
       const { said, code } = await install("latest", dir);
@@ -347,10 +343,8 @@ describe("install.sh", () => {
   });
 
   test("a pinned first install is not told to use a flag its binary may not have", async () => {
-    // `ENGWIRE_VERSION` deliberately fetches an older release, and the same
-    // `install.sh` is served from `releases/latest` — so the sequence above
-    // would tell somebody pinning 0.1.0 to run a flag that release never had.
-    // The script branches on the pin it was given rather than asking the binary.
+    // A pinned version may predate --repo. The current installer must offer
+    // guidance that older binaries can follow too.
     const dir = await machine(reports("0.1.1"));
     try {
       const { said, code } = await install("0.1.1", dir);

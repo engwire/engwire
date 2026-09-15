@@ -275,16 +275,15 @@ describe("isRepoPattern", () => {
   });
 
   test("is the rule the parser applies, not a second opinion beside it", () => {
-    // The CLI validates a pattern before rendering it into a rule, so the two
-    // have to be one grammar: a value `setup --repo` accepted and the parser
-    // then refused would be a config written to be unreadable.
+    // CLI validation and config parsing share the pattern grammar. Setup also
+    // parses the rendered rule before writing, catching redundant patterns.
     expect(() => parseConfig(reviewRule(["acme/foo*"]))).toThrow(ConfigError);
     expect(parseConfig(reviewRule(["acme/*"])).reviews).toHaveLength(1);
   });
 });
 
 describe("reviewRule", () => {
-  test("renders a rule the parser reads back, naming the one reviewer", () => {
+  test("renders a rule the parser reads back, naming the one reviewer it installs", () => {
     // The renderer behind both places patterns somebody typed are shown: the
     // config `setup --repo` writes, and the block it prints over a config it
     // will not edit. A second literal in either would be free to drift.

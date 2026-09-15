@@ -39,7 +39,7 @@ That redirects to the latest release's installer, which is also reachable direct
 `ENGWIRE_PREFIX` puts it elsewhere and `ENGWIRE_VERSION` pins a release — on the right of the pipe, where the installer runs, not the left, where only `curl` would see them:
 
 ```sh
-curl -fsSL https://engwire.com/install.sh | ENGWIRE_VERSION=0.1.0 sh
+curl -fsSL https://engwire.com/install.sh | ENGWIRE_VERSION=0.3.0 sh
 ```
 
 macOS 13+ and Linux with glibc 2.17+, Intel and ARM. The x64 builds require AVX2 — Haswell-era Intel or newer, Excavator or newer on AMD. Those are Bun's own floors, since the binary carries its runtime; Alpine and other musl distributions are not supported yet. The installer runs what it downloaded before replacing anything, so a machine outside that range fails with nothing lost.
