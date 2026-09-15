@@ -2,9 +2,12 @@ import { describe, expect, test } from "bun:test";
 import {
   ADVANCED_KEYS,
   ConfigError,
+  isRepoPattern,
   matchesRepo,
   parseConfig,
   REVIEW_KEYS,
+  REVIEW_SKILL,
+  reviewRule,
   starterConfig,
 } from "./config.ts";
 
@@ -260,8 +263,80 @@ describe("matchesRepo", () => {
   });
 });
 
+describe("isRepoPattern", () => {
+  test("accepts the whole grammar and nothing beside it", () => {
+    for (const value of ["*", "acme/*", "acme/api", "a.b-c_d/e.f-g_h"]) {
+      expect(isRepoPattern(value)).toBe(true);
+    }
+    // The near-misses: a partial wildcard, a missing half, a host, a space.
+    for (const value of ["acme/foo*", "acme", "acme/", "/api", "*/api", "github.com/acme/api", "acme /api", ""]) {
+      expect(isRepoPattern(value)).toBe(false);
+    }
+  });
+
+  test("is the rule the parser applies, not a second opinion beside it", () => {
+    // CLI validation and config parsing share the pattern grammar. Setup also
+    // parses the rendered rule before writing, catching redundant patterns.
+    expect(() => parseConfig(reviewRule(["acme/foo*"]))).toThrow(ConfigError);
+    expect(parseConfig(reviewRule(["acme/*"])).reviews).toHaveLength(1);
+  });
+});
+
+describe("reviewRule", () => {
+  test("renders a rule the parser reads back, naming the one reviewer it installs", () => {
+    // The renderer behind both places patterns somebody typed are shown: the
+    // config `setup --repo` writes, and the block it prints over a config it
+    // will not edit. A second literal in either would be free to drift.
+    const rendered = reviewRule(["acme/*", "other/api"]);
+
+    expect(rendered).toBe(
+      `[[review]]\nrepos = ["acme/*", "other/api"]\nskill = "${REVIEW_SKILL}"\n`,
+    );
+    expect(parseConfig(rendered).reviews).toEqual([
+      { repos: ["acme/*", "other/api"], skill: REVIEW_SKILL, skipDrafts: true },
+    ]);
+  });
+});
+
 describe("starterConfig", () => {
   const starter = starterConfig({ ghBin: "/opt/homebrew/bin/gh", claudeBin: "/usr/local/bin/claude" });
+
+  test("without patterns the rule stays commented out, for the reader to edit", () => {
+    // The whole region `repos` decides, pinned: bare `setup` still writes a
+    // config that authorizes nothing, and taking a parameter made silent drift
+    // in the no-argument case cheap. Pinned as this region rather than as the
+    // whole file, so deliberate edits to the prose around it stay free.
+    const rule = starter.slice(starter.indexOf("# [[review]]"), starter.indexOf("\n[advanced]"));
+
+    expect(rule).toBe(`# [[review]]
+# repos = ["your-org/*"]
+# skill = "${REVIEW_SKILL}"
+#
+# A review request on a draft waits until the pull request is marked ready,
+# without you having to ask again. Set this to false to review drafts too.
+# skip_drafts = true
+`);
+    expect(parseConfig(starter).reviews).toEqual([]);
+  });
+
+  test("with patterns it writes the rule instead, and only the rule changes", () => {
+    const written = starterConfig({
+      ghBin: "/opt/homebrew/bin/gh",
+      claudeBin: "/usr/local/bin/claude",
+      repos: ["acme/*"],
+    });
+
+    expect(parseConfig(written).reviews).toEqual([
+      { repos: ["acme/*"], skill: REVIEW_SKILL, skipDrafts: true },
+    ]);
+    // No commented rule left behind for a reader to uncomment into a second,
+    // shadowed one — and the `[advanced]` half is the same file either way.
+    expect(written).not.toContain("your-org/*");
+    expect(written.slice(written.indexOf("[advanced]"))).toBe(
+      starter.slice(starter.indexOf("[advanced]")),
+    );
+    expect(parseConfig(written).advanced).toEqual(parseConfig(starter).advanced);
+  });
 
   test("is a file this parser accepts", () => {
     const config = parseConfig(starter);

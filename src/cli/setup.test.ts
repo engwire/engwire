@@ -3,9 +3,10 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSy
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { skillFile } from "../claude/skills.ts";
-import { parseConfig } from "../config/config.ts";
+import { SKILL_INSTALL, skillFile } from "../claude/skills.ts";
+import { parseConfig, REVIEW_SKILL } from "../config/config.ts";
 import { paths } from "../config/paths.ts";
+import { WATCHING } from "./run.ts";
 import { backgroundNote, columns, setup } from "./setup.ts";
 
 let dir: string;
@@ -43,6 +44,63 @@ afterEach(async () => {
   await rm(dir, { recursive: true, force: true });
 });
 
+/**
+ * Stand-in tools every check `setup` shares with `doctor` passes, on PATH.
+ *
+ * A real `gh` and `claude` would make the assertions depend on the machine
+ * running the suite — and on a live GitHub call.
+ */
+function healthyTools(options: { authenticated?: boolean } = {}): string {
+  const tools = join(dir, "tools");
+  mkdirSync(tools, { recursive: true });
+  writeFileSync(
+    join(tools, "claude"),
+    `#!/bin/sh
+case "$*" in
+  "--setting-sources user --version")   echo "9.9.9 (Claude Code)" ;;
+  "--setting-sources "*" --version")    exit 1 ;;
+  "--setting-sources user auth status") echo signed in ;;
+  *)                                    exit 1 ;;
+esac
+`,
+  );
+  // Simulate a diagnostic failure after setup has written the config.
+  const login = options.authenticated === false ? 'echo "not logged in" >&2; exit 1' : "echo alice";
+  writeFileSync(
+    join(tools, "gh"),
+    `#!/bin/sh\ncase "$1" in --version) echo 'gh version 2.31.0 (2023-06-06)' ;; *) ${login} ;; esac\n`,
+  );
+  writeFileSync(join(tools, "git"), "#!/bin/sh\nexit 0\n");
+  for (const name of ["claude", "gh", "git"]) chmodSync(join(tools, name), 0o755);
+  process.env.PATH = tools;
+  return tools;
+}
+
+/** A skill on the filesystem where `userSkills` and the preflight both look. */
+function installSkill(name: string): void {
+  mkdirSync(dirname(skillFile(name)), { recursive: true });
+  writeFileSync(skillFile(name), "---\nname: x\n---\n");
+}
+
+/** Run `setup`, keeping stdout and stderr apart: only one of them is a refusal. */
+async function run(repos: string[]): Promise<{ code: number; out: string; err: string }> {
+  const { log, error } = console;
+  let out = "";
+  let err = "";
+  console.log = (message: unknown) => {
+    out += `${message}\n`;
+  };
+  console.error = (message: unknown) => {
+    err += `${message}\n`;
+  };
+  try {
+    return { code: await setup({ repos }), out, err };
+  } finally {
+    console.log = log;
+    console.error = error;
+  }
+}
+
 describe("setup", () => {
   test("a binary beside the caller is never written into the config", async () => {
     // `setup` is where a resolution becomes permanent: the absolute path it
@@ -57,7 +115,7 @@ describe("setup", () => {
       said += `${message}\n`;
     };
     try {
-      expect(await setup()).toBe(1);
+      expect(await setup({ repos: [] })).toBe(1);
     } finally {
       console.error = error;
     }
@@ -69,24 +127,7 @@ describe("setup", () => {
   test("writes a config the parser accepts, naming the binaries it resolved", async () => {
     // Exercise the handover from setup's discovery to the config every later
     // review and `doctor` read.
-    const tools = join(dir, "tools");
-    mkdirSync(tools, { recursive: true });
-    // Exercise the same Claude checks `setup` shares with `doctor`.
-    writeFileSync(
-      join(tools, "claude"),
-      `#!/bin/sh
-case "$*" in
-  "--setting-sources user --version")   echo "9.9.9 (Claude Code)" ;;
-  "--setting-sources "*" --version")    exit 1 ;;
-  "--setting-sources user auth status") echo signed in ;;
-  *)                                    exit 1 ;;
-esac
-`,
-    );
-    writeFileSync(join(tools, "gh"), "#!/bin/sh\ncase \"$1\" in --version) echo 'gh version 2.31.0 (2023-06-06)' ;; *) echo alice ;; esac\n");
-    writeFileSync(join(tools, "git"), "#!/bin/sh\nexit 0\n");
-    for (const name of ["claude", "gh", "git"]) chmodSync(join(tools, name), 0o755);
-    process.env.PATH = tools;
+    const tools = healthyTools();
     // Enough valid names to wrap, plus one name Engwire rejects in a rule.
     const installed = [
       "accessibility-review",
@@ -96,12 +137,7 @@ esac
       "security-review",
       "test-review",
     ];
-    for (const name of [...installed, "not a skill name"]) {
-      // Through `skillFile`, so the test cannot disagree with `userSkills`
-      // about where a skill lives.
-      mkdirSync(dirname(skillFile(name)), { recursive: true });
-      writeFileSync(skillFile(name), "---\nname: x\n---\n");
-    }
+    for (const name of [...installed, "not a skill name"]) installSkill(name);
 
     const log = console.log;
     let said = "";
@@ -110,7 +146,7 @@ esac
     };
     let code: number;
     try {
-      code = await setup();
+      code = await setup({ repos: [] });
     } finally {
       console.log = log;
     }
@@ -172,7 +208,7 @@ esac
       said += `${message}\n`;
     };
     try {
-      await setup();
+      await setup({ repos: [] });
     } finally {
       console.log = log;
     }
@@ -200,7 +236,7 @@ esac
     // *fails* is `doctor`'s row to decide and is asserted there; what this pins
     // is that setup reaches its own last line instead of a stack trace.
     expect(said).toContain("engwire run --once");
-    expect(said).toContain("Requests made before that are not reviewed");
+    expect(said).toContain("nothing requested before that second is reviewed");
   });
 
   test("a root with no skills says where one goes, not that there is nothing to name", async () => {
@@ -220,7 +256,7 @@ esac
       said += `${message}\n`;
     };
     try {
-      await setup();
+      await setup({ repos: [] });
     } finally {
       console.log = log;
     }
@@ -228,7 +264,7 @@ esac
     expect(said).toContain("https://github.com/engwire/skills");
     expect(said).toContain(`Or write your own at ${skillFile("<name>")}.`);
     expect(said).not.toContain("Engwire cannot tell");
-    expect(said).toContain("Requests made before that are not reviewed");
+    expect(said).toContain("nothing requested before that second is reviewed");
   });
 
   test("a skills directory that will not list says why, having no row to point at", async () => {
@@ -260,7 +296,7 @@ esac
       // empty list, and it is reached after the config has been written — so
       // uncaught it leaves somebody half set up, reading a stack trace instead
       // of the three lines telling them what to do next.
-      await setup();
+      await setup({ repos: [] });
     } finally {
       console.log = log;
     }
@@ -270,7 +306,210 @@ esac
     expect(said).toContain("cannot be listed: ");
     expect(said).toContain("https://github.com/engwire/skills");
     expect(said).toContain("ELOOP");
-    expect(said).toContain("Requests made before that are not reviewed");
+    expect(said).toContain("nothing requested before that second is reviewed");
+  });
+});
+
+describe("setup --repo", () => {
+  test("writes the rule, so what comes next is a runner and not an editor", async () => {
+    const tools = healthyTools();
+    installSkill(REVIEW_SKILL);
+
+    const { code, out } = await run(["acme/*", "other/api"]);
+
+    expect(code).toBe(0);
+    const config = parseConfig(await Bun.file(paths().configFile).text());
+    expect(config.reviews).toEqual([
+      { repos: ["acme/*", "other/api"], skill: REVIEW_SKILL, skipDrafts: true },
+    ]);
+    expect(config.advanced.ghBin).toBe(join(tools, "gh"));
+    // Nothing left to uncomment: a second rule for the same repositories would
+    // be shadowed by this one, and the parser refuses that file.
+    expect(out).not.toContain("Uncomment a [[review]] rule");
+    // The ordering the watermark makes load-bearing: start the runner, wait for
+    // the line, then ask for the review. Without it, the most natural way to try
+    // a fresh install produces silence for ever.
+    expect(out).toContain("engwire run ");
+    // Named from the runner that prints it, so a reworded barrier fails here
+    // rather than leaving somebody waiting for a line that never appears.
+    expect(out).toContain(WATCHING);
+    expect(out).toContain("ask for your review after that line");
+    // The cutoff precedes readiness if startup waits for GitHub, and includes
+    // the whole second in which the first runner starts.
+    expect(out).toContain("Watching begins the second `engwire run` starts");
+  });
+
+  test("a check that fails after the write sends the reader to doctor, not back here", async () => {
+    // Diagnostics run after the write. Retrying setup --repo would refuse the
+    // existing file, so the recovery guidance must point to doctor.
+    healthyTools({ authenticated: false });
+    installSkill(REVIEW_SKILL);
+
+    const { code, out } = await run(["acme/*"]);
+
+    expect(code).toBe(1);
+    // Written, valid, and holding the rule that was asked for: the repair is the
+    // environment, not the file.
+    expect(parseConfig(await Bun.file(paths().configFile).text()).reviews).toEqual([
+      { repos: ["acme/*"], skill: REVIEW_SKILL, skipDrafts: true },
+    ]);
+    expect(out).toContain("✗ gh");
+    // Ordered, because which remedy comes first is the whole point: `engwire run`
+    // above `engwire doctor` would send somebody to a runner that cannot start.
+    // Read off the indented command lines rather than the whole output, which
+    // also explains when `engwire run` starts watching — a plain "doctor before
+    // run" match over the text passes on that sentence alone, whichever order the
+    // commands are in.
+    const commands = out.split("\n").filter((line) => line.startsWith("  engwire "));
+    const doctor = commands.findIndex((line) => line.includes("engwire doctor"));
+    const runner = commands.findIndex((line) => line.includes("engwire run"));
+    expect(doctor).toBeGreaterThanOrEqual(0);
+    expect(runner).toBeGreaterThan(doctor);
+    expect(out).toContain("setup never edits one that exists");
+    // The ordering guidance still gets printed: it is about when to ask for a
+    // review, which is as true after the repair as before it.
+    expect(out).toContain(WATCHING);
+  });
+
+  test("a pattern no rule could use leaves no config to repair", async () => {
+    healthyTools();
+    installSkill(REVIEW_SKILL);
+
+    const { code, err } = await run(["acme/foo*"]);
+
+    expect(code).toBe(1);
+    expect(err).toContain("--repo \"acme/foo*\"");
+    expect(err).toContain('"owner/name"');
+    // The invariant is the pathname, not the directory: `setup` legitimately
+    // creates the config's parent. Writing first and failing after would leave a
+    // file that makes the re-run refuse — a one-way street out of a state the
+    // reader was just told to fix.
+    expect(existsSync(paths().configFile)).toBe(false);
+  });
+
+  test("patterns that are each fine and cannot both matter are refused as a pair", async () => {
+    // `isRepoPattern` passes twice here and the rendered rule is still one the
+    // parser rejects, because the first pattern covers the second. Validating
+    // the rule rather than the values is what makes the guarantee total.
+    healthyTools();
+    installSkill(REVIEW_SKILL);
+
+    const { code, err } = await run(["acme/*", "acme/api"]);
+
+    expect(code).toBe(1);
+    expect(err).toContain("can never match");
+    expect(err).toContain("acme/api");
+    expect(existsSync(paths().configFile)).toBe(false);
+  });
+
+  test("a missing reviewer is refused with the one command that installs it", async () => {
+    // Engwire ships no skill and never runs the installer itself, so the step
+    // between a config and a first review is a command the reader runs — printed
+    // here rather than linked, because a link is a second README.
+    healthyTools();
+
+    const { code, err } = await run(["acme/*"]);
+
+    expect(code).toBe(1);
+    expect(err).toContain(`review skill ${REVIEW_SKILL}`);
+    expect(err).toContain(`no SKILL.md at ${skillFile(REVIEW_SKILL)}`);
+    expect(err).toContain(SKILL_INSTALL);
+    expect(err).toContain("needs Node");
+    expect(existsSync(paths().configFile)).toBe(false);
+  });
+
+  test("a reviewer whose path cannot be read at all is not answered with an install", async () => {
+    // The failure an existence check gets wrong: a path that will not resolve
+    // answers "false" exactly as an absent one does, and the remedy for the two
+    // is not the same. A link loop rather than a `chmod`, because the assertion
+    // has to hold for whoever runs the suite — root reads a directory whose mode
+    // forbids it.
+    healthyTools();
+    mkdirSync(dirname(dirname(skillFile(REVIEW_SKILL))), { recursive: true });
+    symlinkSync(REVIEW_SKILL, dirname(skillFile(REVIEW_SKILL)));
+
+    const { code, err } = await run(["acme/*"]);
+
+    expect(code).toBe(1);
+    expect(err).toContain("ELOOP");
+    expect(err).not.toContain(SKILL_INSTALL);
+    expect(existsSync(paths().configFile)).toBe(false);
+  });
+
+  test("a skill disabled by front matter is reported without an install command", async () => {
+    // The file is readable; its invocation setting needs repair, not installation.
+    healthyTools();
+    installSkill(REVIEW_SKILL);
+    writeFileSync(skillFile(REVIEW_SKILL), "---\nuser-invocable: false\n---\n");
+
+    const { code, err } = await run(["acme/*"]);
+
+    expect(code).toBe(1);
+    expect(err).toContain("user-invocable");
+    expect(err).not.toContain(SKILL_INSTALL);
+    expect(existsSync(paths().configFile)).toBe(false);
+  });
+
+  test("an existing config is printed to, never edited", async () => {
+    // The refusal is the feature: somebody's file may hold three rules whose
+    // order is the configuration. So the rule goes to the terminal with where it
+    // belongs in that order, and the exit status says the ask did not happen.
+    healthyTools();
+    installSkill(REVIEW_SKILL);
+    const existing = '[[review]]\nrepos = ["x/y"]\nskill = "engwire-review"\n';
+    mkdirSync(dirname(paths().configFile), { recursive: true });
+    writeFileSync(paths().configFile, existing);
+
+    const { code, err } = await run(["acme/*"]);
+
+    expect(code).toBe(1);
+    expect(await Bun.file(paths().configFile).text()).toBe(existing);
+    expect(err).toContain(paths().configFile);
+    expect(err).toContain('repos = ["acme/*"]');
+    expect(err).toContain(`skill = "${REVIEW_SKILL}"`);
+    // First match, so "broader" would be the wrong word: an earlier narrower or
+    // equivalent rule takes these repositories just as effectively.
+    expect(err).toContain("first match");
+    expect(err).not.toContain("broader");
+    // And the block it printed is a rule, not an approximation of one.
+    const pasted = err.slice(err.indexOf("[[review]]"), err.indexOf("Rules use first match"));
+    expect(parseConfig(pasted).reviews).toEqual([
+      { repos: ["acme/*"], skill: REVIEW_SKILL, skipDrafts: true },
+    ]);
+  });
+
+  test("an unusable pattern is answered before either of the other two refusals", async () => {
+    // All three refusals are due at once — unusable pattern, config already
+    // there, no reviewer installed — and only the first names something the
+    // other two cannot fix. Without this, the contract is unpinned in both
+    // directions: every pattern test runs against a fresh config and an
+    // installed skill, so hoisting either of those checks above `repoProblem`
+    // leaves the suite green while the reader is told to fix the wrong thing.
+    healthyTools();
+    mkdirSync(dirname(paths().configFile), { recursive: true });
+    writeFileSync(paths().configFile, "# mine\n");
+
+    const { code, err } = await run(["acme/foo*"]);
+
+    expect(code).toBe(1);
+    expect(err).toContain("--repo \"acme/foo*\"");
+    expect(err).not.toContain("never edits a config that already exists");
+    expect(err).not.toContain(SKILL_INSTALL);
+  });
+
+  test("the skill is checked only after the config that would refuse anyway", async () => {
+    // Order matters because each remedy has to be the one that unblocks the
+    // reader: offering an install here would promise that `--repo` proceeds
+    // afterwards, and it would refuse the existing config just the same.
+    healthyTools();
+    mkdirSync(dirname(paths().configFile), { recursive: true });
+    writeFileSync(paths().configFile, "# mine\n");
+
+    const { code, err } = await run(["acme/*"]);
+
+    expect(code).toBe(1);
+    expect(err).toContain("never edits a config that already exists");
+    expect(err).not.toContain(SKILL_INSTALL);
   });
 });
 

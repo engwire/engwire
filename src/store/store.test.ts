@@ -49,10 +49,28 @@ describe("Store", () => {
     expect(store.recentRuns().length).toBe(1);
   });
 
-  test("watchingSince is fixed at first use", () => {
+  test("watchingSince is fixed at first use, and says which call fixed it", () => {
     const first = store.watchingSince(new Date("2026-01-01T00:00:00Z"));
     const second = store.watchingSince(new Date("2027-01-01T00:00:00Z"));
-    expect(second).toBe(first);
+
+    expect(first).toEqual({ since: "2026-01-01T00:00:00.000Z", established: true });
+    // `established` is what tells a runner it is the one that drew the boundary,
+    // and only the first one may say so — the notice it prints is about a cutoff
+    // that never moves again.
+    expect(second).toEqual({ since: first.since, established: false });
+  });
+
+  test("the boundary is stored to the second GitHub reports events in", () => {
+    // A watermark carrying milliseconds excludes requests made *after* it:
+    // GitHub timestamps a request made at 12:00:00.400 as `12:00:00Z`, which is
+    // earlier than `12:00:00.200Z`. Nobody would ever see that review, and they
+    // would have asked for it the moment the runner said it was watching.
+    const started = new Date("2026-08-01T12:00:00.200Z");
+
+    const { since } = store.watchingSince(started);
+
+    expect(since).toBe("2026-08-01T12:00:00.000Z");
+    expect(Date.parse("2026-08-01T12:00:00Z")).toBeGreaterThanOrEqual(Date.parse(since));
   });
 
   test("every poll overwrites the last one, rather than being refused", () => {
@@ -167,7 +185,7 @@ describe("Store", () => {
     expect(store.recoverInterrupted("2026-08-02T00:00:00Z")).toBe(1);
     expect(store.get("run-1")).toMatchObject({
       status: "interrupted",
-      detail: "runner stopped mid-review; request the review again",
+      detail: "runner stopped mid-review; not retried, since the review may already have posted",
     });
     expect(store.recoverInterrupted("2026-08-02T00:00:00Z")).toBe(0);
 

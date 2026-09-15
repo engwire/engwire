@@ -6,19 +6,111 @@
  * with the same code `doctor` uses, so "check prerequisites" means the same
  * thing in both places.
  *
- * It deliberately does not start the watch. Running setup authorizes
- * nothing, and this command writes a config with no rules in it, so there is
- * no moment here for a watermark to belong to: `run` sets it when a runner
- * first starts with a rule configured.
+ * `--repo` writes an active rule after validating its patterns and skill.
+ * Existing configs are never edited. Preflight refusals leave no new config,
+ * so they can be repaired and retried; diagnostics run after writing the file.
+ *
+ * Setup does not start watching. `run` sets the watermark when a runner first
+ * starts with a rule configured.
  */
 
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { claudeRootProblem, skillFile, SKILLS_REPO, userSkills } from "../claude/skills.ts";
-import { isSkillName, starterConfig } from "../config/config.ts";
+import {
+  claudeRootProblem,
+  missingSkillProblem,
+  skillFile,
+  SKILL_INSTALL,
+  SKILLS_REPO,
+  skillPreflightProblem,
+  userSkills,
+} from "../claude/skills.ts";
+import {
+  ConfigError,
+  isRepoPattern,
+  isSkillName,
+  parseConfig,
+  REVIEW_SKILL,
+  reviewRule,
+  starterConfig,
+} from "../config/config.ts";
 import { absolutePath, paths } from "../config/paths.ts";
 import { diagnose } from "./doctor.ts";
+import { WATCHING } from "./run.ts";
 import { LINUX_DOCS } from "./service.ts";
+
+/**
+ * What is wrong with the patterns on the command line, or null.
+ *
+ * Per-value first, for a message that names the flag the reader typed. Then the
+ * rendered rule parsed back, because being able to match is a property of the
+ * set rather than of a value: `--repo 'acme/*' --repo 'acme/api'` passes
+ * `isRepoPattern` twice and is then refused by the parser, whose own message
+ * says why. Validating the rule Engwire is about to write, rather than the
+ * values it came from, is what makes the guarantee total.
+ */
+function repoProblem(repos: string[]): string | null {
+  for (const repo of repos) {
+    if (!isRepoPattern(repo)) {
+      return `--repo ${JSON.stringify(repo)} is not "owner/name", "owner/*" or "*"`;
+    }
+  }
+  try {
+    parseConfig(reviewRule(repos));
+    return null;
+  } catch (error) {
+    if (error instanceof ConfigError) return error.message;
+    throw error;
+  }
+}
+
+/**
+ * Print the rule and refuse: an existing config is never modified.
+ *
+ * Non-zero because the operation asked for did not happen. The placement
+ * sentence says "should not win" rather than "broader": an earlier narrower or
+ * equivalent rule takes these repositories just as effectively.
+ */
+function refuseToEdit(configFile: string, repos: string[]): number {
+  console.error("setup never edits a config that already exists:");
+  console.error(`  ${configFile}`);
+  console.error("");
+  console.error("Add this rule yourself:");
+  console.error("");
+  for (const line of reviewRule(repos).trimEnd().split("\n")) console.error(line);
+  console.error("");
+  console.error("Rules use first match; place it before any existing rule that should");
+  console.error("not win for these repositories.");
+  return 1;
+}
+
+/**
+ * Whether installing the reviewer is the remedy for this preflight problem.
+ *
+ * Match the resolver's missing-file message only after validating its root.
+ * A separate existence check could confuse an unreadable path with an absent
+ * file and recommend reinstalling when a permission is what needs repair.
+ */
+function answeredByInstalling(problem: string): boolean {
+  return claudeRootProblem() === null && problem === missingSkillProblem(REVIEW_SKILL);
+}
+
+/**
+ * Print the preflight's evidence — as `doctor` prints it — and the install
+ * command when, and only when, that is what the evidence calls for.
+ */
+function refuseWithoutSkill(problem: string): number {
+  console.error(`review skill ${REVIEW_SKILL}: ${problem}`);
+  if (answeredByInstalling(problem)) {
+    console.error("");
+    console.error("Install it, then run setup again:");
+    console.error(`  ${SKILL_INSTALL}`);
+    console.error("");
+    console.error(`That helper needs Node; Engwire does not. Installing by hand is`);
+    console.error(`documented at ${SKILLS_REPO}.`);
+  }
+  return 1;
+}
 
 /**
  * Wrap comma-separated names without breaking one across lines.
@@ -84,10 +176,25 @@ function skillListing(): { names: string[] } | { problem: string; reportedAbove:
   }
 }
 
-export async function setup(): Promise<number> {
+export async function setup(options: { repos: string[] }): Promise<number> {
   const p = paths();
+  const { repos } = options;
+  const named = repos.length > 0;
 
   const created = !(await Bun.file(p.configFile).exists());
+  // Validate patterns before suggesting a config edit, and refuse an existing
+  // config before suggesting a skill install: neither fixes an earlier failure.
+  if (named) {
+    const problem = repoProblem(repos);
+    if (problem) {
+      console.error(problem);
+      return 1;
+    }
+    if (!created) return refuseToEdit(p.configFile, repos);
+    const skillProblem = skillPreflightProblem(REVIEW_SKILL);
+    if (skillProblem) return refuseWithoutSkill(skillProblem);
+  }
+
   if (created) {
     // Only a config being written needs these on PATH — it records their
     // absolute paths. An existing config may name binaries PATH does not
@@ -107,35 +214,34 @@ export async function setup(): Promise<number> {
     }
 
     mkdirSync(dirname(p.configFile), { recursive: true, mode: 0o700 });
-    writeFileSync(p.configFile, starterConfig({ ghBin, claudeBin }), { mode: 0o600 });
+    writeFileSync(p.configFile, starterConfig({ ghBin, claudeBin, repos }), { mode: 0o600 });
     console.log(`Wrote ${p.configFile}`);
   }
 
-  // A fresh install has no review rules on purpose, so their absence is not a
-  // failed setup. `doctor` and `service install` still treat it as fatal,
-  // because a runner with no rules cannot do anything.
-  const checks = await diagnose(process.env, { allowNoReviewRules: created });
+  // Only a new bare setup deliberately writes no rules. Doctor and service
+  // install still require them, as does setup when given --repo.
+  const checks = await diagnose(process.env, { allowNoReviewRules: created && !named });
   for (const check of checks) {
     console.log(`${check.ok ? "✓" : "✗"} ${check.label.padEnd(11)} ${check.note}`);
   }
   console.log("");
+  const ok = checks.every((check) => check.ok);
 
-  if (created) {
-    // Only on a fresh config. Saying this over an existing file with three
-    // active rules in it would simply be false.
+  if (created && !named) {
     console.log("Engwire is configured but reviewing nothing yet — it starts an agent");
     console.log("on a contributor's code, so which repositories that happens for is");
     console.log(`yours to choose. Uncomment a [[review]] rule in ${p.configFile}.`);
     console.log("");
-    // Engwire ships no reviewer, so a fresh reader may have nothing `skill`
-    // can name — the single step between a configured runner and a first
-    // review. Saying that first, with somewhere to get one, is what the
-    // listing alone never said: names of skills that review nothing read as a
-    // menu of candidates, and the nearest-sounding one gets picked.
-    // Listing failures must still leave the next steps visible after writing config.
+    // Offer a known reviewer before listing skills whose purpose is unknown.
+    // Listing failures must still leave next steps visible after writing config.
     const listing = skillListing();
     console.log("Its `skill` names the Claude Code skill that does the reviewing.");
-    console.log(`Engwire ships none — there is one to copy at ${SKILLS_REPO}`);
+    console.log("Engwire ships none. Install the one it is built around:");
+    console.log("");
+    console.log(`  ${SKILL_INSTALL}`);
+    console.log("");
+    console.log("That helper needs Node; Engwire does not. Installing by hand is");
+    console.log(`documented at ${SKILLS_REPO}.`);
     console.log("");
     if ("problem" in listing) {
       // Reuse the failed root row; directory-read failures need their own message.
@@ -152,18 +258,44 @@ export async function setup(): Promise<number> {
       // resolves through is one Engwire can name.
       console.log(`Or write your own at ${skillFile("<name>")}.`);
     }
-  } else {
+    console.log("");
+  } else if (!created) {
     console.log(`Config: ${p.configFile}`);
+    console.log("");
   }
 
-  console.log("");
   console.log("Then:");
-  // Re-read the edited config and its skill before starting a runner.
-  console.log("  engwire doctor           re-check after editing the config");
-  console.log("  engwire run --once       one poll, at most one review, then exit");
+  if (created && named) {
+    // The config now exists, so repairs go through doctor; repeating setup
+    // --repo would refuse instead of checking the repaired prerequisites.
+    if (!ok) {
+      console.log("  engwire doctor           re-check once the ✗ rows above are fixed");
+    }
+    console.log("  engwire run              watch for review requests and review them");
+  } else {
+    // Re-read the edited config and its skill before starting a runner.
+    console.log("  engwire doctor           re-check after editing the config");
+    console.log("  engwire run --once       one poll, at most one review, then exit");
+  }
   for (const line of backgroundNote()) console.log(line);
   console.log("");
-  console.log("Engwire starts watching when a runner first starts with a rule");
-  console.log("configured. Requests made before that are not reviewed.");
-  return checks.every((check) => check.ok) ? 0 : 1;
+  if (created && named) {
+    if (!ok) {
+      console.log("The config is written and setup never edits one that exists, so fix the");
+      console.log("✗ rows above rather than running this again.");
+      console.log("");
+    }
+    // Distinguish the cutoff — the runner's start — from readiness, which can
+    // come later, and quote the runner's actual message so the reader is not
+    // waiting for a line that never appears. "That second", not "before the
+    // runner started": the boundary is floored to the second GitHub reports a
+    // request in, so one made earlier in the same second is inside it.
+    console.log("Watching begins the second `engwire run` starts, and nothing requested");
+    console.log(`before that second is reviewed. It prints \`${WATCHING}\``);
+    console.log("once it is ready, so ask for your review after that line.");
+  } else {
+    console.log("Engwire starts watching the second a runner first starts with a rule");
+    console.log("configured, and nothing requested before that second is reviewed.");
+  }
+  return ok ? 0 : 1;
 }

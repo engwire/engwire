@@ -105,11 +105,10 @@ export async function discoverReviewRequests(
 ): Promise<ReviewRequest[]> {
   const hits = await candidates(gh, options.limit ?? 1000);
 
-  // Compared as instants, not as text. The watermark is `Date.toISOString()`
-  // and carries milliseconds; GitHub's timestamps stop at the second, and `Z`
-  // sorts after `.`, so `"…10:00:00Z" >= "…10:00:00.500Z"` is true as strings
-  // while the event is half a second older. That is the one window where a
-  // request predating authorization could slip through.
+  // Compare instants: `Z` sorts after `.`, so textual comparison would admit
+  // `10:00:00Z` against a later `10:00:00.500Z` cutoff. Existing databases may
+  // retain millisecond cutoffs; new ones truncate to GitHub's whole seconds.
+  // The comparison below is inclusive so requests in the cutoff second qualify.
   const since = Date.parse(options.since);
 
   // One pull request at a time: `gh` is a subprocess as well as an API client,

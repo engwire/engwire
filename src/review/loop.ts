@@ -20,7 +20,7 @@ export async function pollAndSchedule(runtime: Runtime): Promise<ReviewDecision[
 
   const requests = await discoverReviewRequests(runtime.gh, {
     login: runtime.login,
-    since: store.watchingSince(),
+    since: store.watchingSince().since,
   });
 
   const decisions = reconcileReviews({

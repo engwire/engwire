@@ -87,6 +87,17 @@ if [ "$upgrade" = yes ]; then
     echo "Running in the background? Restart your supervisor to pick this up, e.g."
     echo "  systemctl --user restart engwire"
   fi
-else
+elif [ "$VERSION" != latest ]; then
+  # A pinned release may predate --repo; use guidance it can follow.
   echo "Next: engwire setup"
+else
+  # setup --repo requires the skill to be installed first.
+  echo "Next, install the reviewer and name the repositories to review:"
+  echo "  npx --yes skills add engwire/skills --skill engwire-review -g -a claude-code -y"
+  echo "  engwire setup --repo 'your-org/*'"
+  echo
+  # Unconditional rather than detected: whoever has no Node stops at the first
+  # command, and this is the only place that says where to go before `setup`.
+  echo "The helper needs Node; Engwire does not. To install the skill by hand:"
+  echo "  https://github.com/engwire/skills"
 fi

@@ -214,24 +214,31 @@ export class Store {
   }
 
   /**
-   * When this installation started watching, fixed at first call.
+   * When this installation started watching, fixed at first call, and whether
+   * this call is what fixed it.
    *
-   * Set by the first runner that starts with a review rule configured, not by
-   * `setup`: installing Engwire authorizes nothing, and naming a repository is
-   * the moment that matters. Discovery ignores anything older.
+   * Set when the first runner starts with a review rule configured. Writing
+   * that rule during setup does not start the clock. Discovery ignores anything
+   * older than this cutoff.
    *
    * It is one watermark, not one per rule. A request Engwire has recorded stays
    * recorded, but one that arrived after this point while the runner happened
    * to be stopped was never seen, so a rule added later can still pick it up.
+   *
+   * `established` lets the caller announce a newly written cutoff without
+   * duplicating the timestamp truncation to compare it with its own start time.
    */
-  watchingSince(now = new Date()): string {
+  watchingSince(now = new Date()): { since: string; established: boolean } {
     const existing = this.db
       .query<{ value: string }, []>("SELECT value FROM meta WHERE key = 'watching_since'")
       .get();
-    if (existing) return existing.value;
-    const value = now.toISOString();
+    if (existing) return { since: existing.value, established: false };
+    // Match GitHub's whole-second event timestamps. Milliseconds would exclude
+    // later requests in this same second; truncation admits earlier ones in it
+    // too. See docs/experiments.md for the measured precision.
+    const value = new Date(Math.floor(now.getTime() / 1000) * 1000).toISOString();
     this.db.run("INSERT INTO meta (key, value) VALUES ('watching_since', ?)", [value]);
-    return value;
+    return { since: value, established: true };
   }
 
   /**
@@ -545,13 +552,17 @@ export class Store {
    * `interrupted` is terminal. The review may already have posted to GitHub
    * before the runner died, and nothing here can tell; re-running it would risk
    * a second review of the same pull request, which is worse than none.
+   *
+   * The detail leaves the decision to request another review to the reader,
+   * who can check GitHub for feedback already posted.
+   *
    * `retainUntil` is set so the abandoned checkout is still reaped.
    */
   recoverInterrupted(retainUntil: string, now = new Date()): number {
     const result = this.db.run(
       `UPDATE review_runs
           SET status = 'interrupted',
-              detail = 'runner stopped mid-review; request the review again',
+              detail = 'runner stopped mid-review; not retried, since the review may already have posted',
               retain_until = ?,
               finished_at = ?
         WHERE status = 'running'`,

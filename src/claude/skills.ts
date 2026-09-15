@@ -3,9 +3,18 @@
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
+import { REVIEW_SKILL } from "../config/config.ts";
 
 /** Where to get a reviewer Engwire deliberately does not ship. */
 export const SKILLS_REPO = "https://github.com/engwire/skills";
+
+/**
+ * Install command printed by setup, never executed by Engwire: running this
+ * third-party helper remains the user's choice. The leading `--yes` answers
+ * npx's cold-cache prompt; the trailing `-y` answers the skills CLI's.
+ * Measured in docs/experiments.md#does-npx-ask-before-running-the-skills-helper.
+ */
+export const SKILL_INSTALL = `npx --yes skills add engwire/skills --skill ${REVIEW_SKILL} -g -a claude-code -y`;
 
 /**
  * Where Claude keeps the reviewer's own configuration.
@@ -66,6 +75,18 @@ export function skillFile(
   env: Record<string, string | undefined> = process.env,
 ): string {
   return join(skillsDir(env), name, "SKILL.md");
+}
+
+/**
+ * Missing-file message shared with setup, which offers installation only for
+ * this problem. Reuse the preflight result: a separate `existsSync` check would
+ * also return false for an inaccessible path, whose remedy is different.
+ */
+export function missingSkillProblem(
+  name: string,
+  env: Record<string, string | undefined> = process.env,
+): string {
+  return `no SKILL.md at ${skillFile(name, env)}`;
 }
 
 /**
@@ -182,11 +203,10 @@ export function skillPreflightProblem(
   try {
     source = readFileSync(file, "utf8");
   } catch (error) {
-    // Absent and unreadable are different problems with different fixes.
-    // Reporting a permission error as "no SKILL.md" sends someone to reinstall
-    // a file that is already there.
+    // Only ENOENT calls for installation. Permission errors need repair, and
+    // ENOTDIR means a regular file blocks the path an installer needs to create.
     const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ENOENT" || code === "ENOTDIR") return `no SKILL.md at ${file}`;
+    if (code === "ENOENT") return missingSkillProblem(name, env);
     return `could not read ${file}: ${error instanceof Error ? error.message : String(error)}`;
   }
   const problem = frontMatterProblem(source);

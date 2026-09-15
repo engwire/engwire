@@ -3,7 +3,8 @@ import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { skillFile, skillPreflightProblem, userSkills } from "./skills.ts";
+import { resolve } from "node:path";
+import { SKILL_INSTALL, skillFile, skillPreflightProblem, userSkills } from "./skills.ts";
 
 const scratches: string[] = [];
 
@@ -284,5 +285,43 @@ describe("userSkills", () => {
     expect(() => userSkills({ CLAUDE_CONFIG_DIR: "relative" })).toThrow("absolute");
     expect(() => userSkills({ CLAUDE_CONFIG_DIR: "" })).toThrow("absolute");
     expect(() => userSkills({ HOME: "relative" })).toThrow("absolute");
+  });
+});
+
+describe("skillPreflightProblem's two ways of not finding a skill", () => {
+  test("absent is absent; a file in the path is unreadable, not absent", async () => {
+    // The distinction decides what `setup` offers: an install answers the first
+    // and cannot answer the second, because no installer writes a directory
+    // through a regular file.
+    const root = mkdtempSync(join(tmpdir(), "engwire-skill-shape-"));
+    try {
+      const env = { CLAUDE_CONFIG_DIR: root };
+      expect(skillPreflightProblem("engwire-review", env)).toBe(
+        `no SKILL.md at ${skillFile("engwire-review", env)}`,
+      );
+
+      // A skill saved as a file rather than as a directory holding SKILL.md.
+      mkdirSync(join(root, "skills"), { recursive: true });
+      writeFileSync(join(root, "skills", "engwire-review"), "---\nname: x\n---\n");
+
+      const problem = skillPreflightProblem("engwire-review", env);
+      expect(problem).toContain("could not read");
+      expect(problem).toContain("ENOTDIR");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("SKILL_INSTALL", () => {
+  test("is the command the README prints too, character for character", async () => {
+    // Three places tell a reader how to install the reviewer — this constant,
+    // `install.sh` (pinned in install.test.ts) and the README — and the README
+    // is the one somebody reads before they have anything installed. A stale
+    // copy there is a command that no longer works, pasted by the person least
+    // able to spot it.
+    const readme = await Bun.file(resolve(import.meta.dir, "../../README.md")).text();
+
+    expect(readme).toContain(`\n${SKILL_INSTALL}\n`);
   });
 });

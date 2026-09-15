@@ -14,6 +14,13 @@ import { Store } from "../store/store.ts";
 import { VERSION } from "../version.ts";
 
 /**
+ * Readiness, emitted on every successful start. Shared because `setup`'s
+ * guidance and the README's first-run recipe both quote it: three spellings of
+ * one barrier would make that instruction wrong twice.
+ */
+export const WATCHING = "watching for review requests";
+
+/**
  * Retry startup invocation failures at the poll interval so a runner can boot
  * offline. Malformed successful answers and local failures escape; shutdown
  * returns null. Log the outage once while waiting.
@@ -124,11 +131,16 @@ export async function run(options: { once: boolean }): Promise<number> {
       startedAt: startedAt.toISOString(),
       version: VERSION,
     });
-    // Pass the exact start time so the returned watermark can identify the
-    // first runner. Announce it beside the write: GitHub may remain unreachable
-    // long afterwards, but requests made from this boundary are eligible.
-    if (store.watchingSince(startedAt) === startedAt.toISOString()) {
-      log("watching from now — review requests made earlier are not reviewed");
+    // Establish and announce the cutoff before waiting for GitHub, so requests
+    // made during an outage remain eligible. Later starts retain that cutoff.
+    // Recovery requires removal before re-requesting; a repeated pending ask
+    // adds no event. Who may remove it is unmeasured, so name the change rather
+    // than instructing the reviewer to do it (docs/experiments.md).
+    if (store.watchingSince(startedAt).established) {
+      const remedy =
+        "to have one reviewed: your review request has to be removed and made again";
+      log("watching from now — review requests made before this second will not trigger");
+      log(options.once ? `${remedy}, then run this again` : remedy);
     }
     // Once, here, where "this process just started" is known. Anything the
     // database still calls `running` belongs to a runner that is gone.
@@ -178,13 +190,11 @@ export async function run(options: { once: boolean }): Promise<number> {
       signal: controller.signal,
     };
 
-    // Before either mode, because "it ran and found nothing" and "it never ran"
-    // are the same silence, and `run --once` is the command someone types to
-    // tell those apart.
+    // Emit readiness after identity binding on every start, in both modes:
+    // setup and the README tell the reader to wait for this before asking.
     runtime.log(
-      options.once
-        ? `engwire ${VERSION} polling once for ${login}`
-        : `engwire ${VERSION} watching review requests for ${login}`,
+      `engwire ${VERSION} ${WATCHING} as ${login}` +
+        (options.once ? " — one poll, then exit" : ""),
     );
 
     if (options.once) {
