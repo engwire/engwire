@@ -52,7 +52,7 @@ export type Config = {
 
 export class ConfigError extends Error {}
 
-/** The reviewer a generated rule names: the wedge has exactly one. */
+/** The reviewer a generated rule names: the wedge has one. A hand-written rule may name any skill. */
 export const REVIEW_SKILL = "engwire-review";
 
 const PREAMBLE = `# Engwire — automatic local review of pull requests that request your review.
@@ -415,10 +415,8 @@ const REPO_PATTERN = /^(\*|[A-Za-z0-9._-]+\/(\*|[A-Za-z0-9._-]+))$/;
  * The whole `repos` grammar: `owner/name`, `owner/*`, or `*`.
  *
  * Checked at parse time so a near-miss like `acme/foo*` is a config error
- * rather than a rule that silently matches nothing, and by `setup --repo`
- * before it renders one — the pattern stays private so the CLI asks the domain
- * a question instead of borrowing the parser's regex, exactly as `isSkillName`
- * already works.
+ * rather than a rule that silently matches nothing. `setup --repo` also checks
+ * each value before rendering the rule.
  */
 export function isRepoPattern(value: string): boolean {
   return REPO_PATTERN.test(value);

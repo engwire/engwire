@@ -234,14 +234,9 @@ export class Store {
       .query<{ value: string }, []>("SELECT value FROM meta WHERE key = 'watching_since'")
       .get();
     if (existing) return { since: existing.value, established: false };
-    // Truncated to the second, because GitHub's event timestamps are. Kept to
-    // the millisecond, this boundary excludes requests made *after* it: a review
-    // requested at 12:00:00.400 is reported as `12:00:00Z`, which is earlier
-    // than a watermark of `12:00:00.200Z`, so it would never be reviewed —
-    // permanently, and for somebody who asked the moment the runner said it was
-    // watching. The cost is the other direction: a request made earlier in that
-    // same second is admitted. That is a second of somebody's own authorization,
-    // against silence that never resolves.
+    // Match GitHub's whole-second event timestamps. Milliseconds would exclude
+    // later requests in this same second; truncation admits earlier ones in it
+    // too. See docs/experiments.md for the measured precision.
     const value = new Date(Math.floor(now.getTime() / 1000) * 1000).toISOString();
     this.db.run("INSERT INTO meta (key, value) VALUES ('watching_since', ?)", [value]);
     return { since: value, established: true };
@@ -559,12 +554,8 @@ export class Store {
    * before the runner died, and nothing here can tell; re-running it would risk
    * a second review of the same pull request, which is worse than none.
    *
-   * The detail says that and stops: it deliberately does not ask for the request
-   * to be made again. Whether another review is wanted depends on what GitHub
-   * already has — and on a pull request that may have moved on since — which the
-   * reader can see and Engwire cannot. If they do want one, `review_requested`
-   * is the event that produces it, on the terms `ReviewRun`'s `interrupted`
-   * comment and docs/architecture.md describe.
+   * The detail leaves the decision to request another review to the reader,
+   * who can check GitHub for feedback already posted.
    *
    * `retainUntil` is set so the abandoned checkout is still reaped.
    */

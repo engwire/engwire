@@ -95,17 +95,9 @@ describe("engwire run", () => {
   });
 
   test("First review quotes the phrase this prints, character for character", async () => {
-    // The constant keeps `run`, `setup` and the tests spelling the barrier one
-    // way; the README spells it out in prose, where First review tells somebody
-    // to wait for it. Reword the constant without this and every check stays
-    // green while the instruction names a line that never arrives.
-    //
-    // First review's own command block, not the whole file and not the whole
-    // section: the phrase appears under Use as well, and again in the prose
-    // under the block, so anything wider goes on passing after the one line the
-    // reader actually follows stops naming the barrier. Both ends of the slice
-    // are checked, since a renamed heading would otherwise quietly widen it to
-    // the rest of the README.
+    // The README cannot share the constant. Check the command block itself:
+    // prose elsewhere could still quote the phrase while the first-run recipe
+    // names a message that never appears. Bound the section before slicing it.
     const readme = await Bun.file(resolve(import.meta.dir, "../../README.md")).text();
     const start = readme.indexOf("## First review");
     const end = readme.indexOf("\n## ", start + 1);

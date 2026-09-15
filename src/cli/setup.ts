@@ -6,15 +6,12 @@
  * with the same code `doctor` uses, so "check prerequisites" means the same
  * thing in both places.
  *
- * `--repo` is the difference between a config a reader still has to open in an
- * editor and one that reviews something: it writes the rule instead of
- * commenting it out. It never edits a config that already exists, and never
- * writes one before the patterns are valid and the reviewer is installed — a
- * refusal that left a config behind would make the re-run refuse too.
+ * `--repo` writes an active rule after validating its patterns and skill.
+ * Existing configs are never edited. Preflight refusals leave no new config,
+ * so they can be repaired and retried; diagnostics run after writing the file.
  *
- * It deliberately does not start the watch. Running setup authorizes nothing,
- * and naming a repository is not the same as starting a runner: `run` sets the
- * watermark when one first starts with a rule configured.
+ * Setup does not start watching. `run` sets the watermark when a runner first
+ * starts with a rule configured.
  */
 
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -90,13 +87,9 @@ function refuseToEdit(configFile: string, repos: string[]): number {
 /**
  * Whether installing the reviewer is the remedy for this preflight problem.
  *
- * One of the five the resolver reports, and the difference is the whole value of
- * reporting five: telling somebody to reinstall a file that is already there
- * sends them straight past the permission or the front matter that is actually
- * stopping them. Recognized by asking the message's own producer rather than by
- * looking at the filesystem again, which cannot tell an absent file from a
- * directory it is not allowed to search — and asked only once the root is one
- * Engwire can name, since a root it cannot is itself one of the other four.
+ * Match the resolver's missing-file message only after validating its root.
+ * A separate existence check could confuse an unreadable path with an absent
+ * file and recommend reinstalling when a permission is what needs repair.
  */
 function answeredByInstalling(problem: string): boolean {
   return claudeRootProblem() === null && problem === missingSkillProblem(REVIEW_SKILL);
@@ -186,16 +179,11 @@ function skillListing(): { names: string[] } | { problem: string; reportedAbove:
 export async function setup(options: { repos: string[] }): Promise<number> {
   const p = paths();
   const { repos } = options;
-  // Whether the reviewer named repositories here rather than in an editor. It
-  // decides what gets written and which next step the guidance below is for.
   const named = repos.length > 0;
 
   const created = !(await Bun.file(p.configFile).exists());
-  // The check order is part of the contract, because each refusal's remedy has
-  // to be the one that actually unblocks the reader: patterns no rule could use
-  // are fixed by neither a config edit nor a skill install, an existing config
-  // is not unblocked by installing anything, and only the last of the three
-  // leaves something to run again afterwards.
+  // Validate patterns before suggesting a config edit, and refuse an existing
+  // config before suggesting a skill install: neither fixes an earlier failure.
   if (named) {
     const problem = repoProblem(repos);
     if (problem) {
@@ -230,37 +218,22 @@ export async function setup(options: { repos: string[] }): Promise<number> {
     console.log(`Wrote ${p.configFile}`);
   }
 
-  // A fresh install has no review rules on purpose, so their absence is not a
-  // failed setup. `doctor` and `service install` still treat it as fatal,
-  // because a runner with no rules cannot do anything. With `--repo` there is
-  // nothing to excuse: the config just written has a rule in it.
+  // Only a new bare setup deliberately writes no rules. Doctor and service
+  // install still require them, as does setup when given --repo.
   const checks = await diagnose(process.env, { allowNoReviewRules: created && !named });
   for (const check of checks) {
     console.log(`${check.ok ? "✓" : "✗"} ${check.label.padEnd(11)} ${check.note}`);
   }
   console.log("");
-  // Read before the guidance below, not only at the return: a red row means the
-  // runner cannot start yet, and the next step has to be the one that fixes it.
   const ok = checks.every((check) => check.ok);
 
   if (created && !named) {
-    // Only on a fresh config with nothing in it. Saying this over an existing
-    // file with three active rules in it would simply be false — and over the
-    // rule `--repo` has just written, it would be false in the other direction.
     console.log("Engwire is configured but reviewing nothing yet — it starts an agent");
     console.log("on a contributor's code, so which repositories that happens for is");
     console.log(`yours to choose. Uncomment a [[review]] rule in ${p.configFile}.`);
     console.log("");
-    // Engwire ships no reviewer, so a fresh reader may have nothing `skill`
-    // can name — the single step between a configured runner and a first
-    // review. Saying that first, with somewhere to get one, is what the
-    // listing alone never said: names of skills that review nothing read as a
-    // menu of candidates, and the nearest-sounding one gets picked.
-    //
-    // The command rather than the repository, because a URL leaves the reader
-    // to find the line: a second README is the thing this output exists to
-    // spare them. The link stays for the machine with no Node on it.
-    // Listing failures must still leave the next steps visible after writing config.
+    // Offer a known reviewer before listing skills whose purpose is unknown.
+    // Listing failures must still leave next steps visible after writing config.
     const listing = skillListing();
     console.log("Its `skill` names the Claude Code skill that does the reviewing.");
     console.log("Engwire ships none. Install the one it is built around:");
@@ -291,15 +264,10 @@ export async function setup(options: { repos: string[] }): Promise<number> {
     console.log("");
   }
 
-  // Each branch above closes with its own blank line: a config `--repo` has
-  // just filled in has nothing between the table and what to do next.
   console.log("Then:");
   if (created && named) {
-    // The rule is written and the reviewer is installed, so the only thing
-    // between this and a first review is a runner — unless a check above failed,
-    // in which case the repair comes first and it is not this command. The
-    // config exists now, and `setup` never edits one that does, so a reader who
-    // fixes the problem and retypes what they just ran would be refused.
+    // The config now exists, so repairs go through doctor; repeating setup
+    // --repo would refuse instead of checking the repaired prerequisites.
     if (!ok) {
       console.log("  engwire doctor           re-check once the ✗ rows above are fixed");
     }
@@ -317,16 +285,11 @@ export async function setup(options: { repos: string[] }): Promise<number> {
       console.log("✗ rows above rather than running this again.");
       console.log("");
     }
-    // Two facts, in the order that makes the second one useful: the cutoff is
-    // the runner's *start* — a runner that then waits for GitHub still watches
-    // from when it started — while the line is when it is ready to look, which
-    // is what somebody about to request a review should wait for. Named from the
-    // runner that prints it, since a paraphrase would leave them watching for a
-    // line that never appears.
-    //
-    // "That second", not "before the runner started": the boundary is floored to
-    // the second GitHub reports requests in, so a request made earlier in the
-    // same second is inside it. Precision that matters here of all places.
+    // Distinguish the cutoff — the runner's start — from readiness, which can
+    // come later, and quote the runner's actual message so the reader is not
+    // waiting for a line that never appears. "That second", not "before the
+    // runner started": the boundary is floored to the second GitHub reports a
+    // request in, so one made earlier in the same second is inside it.
     console.log("Watching begins the second `engwire run` starts, and nothing requested");
     console.log(`before that second is reviewed. It prints \`${WATCHING}\``);
     console.log("once it is ready, so ask for your review after that line.");

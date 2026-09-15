@@ -14,12 +14,9 @@ import { Store } from "../store/store.ts";
 import { VERSION } from "../version.ts";
 
 /**
- * The line that says startup is over and the cutoff is already on disk, so a
- * review requested from here is inside it. Printed on every successful start, in
- * both modes — whether a given request is then *seen* is polling's business.
- *
- * Shared, because `setup` tells the reader to wait for it and the README quotes
- * it: three spellings of one barrier would make the instruction wrong twice.
+ * Readiness, emitted on every successful start. Shared because `setup`'s
+ * guidance and the README's first-run recipe both quote it: three spellings of
+ * one barrier would make that instruction wrong twice.
  */
 export const WATCHING = "watching for review requests";
 
@@ -134,31 +131,11 @@ export async function run(options: { once: boolean }): Promise<number> {
       startedAt: startedAt.toISOString(),
       version: VERSION,
     });
-    // Pass the exact start time so the boundary is this runner's start rather
-    // than whenever the store was asked, and say where it is beside the write rather than with
-    // the readiness line further down: "from now" is true here, while a runner
-    // that booted during a GitHub outage would otherwise name a boundary as far
-    // past the real one as the outage was long — and every request made in
-    // between is eligible.
-    //
-    // Only this invocation says it. On a later start the cutoff is older than
-    // the process, and a request made after it while nothing was running is
-    // still eligible, so repeating this there would be a lie of its own.
-    //
-    // The remedy has the removal in it because the obvious wording is the one
-    // that does not work. Measured against a live pull request
-    // (docs/experiments.md): asking again for a request that is still pending is
-    // accepted by GitHub and adds no event at all, so Engwire would never see it
-    // — while removing the reviewer and asking again adds a `review_requested`
-    // event with a new id, one second later. Doing it at once is soon enough,
-    // since the cutoff is the second this runner started.
-    //
-    // It names the change and not the person on purpose. GitHub documents
-    // removing a requested reviewer as needing write access, while a review can
-    // be requested from an account that only has read; whether such a reviewer
-    // may withdraw their own request is unmeasured (docs/experiments.md), so
-    // the shorter "remove yourself" would be an instruction some readers may
-    // have no authority to carry out.
+    // Establish and announce the cutoff before waiting for GitHub, so requests
+    // made during an outage remain eligible. Later starts retain that cutoff.
+    // Recovery requires removal before re-requesting; a repeated pending ask
+    // adds no event. Who may remove it is unmeasured, so name the change rather
+    // than instructing the reviewer to do it (docs/experiments.md).
     if (store.watchingSince(startedAt).established) {
       const remedy =
         "to have one reviewed: your review request has to be removed and made again";
@@ -213,15 +190,8 @@ export async function run(options: { once: boolean }): Promise<number> {
       signal: controller.signal,
     };
 
-    // Startup is over: the config authorizes work, the watermark is on disk, the
-    // account that will post is settled, and a review requested from here is
-    // inside the cutoff. One phrase in both modes and on every successful start,
-    // because it is what `setup` and the README tell the reader to wait for
-    // before asking for a review — restricted to the runner that wrote the
-    // watermark, as the cutoff notice above is, it would be missing from every
-    // restart after the first and that instruction would be a lie. It also
-    // separates "it ran and found nothing" from "it never ran", which is the
-    // question `--once` is typed to answer.
+    // Emit readiness after identity binding on every start, in both modes:
+    // setup and the README tell the reader to wait for this before asking.
     runtime.log(
       `engwire ${VERSION} ${WATCHING} as ${login}` +
         (options.once ? " — one poll, then exit" : ""),

@@ -56,11 +56,9 @@ engwire run                    # wait until it says `watching for review request
 # then request your review on a pull request in acme
 ```
 
-The order is the design rather than a suggestion, and each step is what makes the next one work.
+Install the skill before running `setup --repo`, which requires it to pass preflight. The helper needs Node; Engwire does not. [`engwire/skills`](https://github.com/engwire/skills) also documents installing by hand. The leading `--yes` is `npx`'s own: without it, the command stops to ask on a cold cache ([measured](docs/experiments.md#does-npx-ask-before-running-the-skills-helper)). The trailing `-y` is the skills CLI's.
 
-The skill goes in first because `engwire setup --repo` refuses without it: Engwire ships no reviewer, and [`engwire/skills`](https://github.com/engwire/skills) has the one those rules name. That helper needs Node, which Engwire does not; the skills repository documents installing by hand for a machine without it. The leading `--yes` is `npx`'s own: measured in a terminal with a cold npm cache, the command without it stops to ask before the `skills` CLI is ever reached ([experiments.md](docs/experiments.md#does-npx-ask-before-running-the-skills-helper)). The trailing `-y` is that CLI's.
-
-The runner starts before you ask for anything because Engwire watches from the second a runner first starts with a rule configured. A review requested before that second is not reviewed, however long the runner then stays up — which is why `engwire run` prints `watching for review requests` when it is ready, and why the first run also says how to recover: the review request has to be removed and made again. That order is measured, not guessed — asking again while the request is still pending adds no event for Engwire to see ([experiments.md](docs/experiments.md#does-asking-again-produce-a-fresh-review-request)).
+Wait for `watching for review requests` before requesting your first review. Engwire watches from the second a runner first starts with a rule configured; older requests are excluded. To make an older request eligible, it must be removed and made again. Asking again while it is still pending creates no new event ([measured behavior](docs/experiments.md#does-asking-again-produce-a-fresh-review-request)).
 
 ## Use
 
@@ -90,7 +88,7 @@ skill = "engwire-review"
 
 The first matching rule wins, so put the specific one first — and getting that backwards is an error, not a rule that never runs. `repos` accepts `owner/name`, `owner/*` or `*`, and nothing else; a pattern Engwire cannot read is an error too.
 
-`engwire setup --repo 'acme/*'` writes that rule for you, repeatably — one `--repo` is one pattern, and the skill is always `engwire-review`. It refuses rather than writing anything if the patterns could not all matter, if `engwire-review` is not installed, or if a config already exists: an existing one is never edited, so that case prints the rule and where it belongs in your rule order. Bare `engwire setup` writes the file with its rule commented out instead. Engwire starts an agent on a contributor's code, so which repositories that happens for is yours to choose, and `engwire run` refuses to start until you have.
+`engwire setup --repo 'acme/*'` writes one rule using `engwire-review`; repeat `--repo` to include more patterns. It refuses to write if a pattern is invalid or covered by an earlier pattern, a config already exists, or the skill fails preflight. For an existing config, it prints the rule and placement guidance for you to add it yourself. Bare `engwire setup` writes the file with its rule commented out instead. Engwire starts an agent on a contributor's code, so which repositories that happens for is yours to choose, and `engwire run` refuses to start until you have.
 
 A review request on a draft is held, not dropped: Engwire reviews it once the pull request is marked ready, without you having to ask again. A rule can opt in to reviewing drafts with `skip_drafts = false`.
 
@@ -100,7 +98,7 @@ Unknown keys are an error, not a default — `skip_draft = false` will not quiet
 
 The poll interval, worktree retention, review timeout and checkout timeout have defaults you should not have to think about. They live under `[advanced]` for the machine where one of them is wrong. `checkout_timeout` defaults to `"10m"`; raise it if a first clone needs longer on a slow link. It covers the checkout's cancellable Git work; local cleanup can run beyond it ([details](docs/architecture.md#decisions)).
 
-Engwire starts watching the first time a runner starts with a rule configured — from the second it started, since that is the precision GitHub timestamps a request with ([experiments.md](docs/experiments.md#does-asking-again-produce-a-fresh-review-request)) — and nothing older is reviewed. That runner says where the boundary is and how to get a request across it, and every runner prints `watching for review requests` once it is ready. Anything it has already looked at and passed over stays passed over. It does not promise the reverse, though: a request that arrived after that point while the runner was stopped was never recorded, so adding a rule later can pick it up if it is still outstanding.
+Engwire starts watching the first time a runner starts with a rule configured — at whole-second precision, since that is how GitHub timestamps a request ([measured](docs/experiments.md#does-asking-again-produce-a-fresh-review-request)) — and nothing older is reviewed. This cutoff persists across restarts. Anything it has already looked at and passed over stays passed over. It does not promise the reverse, though: a request that arrived after that point while the runner was stopped was never recorded, so adding a rule later can pick it up if it is still outstanding.
 
 It polls, so it sees what is still asking for your review when it looks. A request made and withdrawn between two polls may never be seen at all — and a review already queued will not start once the request stops appearing, so withdrawing it, closing the pull request, or reviewing it yourself is enough to stop one that has not begun.
 

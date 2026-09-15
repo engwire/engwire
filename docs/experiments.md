@@ -293,7 +293,7 @@ jq -r 'select(.at) | .at' /tmp/review-requests.jsonl | sed 's/[0-9]/N/g' | sort 
 
 All **1,532** timestamps share one shape — `NNNN-NN-NNTNN:NN:NNZ` — and not one carries a fractional second. That is why `watchingSince` truncates the boundary to the second: compared against whole-second events, a watermark carrying milliseconds excludes a request made in the same second *after* it.
 
-What this corpus does not establish. **Zero** of those pairs were removed and then asked again — which is why the probe above exists, and a fair measure of how rare that sequence is in practice rather than of whether it works. Each read covers only the first 100 issue events of a pull request, so a longer history was not inspected past that page. Repeated asks in these windows are mostly a bot's, and the human sample is smaller.
+What this corpus does not establish. **Zero** of those pairs were removed and then asked again — the recovery evidence comes from the probe above. These windows do not establish how common that sequence is outside the sample. Each read covers only the first 100 issue events of a pull request, so a longer history was not inspected past that page. Repeated asks in these windows are mostly a bot's, and the human sample is smaller.
 
 ## Does `npx` ask before running the skills helper?
 
