@@ -22,7 +22,7 @@ One installation belongs to one GitHub account — the one authenticated when it
 
 ## Requirements
 
-You need [`gh`](https://cli.github.com) 2.31 or newer (authenticated), [Claude Code](https://claude.com/claude-code), and a user-level review skill. Engwire ships none of its own — [`engwire/skills`](https://github.com/engwire/skills) has one to copy. It invokes the configured skill as `/<skill> <repo>#<number> at <sha>`: what a review reads, says and posts remains the skill's responsibility.
+You need [`gh`](https://cli.github.com) 2.31 or newer (authenticated), [Claude Code](https://claude.com/claude-code), and a user-level review skill — installing one is a step in [First review](#first-review) below, since Engwire ships none of its own. It invokes the configured skill as `/<skill> <repo>#<number> at <sha>`: what a review reads, says and posts remains the skill's responsibility.
 
 `engwire doctor` reports skills that fail Engwire's preflight. The runner leaves their reviews queued instead of claiming work that Claude can already be shown not to run.
 
@@ -46,17 +46,33 @@ macOS 13+ and Linux with glibc 2.17+, Intel and ARM. The x64 builds require AVX2
 
 Upgrading is the same command; `engwire doctor` says when there is a newer release to run it for. The upgrade replaces the binary without disturbing a review in flight, and a background service picks the new binary up only when its job restarts — `engwire service install` does that on macOS; elsewhere, restart it under your own supervisor. `engwire status` names the version the runner is actually on, so you can tell when it has not.
 
+## First review
+
+```sh
+curl -fsSL https://engwire.com/install.sh | sh
+npx --yes skills add engwire/skills --skill engwire-review -g -a claude-code -y
+engwire setup --repo 'acme/*'
+engwire run                    # wait until it says `watching for review requests`
+# then request your review on a pull request in acme
+```
+
+The order is the design rather than a suggestion, and each step is what makes the next one work.
+
+The skill goes in first because `engwire setup --repo` refuses without it: Engwire ships no reviewer, and [`engwire/skills`](https://github.com/engwire/skills) has the one those rules name. That helper needs Node, which Engwire does not; the skills repository documents installing by hand for a machine without it. The leading `--yes` is `npx`'s own: measured in a terminal with a cold npm cache, the command without it stops to ask before the `skills` CLI is ever reached ([experiments.md](docs/experiments.md#does-npx-ask-before-running-the-skills-helper)). The trailing `-y` is that CLI's.
+
+The runner starts before you ask for anything because Engwire watches from the second a runner first starts with a rule configured. A review requested before that second is not reviewed, however long the runner then stays up — which is why `engwire run` prints `watching for review requests` when it is ready, and why the first run also says how to recover: the review request has to be removed and made again. That order is measured, not guessed — asking again while the request is still pending adds no event for Engwire to see ([experiments.md](docs/experiments.md#does-asking-again-produce-a-fresh-review-request)).
+
 ## Use
 
 ```sh
-engwire setup               # check prerequisites and write a starter config
-engwire run --once          # one poll, at most one review, then exit
-engwire service install     # keep it running in the background (macOS)
-engwire status              # what it is doing and what it last did
-engwire doctor              # diagnose the local setup
+engwire setup --repo 'acme/*'  # check prerequisites and write the config
+engwire run --once             # one poll, at most one review, then exit
+engwire service install        # keep it running in the background (macOS)
+engwire status                 # what it is doing and what it last did
+engwire doctor                 # diagnose the local setup
 ```
 
-Run `setup`, then [configure review rules](#configure) before starting the runner. Built-in service management is macOS-only; on Linux, run `engwire run` under your own supervisor — [docs/linux.md](docs/linux.md) provides a systemd user unit and explains its environment and shutdown differences from launchd.
+`setup` without `--repo` writes the same config with its rule commented out, for you to [configure](#configure) before starting the runner. Built-in service management is macOS-only; on Linux, run `engwire run` under your own supervisor — [docs/linux.md](docs/linux.md) provides a systemd user unit and explains its environment and shutdown differences from launchd.
 
 ## Configure
 
@@ -74,7 +90,7 @@ skill = "engwire-review"
 
 The first matching rule wins, so put the specific one first — and getting that backwards is an error, not a rule that never runs. `repos` accepts `owner/name`, `owner/*` or `*`, and nothing else; a pattern Engwire cannot read is an error too.
 
-For a new installation, `engwire setup` writes the file with every rule commented out; it leaves an existing config unchanged. Engwire starts an agent on a contributor's code, so which repositories that happens for is yours to choose, and `engwire run` refuses to start until you have.
+`engwire setup --repo 'acme/*'` writes that rule for you, repeatably — one `--repo` is one pattern, and the skill is always `engwire-review`. It refuses rather than writing anything if the patterns could not all matter, if `engwire-review` is not installed, or if a config already exists: an existing one is never edited, so that case prints the rule and where it belongs in your rule order. Bare `engwire setup` writes the file with its rule commented out instead. Engwire starts an agent on a contributor's code, so which repositories that happens for is yours to choose, and `engwire run` refuses to start until you have.
 
 A review request on a draft is held, not dropped: Engwire reviews it once the pull request is marked ready, without you having to ask again. A rule can opt in to reviewing drafts with `skip_drafts = false`.
 
@@ -84,13 +100,13 @@ Unknown keys are an error, not a default — `skip_draft = false` will not quiet
 
 The poll interval, worktree retention, review timeout and checkout timeout have defaults you should not have to think about. They live under `[advanced]` for the machine where one of them is wrong. `checkout_timeout` defaults to `"10m"`; raise it if a first clone needs longer on a slow link. It covers the checkout's cancellable Git work; local cleanup can run beyond it ([details](docs/architecture.md#decisions)).
 
-Engwire starts watching the first time a runner starts with a rule configured; nothing older is ever reviewed. Anything it has already looked at and passed over stays passed over. It does not promise the reverse, though: a request that arrived after that point while the runner was stopped was never recorded, so adding a rule later can pick it up if it is still outstanding.
+Engwire starts watching the first time a runner starts with a rule configured — from the second it started, since that is the precision GitHub timestamps a request with ([experiments.md](docs/experiments.md#does-asking-again-produce-a-fresh-review-request)) — and nothing older is reviewed. That runner says where the boundary is and how to get a request across it, and every runner prints `watching for review requests` once it is ready. Anything it has already looked at and passed over stays passed over. It does not promise the reverse, though: a request that arrived after that point while the runner was stopped was never recorded, so adding a rule later can pick it up if it is still outstanding.
 
 It polls, so it sees what is still asking for your review when it looks. A request made and withdrawn between two polls may never be seen at all — and a review already queued will not start once the request stops appearing, so withdrawing it, closing the pull request, or reviewing it yourself is enough to stop one that has not begun.
 
 ## How it works
 
-Engwire polls GitHub for `review_requested` issue events naming you. Each event has its own identity, so re-requesting a review of an unchanged commit gets you a second review, because you meant it — though several unseen asks for the same pull request found in one poll are collapsed to the newest, and the rest recorded as superseded. For each accepted request it prepares a detached worktree from its own clone at the latest head seen on the successful poll immediately before the review starts, and runs Claude Code there. Your skill reads the code and posts the review through `gh`. The checkout is kept for a day by default so you can see what Claude saw, then removed.
+Engwire polls GitHub for `review_requested` issue events naming you. Each event has its own identity, so a fresh request gets you a second review even of an unchanged commit, because you meant it — though several unseen asks for the same pull request found in one poll are collapsed to the newest, and the rest recorded as superseded. For each accepted request it prepares a detached worktree from its own clone at the latest head seen on the successful poll immediately before the review starts, and runs Claude Code there. Your skill reads the code and posts the review through `gh`. The checkout is kept for a day by default so you can see what Claude saw, then removed.
 
 Claude runs with `--setting-sources user`, so the review is governed by *your* configuration and *your* skill — never by a `.claude/` directory, `CLAUDE.md` or `.mcp.json` the pull request brought with it. `engwire doctor` checks that your Claude Code still validates the flag; [docs/experiments.md](docs/experiments.md) records how to verify that it still enforces the boundary.
 

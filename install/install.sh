@@ -87,6 +87,23 @@ if [ "$upgrade" = yes ]; then
     echo "Running in the background? Restart your supervisor to pick this up, e.g."
     echo "  systemctl --user restart engwire"
   fi
-else
+elif [ "$VERSION" != latest ]; then
+  # A pin deliberately fetches an older release, which may predate `--repo`, so
+  # it gets the instruction every version answers. Feature detection in a script
+  # piped into a shell is not the way to find out which one this is.
   echo "Next: engwire setup"
+else
+  # The next two steps, in the order that works: `setup --repo` refuses when the
+  # skill is missing, and the skill is what a rule names. Both are printed rather
+  # than linked — a second README is exactly what a first review should not need.
+  # `setup` names what follows it, so this stops at what these two do.
+  echo "Next, install the reviewer and name the repositories to review:"
+  echo "  npx --yes skills add engwire/skills --skill engwire-review -g -a claude-code -y"
+  echo "  engwire setup --repo 'your-org/*'"
+  echo
+  # Unconditional, and not a detection: somebody with no Node hits the first
+  # command and needs somewhere to go, and this is the only place that says so
+  # before `setup` — which they cannot usefully reach without a skill.
+  echo "The helper needs Node; Engwire does not. To install the skill by hand:"
+  echo "  https://github.com/engwire/skills"
 fi

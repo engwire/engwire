@@ -361,8 +361,14 @@ describe("main", () => {
     // `invoke` rather than `dispatch`: the help text goes to stdout, which the
     // dispatcher harness deliberately swallows.
     const { said: help } = await invoke(["help"]);
+    // A flag may take a value — `[--repo <pattern>]` — and may be repeatable,
+    // which the trailing `...` is the whole statement of. Both sides are read
+    // with one pattern, and it captures that marker: without it the help could
+    // drop `...` while the refusal kept it, and this test would not notice that
+    // the two no longer promise the same grammar.
+    const FLAGS = /\[--[a-z-]+(?: <[a-z]+>)?\](?:\.\.\.)?/g;
     const promised = [
-      ...help.matchAll(/^ {2}engwire ([a-z]+(?: [a-z]+)?)((?: \[--[a-z-]+\])*)/gm),
+      ...help.matchAll(/^ {2}engwire ([a-z]+(?: [a-z]+)?)((?: \[--[a-z-]+(?: <[a-z]+>)?\](?:\.\.\.)?)*)/gm),
     ].map((match) => ({ command: match[1]!, flags: match[2]!.trim() }));
 
     expect(promised.length).toBeGreaterThan(4);
@@ -372,8 +378,25 @@ describe("main", () => {
       expect(code).toBe(1);
       expect(said).toContain("Usage:");
       expect(said).not.toContain("Unknown command");
-      expect(said.match(/\[--[a-z-]+\]/g)?.join(" ") ?? "").toBe(flags);
+      expect(said.match(FLAGS)?.join(" ") ?? "").toBe(flags);
     }
+  });
+
+  test("every --repo reaches setup, in the order they were typed", async () => {
+    // The dispatcher's half of the flag: the grammar tests above only prove that
+    // malformed arguments are refused, so dropping every pattern — or all but
+    // the first — would leave them passing and the advertised command broken.
+    // Answered against an existing config, the one refusal that happens before
+    // `setup` looks at a binary, a skill or GitHub: it prints the rule it would
+    // have written, which is where the patterns become visible.
+    install();
+    mkdirSync(dirname(paths().configFile), { recursive: true });
+    writeFileSync(paths().configFile, "# mine\n");
+
+    const { code, said } = await invoke(["setup", "--repo", "acme/*", "--repo", "other/api"]);
+
+    expect(code).toBe(1);
+    expect(said).toContain('repos = ["acme/*", "other/api"]');
   });
 
   test("a runner with no rules refuses, rather than dismissing the whole queue", async () => {
@@ -466,6 +489,11 @@ describe("main", () => {
       ["run", "--once", "--once"],
       ["run", "--once", "extra"],
       ["setup", "extra"],
+      // A repeatable flag is still an exact grammar: a value it never got, and
+      // an argument that is not another occurrence of it.
+      ["setup", "--repo"],
+      ["setup", "--repo", "acme/*", "extra"],
+      ["setup", "--repo", "acme/*", "--once"],
       ["status", "extra"],
       ["doctor", "extra"],
       ["service"],

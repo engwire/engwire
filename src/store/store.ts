@@ -214,7 +214,8 @@ export class Store {
   }
 
   /**
-   * When this installation started watching, fixed at first call.
+   * When this installation started watching, fixed at first call, and whether
+   * this call is what fixed it.
    *
    * Set by the first runner that starts with a review rule configured, not by
    * `setup`: installing Engwire authorizes nothing, and naming a repository is
@@ -223,15 +224,27 @@ export class Store {
    * It is one watermark, not one per rule. A request Engwire has recorded stays
    * recorded, but one that arrived after this point while the runner happened
    * to be stopped was never seen, so a rule added later can still pick it up.
+   *
+   * `established` rather than a spelling the caller compares: the boundary is
+   * stored truncated to the second, and a caller that re-derived that rule to
+   * recognize its own value would be the second place the rule lived.
    */
-  watchingSince(now = new Date()): string {
+  watchingSince(now = new Date()): { since: string; established: boolean } {
     const existing = this.db
       .query<{ value: string }, []>("SELECT value FROM meta WHERE key = 'watching_since'")
       .get();
-    if (existing) return existing.value;
-    const value = now.toISOString();
+    if (existing) return { since: existing.value, established: false };
+    // Truncated to the second, because GitHub's event timestamps are. Kept to
+    // the millisecond, this boundary excludes requests made *after* it: a review
+    // requested at 12:00:00.400 is reported as `12:00:00Z`, which is earlier
+    // than a watermark of `12:00:00.200Z`, so it would never be reviewed —
+    // permanently, and for somebody who asked the moment the runner said it was
+    // watching. The cost is the other direction: a request made earlier in that
+    // same second is admitted. That is a second of somebody's own authorization,
+    // against silence that never resolves.
+    const value = new Date(Math.floor(now.getTime() / 1000) * 1000).toISOString();
     this.db.run("INSERT INTO meta (key, value) VALUES ('watching_since', ?)", [value]);
-    return value;
+    return { since: value, established: true };
   }
 
   /**
@@ -545,13 +558,21 @@ export class Store {
    * `interrupted` is terminal. The review may already have posted to GitHub
    * before the runner died, and nothing here can tell; re-running it would risk
    * a second review of the same pull request, which is worse than none.
+   *
+   * The detail says that and stops: it deliberately does not ask for the request
+   * to be made again. Whether another review is wanted depends on what GitHub
+   * already has — and on a pull request that may have moved on since — which the
+   * reader can see and Engwire cannot. If they do want one, `review_requested`
+   * is the event that produces it, on the terms `ReviewRun`'s `interrupted`
+   * comment and docs/architecture.md describe.
+   *
    * `retainUntil` is set so the abandoned checkout is still reaped.
    */
   recoverInterrupted(retainUntil: string, now = new Date()): number {
     const result = this.db.run(
       `UPDATE review_runs
           SET status = 'interrupted',
-              detail = 'runner stopped mid-review; request the review again',
+              detail = 'runner stopped mid-review; not retried, since the review may already have posted',
               retain_until = ?,
               finished_at = ?
         WHERE status = 'running'`,

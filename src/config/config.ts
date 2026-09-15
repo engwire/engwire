@@ -52,6 +52,9 @@ export type Config = {
 
 export class ConfigError extends Error {}
 
+/** The reviewer a generated rule names: the wedge has exactly one. */
+export const REVIEW_SKILL = "engwire-review";
+
 const PREAMBLE = `# Engwire — automatic local review of pull requests that request your review.
 #
 # Every rule below answers one question: when a repository asks for my review,
@@ -62,19 +65,35 @@ const PREAMBLE = `# Engwire — automatic local review of pull requests that req
 # what it says, whether it posts — is entirely that skill's business. There is
 # one to start from at https://github.com/engwire/skills, and a reviewer you
 # wrote yourself goes in the same place under a name of your own.
-#
+`;
+
+/** How a draft is handled, offered as the edit that changes it. */
+const DRAFTS = `#
+# A review request on a draft waits until the pull request is marked ready,
+# without you having to ask again. Set this to false to review drafts too.
+# skip_drafts = true
+`;
+
+/** The rule a reader edits when they named no repository themselves. */
+const EXAMPLE = `#
 # Nothing is reviewed until you uncomment a rule and name the repositories you
 # want reviewed. Engwire starts an agent on a contributor's code, so which
 # repositories that happens for is a decision worth making yourself.
 
 # [[review]]
 # repos = ["your-org/*"]
-# skill = "engwire-review"
-#
-# A review request on a draft waits until the pull request is marked ready,
-# without you having to ask again. Set this to false to review drafts too.
-# skip_drafts = true
-`;
+# skill = "${REVIEW_SKILL}"
+${DRAFTS}`;
+
+/**
+ * One `[[review]]` rule, for the two places that render patterns somebody typed
+ * — the config `setup --repo` writes, and the block it prints to paste into a
+ * config it will not edit. Serialized rather than interpolated, for the reason
+ * `setting` gives.
+ */
+export function reviewRule(repos: string[]): string {
+  return `[[review]]\n${Bun.TOML.stringify({ repos, skill: REVIEW_SKILL })}`;
+}
 
 /**
  * The tuning defaults, written as the durations a config file would spell them.
@@ -99,15 +118,34 @@ function setting(key: string, value: string): string {
   return Bun.TOML.stringify({ [key]: value })!.trimEnd();
 }
 
-/** The config starter lives beside the parser that defines what it may contain. */
-export function starterConfig(bins: { ghBin: string; claudeBin: string }): string {
-  return `${PREAMBLE}
+/**
+ * The config starter lives beside the parser that defines what it may contain.
+ *
+ * `repos` is what `setup --repo` was given: a rule already in force. Without it
+ * the file carries the same rule commented out, because naming a repository is
+ * the decision that lets an agent run on somebody's branch.
+ */
+export function starterConfig(options: {
+  ghBin: string;
+  claudeBin: string;
+  repos?: string[];
+}): string {
+  const repos = options.repos ?? [];
+  const review =
+    repos.length === 0
+      ? EXAMPLE
+      : `#
+# One rule, from \`engwire setup --repo\`. The first matching rule wins, so a
+# narrower rule for the same repositories belongs above this one.
+
+${reviewRule(repos)}${DRAFTS}`;
+  return `${PREAMBLE}${review}
 [advanced]
 # Absolute paths: a background service does not naturally inherit your shell
 # environment, and which binary reviews your code should not depend on what
 # happens to be on a PATH.
-${setting("gh_bin", bins.ghBin)}
-${setting("claude_bin", bins.claudeBin)}
+${setting("gh_bin", options.ghBin)}
+${setting("claude_bin", options.claudeBin)}
 
 # The rest have defaults you should not have to think about. They are here so
 # that the machine where one of them is wrong has something to edit. Durations
@@ -277,7 +315,7 @@ export function parseConfig(source: string): Config {
     }
     const repos = stringList(t.repos, `review[${index}].repos`);
     for (const pattern of repos) {
-      if (!REPO_PATTERN.test(pattern)) {
+      if (!isRepoPattern(pattern)) {
         throw new ConfigError(
           `review[${index}].repos: ${JSON.stringify(pattern)} is not "owner/name", "owner/*" or "*"`,
         );
@@ -371,13 +409,20 @@ export function isSkillName(name: string): boolean {
   return SKILL_NAME.test(name);
 }
 
+const REPO_PATTERN = /^(\*|[A-Za-z0-9._-]+\/(\*|[A-Za-z0-9._-]+))$/;
+
 /**
  * The whole `repos` grammar: `owner/name`, `owner/*`, or `*`.
  *
  * Checked at parse time so a near-miss like `acme/foo*` is a config error
- * rather than a rule that silently matches nothing.
+ * rather than a rule that silently matches nothing, and by `setup --repo`
+ * before it renders one — the pattern stays private so the CLI asks the domain
+ * a question instead of borrowing the parser's regex, exactly as `isSkillName`
+ * already works.
  */
-const REPO_PATTERN = /^(\*|[A-Za-z0-9._-]+\/(\*|[A-Za-z0-9._-]+))$/;
+export function isRepoPattern(value: string): boolean {
+  return REPO_PATTERN.test(value);
+}
 
 /**
  * Whether every repository `later` could match is already matched by `earlier`.

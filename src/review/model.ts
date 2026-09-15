@@ -3,8 +3,8 @@
  *
  * A ReviewRequest is an event that happened; a ReviewRun is what Engwire
  * decided to do about it. Keeping them apart is the whole reason the runner can
- * honour a second review request on an unchanged revision — which GitHub treats
- * as a distinct act, and which a reviewer means literally.
+ * honour a second `review_requested` event on an unchanged revision — which
+ * GitHub records as an act of its own, and which a reviewer means literally.
  */
 
 /**
@@ -46,7 +46,9 @@ export type RunStatus =
   /**
    * The runner died mid-review. Terminal, and deliberately not retried: the
    * skill posts to GitHub, so a half-finished review may already have said
-   * something, and Engwire cannot tell. Re-request the review to try again.
+   * something, and Engwire cannot tell. A fresh `review_requested` event runs
+   * again, and while the request still stands, asking again makes no such event:
+   * it has to be removed first (docs/experiments.md).
    */
   | "interrupted"
   /** A newer review request replaced this one before it started. */

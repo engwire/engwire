@@ -12,6 +12,7 @@ import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { KILL_GRACE_MS } from "../../src/claude/run.ts";
+import { WATCHING } from "../../src/cli/run.ts";
 import { paths } from "../../src/config/paths.ts";
 import { Store } from "../../src/store/store.ts";
 import { createOrigin, type Origin } from "../fixtures/repo.ts";
@@ -74,7 +75,25 @@ function noWork(): void {
  * computes exactly the URL it computes in production — this is git's own test
  * seam rather than an escape hatch in Engwire.
  */
-function oneRequest(): string {
+/**
+ * A timestamp in the shape GitHub reports one in: whole seconds, no fraction.
+ *
+ * Measured across request and removal timestamps that carried one shape between
+ * them (docs/experiments.md, which keeps the count) — and the shape is the point
+ * here, because the cutoff is stored truncated to the second to admit a request
+ * made in it.
+ */
+function githubTime(at: Date): string {
+  return `${at.toISOString().slice(0, 19)}Z`;
+}
+
+function oneRequest(
+  options: {
+    /** The pull request's `review_requested` history, oldest first. */
+    requests?: { id: number; at: Date }[];
+    watchingSince?: Date;
+  } = {},
+): string {
   writeFileSync(
     join(ghDir, "search.json"),
     JSON.stringify([{ number: 42, repository: { nameWithOwner: "acme/api" } }]),
@@ -92,15 +111,15 @@ function oneRequest(): string {
   );
   writeFileSync(
     join(ghDir, "events.json"),
-    JSON.stringify([
-      {
-        id: 1,
+    JSON.stringify(
+      (options.requests ?? [{ id: 1, at: new Date() }]).map(({ id, at }) => ({
+        id,
         event: "review_requested",
-        created_at: new Date().toISOString(),
+        created_at: githubTime(at),
         commit_id: null,
         requested_reviewer: { login: "me" },
-      },
-    ]),
+      })),
+    ),
   );
 
   const gitconfig = join(dir, "gitconfig");
@@ -110,10 +129,13 @@ function oneRequest(): string {
   );
 
   // Watching began before the request, which is otherwise older than the
-  // watermark the first runner writes.
-  const store = new Store(paths({ ENGWIRE_HOME: home }).dbFile);
-  store.watchingSince(new Date(Date.now() - 3_600_000));
-  store.close();
+  // watermark the first runner writes. `watchingSince: undefined` leaves that to
+  // the runner — the fresh install a first review has to survive.
+  if (options.watchingSince !== undefined) {
+    const store = new Store(paths({ ENGWIRE_HOME: home }).dbFile);
+    store.watchingSince(options.watchingSince);
+    store.close();
+  }
 
   return gitconfig;
 }
@@ -141,13 +163,16 @@ function start(
   });
 }
 
-/** Read through the watching announcement, retaining earlier startup messages. */
+/** Read through the readiness announcement, retaining earlier startup messages. */
 async function waitForWatching(stream: ReadableStream<Uint8Array>): Promise<string> {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let seen = "";
   try {
-    while (!seen.includes("watching review requests")) {
+    // The runner's own phrase, because this is the barrier the documentation
+    // tells a reader to wait for: a test that waited for something else would
+    // stop pinning the thing a first review depends on.
+    while (!seen.includes(WATCHING)) {
       const { value, done } = await reader.read();
       if (done) throw new Error(`runner exited before watching: ${seen}`);
       seen += decoder.decode(value, { stream: true });
@@ -206,12 +231,15 @@ describe("engwire run", () => {
   );
 
   test(
-    "a fresh installation says where its watching starts, once",
+    "every start says it is watching; only the first says where watching starts",
     async () => {
-      // A command that prints nothing at all is indistinguishable from one that
-      // never ran, and this is the command someone types right after editing
-      // config.toml — so the runner that sets the watermark says where it put
-      // it. Only that one: the boundary never moves again.
+      // Two different facts, and conflating them cost a first review. Readiness
+      // is what `setup` and the README tell the reader to wait for before asking
+      // for a review, so it has to be true on every start — printed only by the
+      // runner that wrote the watermark, the instruction was a lie from the
+      // second start onwards. Where watching *starts* is the opposite: the
+      // boundary never moves again, so repeating it would claim a cutoff that is
+      // no longer where the notice puts it.
       noWork();
       const first = start({}, ["run", "--once"]);
       const [firstOut, firstCode] = await Promise.all([
@@ -220,22 +248,87 @@ describe("engwire run", () => {
       ]);
 
       expect(firstCode).toBe(0);
-      expect(firstOut).toContain("polling once for me");
+      expect(firstOut).toContain(WATCHING);
+      // The qualification `--once` needs: there is no next poll to wait for.
+      expect(firstOut).toContain("one poll, then exit");
       expect(firstOut).toContain("watching from now");
+      // A remedy that produces an event, rather than asking again for a request
+      // that is already pending — and, in this mode, a second invocation.
+      expect(firstOut).toContain("has to be removed and made again");
+      expect(firstOut).toContain("then run this again");
 
-      // Said once, ever: the watermark is fixed at the first runner, and a
-      // notice repeated every poll is a notice nobody reads.
-      const second = start({}, ["run", "--once"]);
-      const [secondOut, secondCode] = await Promise.all([
-        new Response(second.stdout).text(),
-        second.exited,
-      ]);
+      // A later start, as a daemon this time: still watching, and the cutoff
+      // notice is gone. A request made after that cutoff while nothing was
+      // running is eligible, so repeating "requests made earlier will not
+      // trigger" here would be false as well as stale.
+      const second = start({}, ["run"]);
+      const secondOut = await waitForWatching(second.stdout);
+      second.kill("SIGTERM");
 
-      expect(secondCode).toBe(0);
-      expect(secondOut).toContain("polling once for me");
+      expect(await second.exited).toBe(143);
+      expect(secondOut).toContain(WATCHING);
+      expect(secondOut).not.toContain("one poll, then exit");
       expect(secondOut).not.toContain("watching from now");
     },
     20_000,
+  );
+
+  test(
+    "the request that predates a fresh installation is reviewed once removing it and asking again makes a fresh event",
+    async () => {
+      // The dead end this whole sequence exists to remove, reproduced: request
+      // your own review first, then install Engwire and start it. That request
+      // predates the watermark and is never reviewed, however long the runner
+      // stays up — so the first run has to say so, and the remedy it prints has
+      // to actually produce a review.
+      const asked = { id: 1, at: new Date(Date.now() - 3_600_000) };
+      const gitconfig = oneRequest({ requests: [asked] });
+      const first = start({ GIT_CONFIG_GLOBAL: gitconfig }, ["run", "--once"]);
+      const [firstOut, firstCode] = await Promise.all([
+        new Response(first.stdout).text(),
+        first.exited,
+      ]);
+
+      expect(firstCode).toBe(0);
+      expect(firstOut).toContain("watching from now");
+      // Not reviewed, and not recorded either: an unrecorded request is one a
+      // later poll can still pick up, which is what the remedy relies on.
+      expect(existsSync(claudeLog)).toBe(false);
+
+      // What the printed remedy was measured to produce against a live pull
+      // request (docs/experiments.md): removing the reviewer and asking again adds
+      // a `review_requested` event with a new id, beside the original, which
+      // GitHub keeps in the history and the watermark goes on excluding. Same pull
+      // request, same revision.
+      //
+      // Stamped in the very second the runner drew its boundary, which is the
+      // case somebody following the notice actually produces: the request is
+      // removed and made again the moment they read it, and GitHub timestamps the
+      // new one to the second.
+      // A watermark carrying milliseconds excluded exactly this, for ever.
+      const store = new Store(paths({ ENGWIRE_HOME: home }).dbFile);
+      const cutoff = store.watchingSince();
+      store.close();
+      expect(cutoff.established).toBe(false);
+      oneRequest({ requests: [asked, { id: 2, at: new Date(Date.parse(cutoff.since)) }] });
+      const second = start({ GIT_CONFIG_GLOBAL: gitconfig }, ["run", "--once"]);
+      const secondCode = await second.exited;
+
+      expect(secondCode).toBe(0);
+      // Exactly one agent invocation across both runs — the promise the whole
+      // product makes, and the reason a test that stopped at "the message
+      // printed" would pass while nothing was ever reviewed.
+      expect(readFileSync(claudeLog, "utf8").trimEnd().split("\n")).toHaveLength(1);
+      const after = new Store(paths({ ENGWIRE_HOME: home }).dbFile);
+      try {
+        expect(after.recentRuns()).toMatchObject([
+          { repo: "acme/api", pullNumber: 42, status: "completed", eventId: "2" },
+        ]);
+      } finally {
+        after.close();
+      }
+    },
+    30_000,
   );
 
   test(
@@ -393,7 +486,7 @@ describe("engwire run", () => {
       // runner would unwind normally and file the killed review as an ordinary
       // failure — spending a request that startup recovery would otherwise
       // reopen as `interrupted`.
-      const gitconfig = oneRequest();
+      const gitconfig = oneRequest({ watchingSince: new Date(Date.now() - 3_600_000) });
       const proc = start({ GIT_CONFIG_GLOBAL: gitconfig, FAKE_CLAUDE_SLEEP: "30" });
       await waitForAgent();
 

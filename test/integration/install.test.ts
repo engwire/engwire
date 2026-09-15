@@ -13,6 +13,7 @@ import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
+import { SKILL_INSTALL } from "../../src/claude/skills.ts";
 import { BINARIES } from "../../scripts/build.ts";
 
 const installer = resolve(import.meta.dir, "../../install/install.sh");
@@ -319,6 +320,50 @@ describe("install.sh", () => {
     }
   });
 
+  test("a first install of the latest release names the steps that reach a review", async () => {
+    // The installer is part of the activation contract: it was the last dead end
+    // found, because `Next: engwire setup` steers a fresh reader into a config
+    // with every rule commented out and then into a `setup --repo` that refuses
+    // for want of a skill. The order is the design — the skill first, since the
+    // flag checks for it — and the skills repository stays on the page for the
+    // machine with no Node on it, which the `npx` line would otherwise end at.
+    const dir = await machine(reports("0.3.0"));
+    try {
+      const { said, code } = await install("latest", dir);
+
+      expect(code).toBe(0);
+      // Exactly the command Engwire's own output prints, rather than a second
+      // spelling of it in a shell script nobody typechecks.
+      expect(said).toContain(`  ${SKILL_INSTALL}
+`);
+      expect(said).toContain("engwire setup --repo");
+      expect(said.indexOf(SKILL_INSTALL)).toBeLessThan(said.indexOf("engwire setup --repo"));
+      expect(said).toContain("needs Node; Engwire does not");
+      expect(said).toContain("https://github.com/engwire/skills");
+      expect(said).not.toContain("Next: engwire setup\n");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a pinned first install is not told to use a flag its binary may not have", async () => {
+    // `ENGWIRE_VERSION` deliberately fetches an older release, and the same
+    // `install.sh` is served from `releases/latest` — so the sequence above
+    // would tell somebody pinning 0.1.0 to run a flag that release never had.
+    // The script branches on the pin it was given rather than asking the binary.
+    const dir = await machine(reports("0.1.1"));
+    try {
+      const { said, code } = await install("0.1.1", dir);
+
+      expect(code).toBe(0);
+      expect(said).toContain("Next: engwire setup\n");
+      expect(said).not.toContain("--repo");
+      expect(said).not.toContain("npx");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("an upgrade on macOS is offered the command Engwire ships", async () => {
     const dir = await machine(reports("0.1.1"), { installed: true });
     try {
@@ -329,6 +374,24 @@ describe("install.sh", () => {
       expect(said).toContain("engwire service install");
       expect(said).not.toContain("systemctl");
       expect(said).not.toContain("Next: engwire setup");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("an upgrade is never sent through setup, pin or no pin", async () => {
+    // The fresh-install sequence sits behind a second branch now — the pinned
+    // one — and an upgrade must reach neither. `latest` is the selector almost
+    // every upgrade uses and the one no other test here exercises.
+    const dir = await machine(reports("0.3.0"), { installed: true });
+    try {
+      const { said, code } = await install("latest", dir);
+
+      expect(code).toBe(0);
+      expect(said).toContain("Running in the background?");
+      expect(said).not.toContain("Next: engwire setup");
+      expect(said).not.toContain("--repo");
+      expect(said).not.toContain("npx");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

@@ -131,6 +131,198 @@ The sign-in probe also carries the flag. It was measured both ways from the aren
 
 `auth status` is inert either way on 2.1.259, and the flag goes on it regardless. Which subcommands consume the working directory is a fact that would need re-measuring for each one and each release; "every `claude` Engwire spawns carries the boundary" is a rule, and `doctor` is a command someone types from wherever they happen to be standing — which can be the checkout under review.
 
+## Does asking again produce a fresh review request?
+
+A runner's first start draws a cutoff, and anything requested earlier is not this installation's business. The notice it prints therefore has to name a recovery that produces something discovery will see — a new `review_requested` event, with an id of its own, timestamped at or after the cutoff. The obvious wording, *request the review again*, turns out to be the one that does not work.
+
+GitHub refuses a review request naming the pull request's own author, so a measurement needs two identities: the branch, the commit and the pull request are made with an app installation token, and the review requests with the reviewer's own `gh`. Against a throwaway repository, on 2026-09-13 with `gh` 2.98.0:
+
+```sh
+cat > /tmp/recovery-probe <<'EOF'
+#!/bin/sh
+set -eu
+repo="$1"      # owner/name of a throwaway repository
+reviewer="$2"  # the account whose review is requested, removed, then requested again
+branch="engwire-recovery-probe-$$"
+
+bot() { # gh, as the app installation for $repo
+  token=$(printf 'protocol=https\nhost=github.com\npath=%s\n' "$repo" |
+    git-credential-engwire get | sed -n 's/^password=//p')
+  [ -n "$token" ] || { echo "no installation token for $repo" >&2; exit 1; }
+  env GH_TOKEN="$token" GH_HOST=github.com gh "$@"
+}
+
+events() { # the review-request history, sorted rather than trusted to arrive sorted
+  gh api "repos/$repo/issues/$1/events?per_page=100" --jq \
+    '[.[] | select(.event | startswith("review_request"))] | sort_by(.id) | .[]
+     | "\(.event) id=\(.id) at=\(.created_at) who=\(.requested_reviewer.login // "team")"'
+}
+
+base=$(bot api "repos/$repo" --jq .default_branch)
+# An empty repository has no ref to branch from, and a pull request needs two.
+if ! sha=$(bot api "repos/$repo/git/ref/heads/$base" --jq .object.sha 2>/dev/null); then
+  bot api --method PUT "repos/$repo/contents/README.md" -f message="seed" \
+    -f content="$(printf 'Throwaway.\n' | base64)" > /dev/null
+  sha=$(bot api "repos/$repo/git/ref/heads/$base" --jq .object.sha)
+fi
+bot api "repos/$repo/git/refs" -f "ref=refs/heads/$branch" -f "sha=$sha" > /dev/null
+bot api --method PUT "repos/$repo/contents/probe-$$.md" -f message="probe" \
+  -f content="$(printf 'A change, so the pull request has a diff.\n' | base64)" \
+  -f branch="$branch" > /dev/null
+pr=$(bot api "repos/$repo/pulls" -f title="probe" -f head="$branch" -f base="$base" \
+  -f body="Throwaway." --jq .number)
+
+# Closed and deleted whatever happens next, including on an interrupt.
+trap 'gh api --method PATCH "repos/$repo/pulls/$pr" -f state=closed > /dev/null 2>&1;
+      bot api --method DELETE "repos/$repo/git/refs/heads/$branch" > /dev/null 2>&1' EXIT
+
+step() { echo "--- $1 ---"; events "$pr"; }
+request() { gh api --method "$1" "repos/$repo/pulls/$pr/requested_reviewers" \
+  -f "reviewers[]=$reviewer" > /dev/null; }
+request POST;   step "requested"
+request DELETE; step "removed"
+request POST;   step "requested again"
+gh api "repos/$repo/pulls/$pr" --jq '"requested_reviewers now: \(.requested_reviewers | map(.login) | join(","))"'
+EOF
+chmod +x /tmp/recovery-probe
+/tmp/recovery-probe OWNER/THROWAWAY REVIEWER
+```
+
+The remove-then-ask sequence gains an event, three seconds end to end:
+
+```text
+--- requested ---
+review_requested       id=31063431407 at=2026-09-13T20:15:48Z who=koistya
+--- removed ---
+review_requested       id=31063431407 at=2026-09-13T20:15:48Z who=koistya
+review_request_removed id=31063432264 at=2026-09-13T20:15:50Z who=koistya
+--- requested again ---
+review_requested       id=31063431407 at=2026-09-13T20:15:48Z who=koistya
+review_request_removed id=31063432264 at=2026-09-13T20:15:50Z who=koistya
+review_requested       id=31063432873 at=2026-09-13T20:15:51Z who=koistya
+requested_reviewers now: koistya
+```
+
+Asking again *without* removing first does not. The same probe with the `DELETE` line dropped — two `POST`s in a row — leaves the history at one event, while the API accepts the second request without complaint:
+
+```text
+--- requested ---
+review_requested id=31063450226 at=2026-09-13T20:16:29Z who=koistya
+--- asked again while still pending ---
+review_requested id=31063450226 at=2026-09-13T20:16:29Z who=koistya
+requested_reviewers now: koistya
+```
+
+Re-run three times over an hour, both shapes came back with fresh ids each time. So the printed remedy has to have the removal in it: *your review request has to be removed and made again*. "Request the review again" would be accepted by GitHub, change nothing Engwire can see, and leave the reviewer waiting on a review that was never going to happen — the same silence the cutoff notice exists to break. The new event also arrives one second after the removal, so the recovery works at the speed a person does it.
+
+Three things this does not settle. What any UI button does, as against these API calls. Whether a request already answered by a submitted review behaves the same way, which Engwire never depends on. And who may perform the recovery: the requests here were made and removed by an account with admin on the repository, so this says nothing about a reviewer who holds only read access on one. GitHub's own reference documents removing a requested reviewer as needing write — unmeasured here, since the case takes a second account rather than a second pull request, which is why the printed remedy names the change and not the person.
+
+### At scale, and the precision the cutoff is stored at
+
+One probe is one pull request. The same questions asked of 992 recent numbers in four public repositories — read-only; nothing here creates or modifies anything — say how the identities and timestamps behave in the wild:
+
+```sh
+cat > /tmp/review-requests <<'EOF'
+#!/bin/sh
+# One pull request, from the first 100 of its issue events: a line recording
+# whether the read succeeded, then its review-request history, oldest id first.
+# The marker is not decoration — a scan that quietly hit a rate limit otherwise
+# looks exactly like a repository with nothing to find.
+body=$(gh api "repos/$1/issues/$2/events?per_page=100" 2>/dev/null) || {
+  printf '{"repo":"%s","pr":%s,"read":"failed"}\n' "$1" "$2"
+  exit 0
+}
+printf '%s' "$body" | jq -c --arg repo "$1" --arg pr "$2" '
+  [{repo: $repo, pr: ($pr | tonumber), read: "ok"}]
+  + ([.[] | select(.event == "review_requested" or .event == "review_request_removed")
+          | {repo: $repo, pr: ($pr | tonumber), event, id, at: .created_at,
+             who: (.requested_reviewer.login // ("team:" + (.requested_team.slug // "?")))}]
+     | sort_by(.id))
+  | .[]' 2>/dev/null ||
+  printf '{"repo":"%s","pr":%s,"read":"failed"}\n' "$1" "$2"
+EOF
+chmod +x /tmp/review-requests
+
+# The four windows, written out rather than looped: `set -- $window` splits in sh
+# and does not in zsh, which is how one earlier run scanned nothing at all and
+# reported it as nothing to find.
+{ seq 181736 182135 | xargs -P 8 -I{} /tmp/review-requests home-assistant/core {}
+  seq 141777 142076 | xargs -P 8 -I{} /tmp/review-requests kubernetes/kubernetes {}
+  seq 11700 11930   | xargs -P 8 -I{} /tmp/review-requests cli/cli {}
+  seq 30300 30360   | xargs -P 8 -I{} /tmp/review-requests oven-sh/bun {}
+} > /tmp/review-requests.jsonl
+
+# Coverage before conclusions: the limit is 5,000 requests an hour, and an
+# exhausted quota reads as a repository where nothing ever happens.
+jq -r 'select(.read) | .read' /tmp/review-requests.jsonl | sort | uniq -c
+```
+
+Measured on 2026-09-13 with `gh` 2.98.0: 971 of those 992 numbers read, 21 reads failed, for 1,532 review-request events. Everything below is then a question put to that one corpus:
+
+```sh
+events='[.[] | select(.event)]'
+
+# The same reviewer asked more than once on one pull request.
+jq -s "$events | group_by(\"\(.repo)#\(.pr) \(.who)\")
+       | map(select([.[] | select(.event == \"review_requested\")] | length > 1)) | length" \
+  /tmp/review-requests.jsonl
+
+# …asked again after being removed, which is the recovery the notice describes.
+jq -s "$events | group_by(\"\(.repo)#\(.pr) \(.who)\")
+       | map(select([.[].event] as \$e | (\$e | index(\"review_request_removed\")) as \$rm
+           | \$rm != null
+             and ((\$e | to_entries | map(select(.value == \"review_requested\" and .key > \$rm)) | length) > 0)))
+       | length" /tmp/review-requests.jsonl
+
+# Removals, which are events in their own right.
+jq -s "$events | map(select(.event == \"review_request_removed\")) | length" \
+  /tmp/review-requests.jsonl
+
+# Pull requests with more than one of these events, and how many of those
+# disagree about the order: sorted by id, are the timestamps still ascending?
+# Discovery's `BigInt` ordering of ids is what rests on the answer.
+jq -s "$events | group_by(.repo + \"#\" + (.pr|tostring))
+       | map(select(length > 1) | sort_by(.id) | map(.at))
+       | [length, (map(select(. != (. | sort))) | length)]" /tmp/review-requests.jsonl
+
+# The precision of every timestamp in it.
+jq -r 'select(.at) | .at' /tmp/review-requests.jsonl | sed 's/[0-9]/N/g' | sort | uniq -c
+```
+
+**125** reviewer-and-pull-request pairs hold more than one `review_requested` event, **each with an id of its own** — `arturpragacz` on `home-assistant/core#181860` twice, ids `30919511226` and `30978287885`; `edenhaus` on `#181918`, ids `30955046743` and `30961839935`; a bot up to thirteen times on one pull request. Note what this cannot be read as: *every ask* is its own event. An event history only holds the asks that produced one, and the probe above just showed an ask that produces none, so no corpus of events will ever count those. **22** removals appear. Of the **444** pull requests carrying more than one of these events, **0** ordered their ids differently from their timestamps, which is what discovery's `BigInt` ordering of ids assumes.
+
+All **1,532** timestamps share one shape — `NNNN-NN-NNTNN:NN:NNZ` — and not one carries a fractional second. That is why `watchingSince` truncates the boundary to the second: compared against whole-second events, a watermark carrying milliseconds excludes a request made in the same second *after* it.
+
+What this corpus does not establish. **Zero** of those pairs were removed and then asked again — which is why the probe above exists, and a fair measure of how rare that sequence is in practice rather than of whether it works. Each read covers only the first 100 issue events of a pull request, so a longer history was not inspected past that page. Repeated asks in these windows are mostly a bot's, and the human sample is smaller.
+
+## Does `npx` ask before running the skills helper?
+
+`setup`, the installer and the README all print one command for installing the reviewer, and the reader pastes it. Whether it is paste-and-forget turns on a prompt nobody sees on a warm cache: the `skills` CLI's own confirmation is the trailing `-y`, but `npx` has a question of its own when the package is not in the npm cache. Measured on 2026-09-13 with node v26.0.0, npm 11.12.1, `skills@1.5.26` on Darwin 24.6.0:
+
+```sh
+# A cache per row, since the first install warms whatever it touches — and a
+# terminal, because that is what a human pasting the command has. `script -q
+# /dev/null` supplies one on macOS; util-linux's `script` spells it differently.
+# The status is echoed inside the pty: `script`'s own exit status is not the
+# child's to rely on, and a pipeline's would be the last command's.
+# `--version` rather than `add`, so this does not install a skill into the
+# machine it is measuring; `< /dev/null` closes the pty's input, which is what
+# answers a prompt with EOF instead of waiting for a person.
+for flags in "" "--yes"; do
+  cache="$(mktemp -d)"
+  npm_config_cache="$cache" script -q /dev/null \
+    sh -c "npx $flags skills --version; echo exit=\$?" < /dev/null
+  rm -rf "$cache"
+  echo "---"
+done
+```
+
+Without `--yes`, `npx` printed `Need to install the following packages:`, `skills@1.5.26` and `Ok to proceed? (y)`, then `exit=1` on the EOF that answered it. With `--yes` it printed `1.5.26` and `exit=0`, no question asked. So on this npm, against a cold cache, under a terminal, the leading `--yes` is what makes the command paste-and-forget — and the command as the skills repository's own README writes it stops and waits.
+
+The prompt is a property of that combination, not of the command. The same rows with stdin closed and *no* pty answer differently: `npm warn exec The following package was not found and will be installed`, then exit 0. That is the shape a script or a CI job sees, and it is why this had to be measured under a terminal rather than from a pipe.
+
+What this does not establish: what other npm versions do, how npm decides a package is missing beyond the cache this varied, or what `skills add` asks beyond the flag it documents.
+
 ## Which skills Claude will actually run
 
 The preflight in `claude/skills.ts` must not accept a value Claude fails to invoke. It may conservatively refuse a working spelling: the expensive direction is a skill that *passes* the check and then does not run, because Engwire claims the queued run, Claude exits 0, and a GitHub review request is spent on nothing.

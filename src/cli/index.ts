@@ -37,13 +37,16 @@ import { uninstall } from "./uninstall.ts";
 const USAGE = `Engwire ${VERSION} — review the pull requests that ask for your review
 
 Usage
-  engwire setup              Check prerequisites and write a starter config
-  engwire run [--once]       Watch for review requests and review them
-  engwire status             Runner state and recent reviews
-  engwire doctor             Diagnose the local setup
-  engwire service install    Run in the background (macOS)
-  engwire service uninstall  Stop running in the background (macOS)
-  engwire uninstall [--yes]  Preview or remove this installation's data, config and service
+  engwire setup [--repo <pattern>]...  Check prerequisites and write the config
+  engwire run [--once]                 Watch for review requests and review them
+  engwire status                       Runner state and recent reviews
+  engwire doctor                       Diagnose the local setup
+  engwire service install              Run in the background (macOS)
+  engwire service uninstall            Stop running in the background (macOS)
+  engwire uninstall [--yes]            Preview or remove this installation's data, config and service
+
+Each --repo is one \`owner/name\`, \`owner/*\` or \`*\`; repeat it to add another.
+Given none, a new config's review rule is written commented out for you to edit.
 
 Config
   ${paths().configFile}
@@ -60,6 +63,24 @@ Config
  */
 function noArgs(args: string[]): boolean {
   return args.length === 0;
+}
+
+/**
+ * The `--repo <pattern>` occurrences in order, or null if that is not what these
+ * arguments are.
+ *
+ * Repeatable, and one occurrence is one pattern. Whether a value is a pattern is
+ * `setup`'s question, not the grammar's — so `--repo --once` is accepted here
+ * and refused there, where the message can say what a pattern looks like.
+ */
+function repoFlags(args: string[]): string[] | null {
+  const repos: string[] = [];
+  for (let index = 0; index < args.length; index += 2) {
+    const value = args[index + 1];
+    if (args[index] !== "--repo" || value === undefined) return null;
+    repos.push(value);
+  }
+  return repos;
 }
 
 function usageError(usage: string): number {
@@ -139,9 +160,11 @@ async function dispatch(argv: string[]): Promise<number> {
   // derives the commands from the help text and holds each to refusing or to
   // being deliberately exempt.
   switch (command) {
-    case "setup":
-      if (!noArgs(rest)) return usageError("engwire setup");
-      return refuseRelativeLocation() ?? setup();
+    case "setup": {
+      const repos = repoFlags(rest);
+      if (repos === null) return usageError("engwire setup [--repo <pattern>]...");
+      return refuseRelativeLocation() ?? setup({ repos });
+    }
     case "run": {
       const once = rest.length === 1 && rest[0] === "--once";
       if (!once && !noArgs(rest)) return usageError("engwire run [--once]");
