@@ -351,21 +351,14 @@ async function invoke(argv: string[]): Promise<{ code: number; said: string }> {
 
 describe("main", () => {
   test("every command and flag the usage text promises is one the dispatcher accepts", async () => {
-    // The two drift apart in the direction that matters: a command removed
-    // from dispatch but left in the help is one a reader will type and be told
-    // does not exist, and a flag the dispatcher takes but the help omits is one
-    // nobody finds. Each is given an argument it cannot take, so the grammar
-    // answers without the command running — and that refusal names the flags
-    // the command accepts, which is the second statement to compare the help
-    // against.
+    // Give each advertised command an invalid argument and compare its usage
+    // refusal with the help text, without running the command. This detects
+    // removed commands left in help and mismatched flag descriptions; it does
+    // not discover commands or flags omitted from both descriptions.
     // `invoke` rather than `dispatch`: the help text goes to stdout, which the
     // dispatcher harness deliberately swallows.
     const { said: help } = await invoke(["help"]);
-    // A flag may take a value — `[--repo <pattern>]` — and may be repeatable,
-    // which the trailing `...` is the whole statement of. Both sides are read
-    // with one pattern, and it captures that marker: without it the help could
-    // drop `...` while the refusal kept it, and this test would not notice that
-    // the two no longer promise the same grammar.
+    // Include values and repetition markers when comparing flag descriptions.
     const FLAGS = /\[--[a-z-]+(?: <[a-z]+>)?\](?:\.\.\.)?/g;
     const promised = [
       ...help.matchAll(/^ {2}engwire ([a-z]+(?: [a-z]+)?)((?: \[--[a-z-]+(?: <[a-z]+>)?\](?:\.\.\.)?)*)/gm),

@@ -9,13 +9,10 @@ import { REVIEW_SKILL } from "../config/config.ts";
 export const SKILLS_REPO = "https://github.com/engwire/skills";
 
 /**
- * The one command that installs that reviewer, printed rather than linked: a
- * URL leaves the reader to find the line in somebody else's README, which is
- * the second document the first review should not need.
- *
- * Engwire never runs it. The helper is third-party network code, and the user
- * executing it is the boundary — the leading `--yes` is `npx`'s own, so a cold
- * npm cache does not stop to ask; the trailing one is the `skills` CLI's.
+ * Install command printed by setup, never executed by Engwire: running this
+ * third-party helper remains the user's choice. The leading `--yes` answers
+ * npx's cold-cache prompt; the trailing `-y` answers the skills CLI's.
+ * Measured in docs/experiments.md#does-npx-ask-before-running-the-skills-helper.
  */
 export const SKILL_INSTALL = `npx --yes skills add engwire/skills --skill ${REVIEW_SKILL} -g -a claude-code -y`;
 
@@ -81,13 +78,9 @@ export function skillFile(
 }
 
 /**
- * The one preflight problem installing a skill answers: no file at that path.
- *
- * Written here and recognized by `setup`, which appends the install command for
- * this problem and for none of the other four. Comparing against the message's
- * own producer is what keeps that exact: a second look at the filesystem cannot
- * tell absence from a directory it is not allowed to search, and `existsSync`
- * answers false to both.
+ * Missing-file message shared with setup, which offers installation only for
+ * this problem. Reuse the preflight result: a separate `existsSync` check would
+ * also return false for an inaccessible path, whose remedy is different.
  */
 export function missingSkillProblem(
   name: string,
@@ -210,13 +203,8 @@ export function skillPreflightProblem(
   try {
     source = readFileSync(file, "utf8");
   } catch (error) {
-    // Absent and unreadable are different problems with different fixes.
-    // Reporting a permission error as "no SKILL.md" sends someone to reinstall
-    // a file that is already there. `ENOTDIR` is on the unreadable side of that
-    // line rather than the absent one: it means a component of the path is a
-    // regular file — a skill saved as a file rather than a directory, or a file
-    // sitting where the skills directory belongs — and an installer cannot write
-    // through it, so "install it" would be a remedy that fails without saying why.
+    // Only ENOENT calls for installation. Permission errors need repair, and
+    // ENOTDIR means a regular file blocks the path an installer needs to create.
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT") return missingSkillProblem(name, env);
     return `could not read ${file}: ${error instanceof Error ? error.message : String(error)}`;

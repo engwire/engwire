@@ -217,17 +217,16 @@ export class Store {
    * When this installation started watching, fixed at first call, and whether
    * this call is what fixed it.
    *
-   * Set by the first runner that starts with a review rule configured, not by
-   * `setup`: installing Engwire authorizes nothing, and naming a repository is
-   * the moment that matters. Discovery ignores anything older.
+   * Set when the first runner starts with a review rule configured. Writing
+   * that rule during setup does not start the clock. Discovery ignores anything
+   * older than this cutoff.
    *
    * It is one watermark, not one per rule. A request Engwire has recorded stays
    * recorded, but one that arrived after this point while the runner happened
    * to be stopped was never seen, so a rule added later can still pick it up.
    *
-   * `established` rather than a spelling the caller compares: the boundary is
-   * stored truncated to the second, and a caller that re-derived that rule to
-   * recognize its own value would be the second place the rule lived.
+   * `established` lets the caller announce a newly written cutoff without
+   * duplicating the timestamp truncation to compare it with its own start time.
    */
   watchingSince(now = new Date()): { since: string; established: boolean } {
     const existing = this.db
